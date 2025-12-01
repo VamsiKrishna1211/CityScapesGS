@@ -1,0 +1,47 @@
+{
+  "example_configurations": {
+    "miami_downtown": {
+      "bbox": [-80.13423442840576, 25.77376933762778, -80.1264238357544, 25.788608487732198],
+      "description": "Small area in downtown Miami",
+      "area_sq_degrees": 0.0006
+    },
+    "paris_louvre": {
+      "bbox": [2.294, 48.857, 2.296, 48.859],
+      "description": "Small area around the Louvre in Paris",
+      "area_sq_degrees": 0.000004
+    },
+    "london_bridge": {
+      "bbox": [-0.0899, 51.5044, -0.0859, 51.5074],
+      "description": "Small area around London Bridge",
+      "area_sq_degrees": 0.000012
+    },
+    "tokyo_shibuya": {
+      "bbox": [139.6955, 35.6580, 139.7015, 35.6620],
+      "description": "Small area in Shibuya, Tokyo",
+      "area_sq_degrees": 0.0000024
+    }
+  },
+  "api_info": {
+    "max_bbox_area_sq_degrees": 0.01,
+    "recommended_max_area_sq_degrees": 0.001,
+    "rate_limits": {
+      "entity_api": "60,000 per minute",
+      "search_api": "10,000 per minute", 
+      "tiles_api": "50,000 per day"
+    }
+  },
+  "usage_examples": [
+    {
+      "command": "python mapillary_downloader.py --bbox \"-80.134,25.773,-80.126,25.789\" --token \"MLY|your_token\"",
+      "description": "Basic download for Miami area"
+    },
+    {
+      "command": "python mapillary_downloader.py --bbox \"2.294,48.857,2.296,48.859\" --token \"MLY|your_token\" --output \"paris_data\" --max-images 500",
+      "description": "Download max 500 images for Paris area to custom directory"
+    },
+    {
+      "command": "python mapillary_downloader.py --bbox \"139.695,35.658,139.701,35.662\" --token \"MLY|your_token\" --no-pointclouds",
+      "description": "Download only images (no point clouds) for Tokyo area"
+    }
+  ]
+}

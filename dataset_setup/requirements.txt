@@ -1,0 +1,16 @@
+# Core dependencies for Mapillary Data Downloader
+requests>=2.28.0
+numpy>=1.21.0
+PyYAML>=6.0
+Pillow>=9.0.0
+opencv-python>=4.5.0
+
+# Optional dependencies for enhanced functionality  
+tqdm>=4.64.0  # Progress bars and download speed tracking
+mapbox-vector-tile>=2.0.0  # For decoding detection geometries
+matplotlib>=3.5.0  # For visualization and analysis
+
+# Development and testing dependencies (optional)
+pytest>=7.0.0
+black>=22.0.0
+flake8>=4.0.0

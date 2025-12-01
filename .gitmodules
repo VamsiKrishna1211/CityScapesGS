@@ -1,0 +1,48 @@
+[submodule "thrid_party/pyCuSFM"]
+	path = thrid_party/pyCuSFM
+	url = https://github.com/nvidia-isaac/pyCuSFM.git
+[submodule "thrid_party/OpenSfM"]
+	path = thrid_party/OpenSfM
+	url = https://github.com/mapillary/OpenSfM
+[submodule "thrid_party/Skyfall-GS"]
+	path = thrid_party/Skyfall-GS
+	url = https://github.com/jayin92/Skyfall-GS.git
+[submodule "thrid_party/mast3r"]
+	path = thrid_party/mast3r
+	url = https://github.com/naver/mast3r.git
+[submodule "thrid_party/LongSplat"]
+	path = thrid_party/LongSplat
+	url = https://github.com/NVlabs/LongSplat.git
+[submodule "thrid_party/romo"]
+	path = thrid_party/romo
+	url = https://github.com/google-deepmind/romo.git
+[submodule "thrid_party/sam2"]
+	path = thrid_party/sam2
+	url = https://github.com/facebookresearch/sam2.git
+[submodule "thrid_party/CF-3DGS"]
+	path = thrid_party/CF-3DGS
+	url = https://github.com/NVlabs/CF-3DGS.git
+[submodule "thrid_party/lietorch"]
+	path = thrid_party/lietorch
+	url = https://github.com/princeton-vl/lietorch.git
+[submodule "thrid_party/Hierarchical-Localization"]
+	path = thrid_party/Hierarchical-Localization
+	url = https://github.com/cvg/Hierarchical-Localization/
+[submodule "thrid_party/Depth-Anything-3"]
+	path = thrid_party/Depth-Anything-3
+	url = https://github.com/ByteDance-Seed/Depth-Anything-3.git
+[submodule "thrid_party/depth_anything_v2"]
+	path = thrid_party/depth_anything_v2
+	url = https://github.com/DepthAnything/Depth-Anything-V2
+[submodule "thrid_party/pixel-perfect-sfm"]
+	path = thrid_party/pixel-perfect-sfm
+	url = https://github.com/cvg/pixel-perfect-sfm
+[submodule "thrid_party/nerfstudio"]
+	path = thrid_party/nerfstudio
+	url = https://github.com/nerfstudio-project/nerfstudio.git
+[submodule "thrid_party/vggt"]
+	path = thrid_party/vggt
+	url = https://github.com/facebookresearch/vggt.git
+[submodule "thrid_party/LangSplat"]
+	path = thrid_party/LangSplat
+	url = https://github.com/minghanqin/LangSplat.git
