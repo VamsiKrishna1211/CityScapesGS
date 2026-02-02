@@ -52,3 +52,12 @@
 [submodule "third_party/colmap"]
 	path = third_party/colmap
 	url = https://github.com/colmap/colmap.git
+[submodule "third_party/tiny-cuda-nn"]
+	path = third_party/tiny-cuda-nn
+	url = https://github.com/NVlabs/tiny-cuda-nn/
+[submodule "third_party/triangle-splatting"]
+	path = third_party/triangle-splatting
+	url = https://github.com/trianglesplatting/triangle-splatting.git
+[submodule "third_party/mesh-splatting"]
+	path = third_party/mesh-splatting
+	url = https://github.com/meshsplatting/mesh-splatting.git
