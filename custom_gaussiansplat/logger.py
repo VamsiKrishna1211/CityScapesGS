@@ -178,11 +178,13 @@ class GaussianSplattingLogger:
         self.writer.add_scalar('Model/NumGaussians', num_gaussians, step)
         
         if max_radii is not None:
-            self.writer.add_scalar('Model/AvgMaxRadii', max_radii.mean().item(), step)
+            # Ensure max_radii is float before computing mean
+            self.writer.add_scalar('Model/AvgMaxRadii', max_radii.float().mean().item(), step)
     
     def log_images(self, rendered: torch.Tensor, ground_truth: torch.Tensor, 
                    alpha: Optional[torch.Tensor] = None, 
-                   rendered_depth: Optional[torch.Tensor] = None, gt_depth: Optional[torch.Tensor] = None,
+                   inv_rendered_depth: Optional[torch.Tensor] = None, 
+                   inv_prior_depth: Optional[torch.Tensor] = None,
                 step: int = 0):
         """
         Log rendered and ground truth images with optional alpha mask.
@@ -191,39 +193,42 @@ class GaussianSplattingLogger:
             rendered: Rendered image [H, W, 3]
             ground_truth: Ground truth image [H, W, 3]
             alpha: Optional alpha mask [H, W, 1]
-            rendered_depth: Optional rendered depth map [H, W]
-            gt_depth: Optional ground truth depth map [H, W]
+            inv_rendered_depth: Optional inverse rendered depth map [H, W]
+            inv_prior_depth: Optional inverse prior depth map [H, W]
             step: Current training iteration
         """
-        if not self.enabled:
-            return
-        
-        # Convert from [H, W, 3] to [3, H, W] for tensorboard
-        rendered_tb = rendered.permute(2, 0, 1).clamp(0, 1)
-        gt_tb = ground_truth.permute(2, 0, 1).clamp(0, 1)
-        
-        self.writer.add_image('Images/Rendered', rendered_tb, step)
-        self.writer.add_image('Images/GroundTruth', gt_tb, step)
-        
-        # Log absolute difference map
-        diff = torch.abs(rendered - ground_truth).mean(dim=2, keepdim=True)  # [H, W, 1]
-        diff_tb = diff.permute(2, 0, 1).clamp(0, 1)
-        self.writer.add_image('Images/AbsoluteDifference', diff_tb, step)
-        
-        # Log alpha mask if provided
-        if alpha is not None:
-            alpha_tb = alpha.permute(2, 0, 1).clamp(0, 1)
-            self.writer.add_image('Images/AlphaMask', alpha_tb, step)
-        
-        # Log depth maps if provided
-        if rendered_depth is not None:
-            # rendered_depth_tb = rendered_depth.unsqueeze(0).clamp(0, 1)  # [1, H, W]
-            norm_rendered_depth = (rendered_depth - rendered_depth.min()) / (rendered_depth.max() - rendered_depth.min() + 1e-8)
-            self.writer.add_image('Images/RenderedDepth', norm_rendered_depth.unsqueeze(0), step)
-        if gt_depth is not None:
-            # gt_depth_tb = gt_depth.unsqueeze(0).clamp(0, 1)  # [1, H, W]
-            norm_gt_depth = (gt_depth - gt_depth.min()) / (gt_depth.max() - gt_depth.min() + 1e-8)
-            self.writer.add_image('Images/GroundTruthDepth', norm_gt_depth.unsqueeze(0), step)
+        try:
+            if not self.enabled:
+                return
+            
+            # Convert from [H, W, 3] to [3, H, W] for tensorboard
+            rendered_tb = rendered.permute(2, 0, 1).clamp(0, 1)
+            gt_tb = ground_truth.permute(2, 0, 1).clamp(0, 1)
+            
+            self.writer.add_image('Images/Rendered', rendered_tb, step)
+            self.writer.add_image('Images/GroundTruth', gt_tb, step)
+            
+            # Log absolute difference map
+            diff = torch.abs(rendered - ground_truth).mean(dim=2, keepdim=True)  # [H, W, 1]
+            diff_tb = diff.permute(2, 0, 1).clamp(0, 1)
+            self.writer.add_image('Images/AbsoluteDifference', diff_tb, step)
+            
+            # Log alpha mask if provided
+            if alpha is not None:
+                alpha_tb = alpha.permute(2, 0, 1).clamp(0, 1)
+                self.writer.add_image('Images/AlphaMask', alpha_tb, step)
+            
+            # Log depth maps if provided
+            if inv_rendered_depth is not None:
+                # rendered_depth_tb = rendered_depth.unsqueeze(0).clamp(0, 1)  # [1, H, W]
+                norm_rendered_depth = (inv_rendered_depth - inv_rendered_depth.min()) / (inv_rendered_depth.max() - inv_rendered_depth.min() + 1e-8)
+                self.writer.add_image('Images/RenderedDepth', norm_rendered_depth.unsqueeze(0), step)
+            if inv_prior_depth is not None:
+                # gt_depth_tb = gt_depth.unsqueeze(0).clamp(0, 1)  # [1, H, W]
+                norm_gt_depth = (inv_prior_depth - inv_prior_depth.min()) / (inv_prior_depth.max() - inv_prior_depth.min() + 1e-8)
+                self.writer.add_image('Images/GroundTruthDepth', norm_gt_depth.unsqueeze(0), step)
+        except Exception as e:
+            logger.warning(f"Failed to log depth images: {e}")
     
     def log_gaussian_histograms(self, model, step: int):
         """

@@ -24,12 +24,19 @@ def inverse_sigmoid(x):
     return torch.log(x / (1 - x))
 
 class GaussianModel(nn.Module):
-    def __init__(self, init_points: torch.Tensor, init_colors: torch.Tensor, sh_degree=3, console=None):
+    def __init__(self, init_points: torch.Tensor, 
+                 init_colors: torch.Tensor, 
+                 sh_degree=3, 
+                 train_semantics=False,
+                 feature_dim: Optional[int] = None,
+                 console=None):
         super().__init__()
         num_points = init_points.shape[0]
         self.sh_degree = sh_degree
         self.console = console
 
+        if len(init_points) == 0:
+            raise ValueError("Initialization point cloud is empty. Please provide a valid COLMAP point cloud for initialization.")
         # --- Learnable Parameters ---
         # 1. Position: The center of the gaussian
         self._means = nn.Parameter(init_points)
@@ -38,11 +45,15 @@ class GaussianModel(nn.Module):
         # Initialize as isotropic small spheres
         # dist_to_nearest = torch.ones(num_points, device=init_points.device) * 0.1
         # Use KNN to find distance to nearest neighbor for better initialization
+        torch.zeros(1, device=init_points.device)  # Warm up CUDA context to prevent first-iteration lag
         with torch.no_grad():
             # distCUDA2 expects a single tensor and returns a 1D tensor of mean squared
             # distances per point. Take sqrt to get distance and clamp small values.
             dist_to_nearest = torch.sqrt(distCUDA2(init_points.contiguous()))
+            torch.zeros(1, device=init_points.device)  # Warm up CUDA context to prevent first-iteration lag
+
             dist_to_nearest[dist_to_nearest < 1e-5] = 1e-5  # Avoid zero distances
+        
         self._scales = nn.Parameter(torch.log(dist_to_nearest.unsqueeze(1).repeat(1, 3)))
         
         # 3. Rotation: Quaternion (w, x, y, z)
@@ -60,20 +71,11 @@ class GaussianModel(nn.Module):
         # We fuse RGB into the DC component for easier initialization
         self._features_dc = nn.Parameter(init_colors.unsqueeze(1)) # [N, 1, 3]
         self._features_rest = nn.Parameter(torch.zeros(num_points, (sh_degree + 1)**2 - 1, 3, device=init_points.device)) # [N, D, 3]
-        
-        # --- Gradient Accumulation Buffers (for densification) ---
-        # These track gradients over multiple iterations to decide when to densify/prune
 
-        # self.xyz_gradient_accum = torch.zeros(num_points, 1, device=init_points.device)
-        # self.denom = torch.zeros(num_points, 1, device=init_points.device)
-        # self.max_radii2D = torch.zeros(num_points, device=init_points.device)
-
-        self.register_buffer('xyz_gradient_accum', torch.zeros(num_points, 1, device=init_points.device))
-        self.register_buffer('denom', torch.zeros(num_points, 1, device=init_points.device))
-        self.register_buffer('max_radii2D', torch.zeros(num_points, device=init_points.device))
+        if feature_dim is not None:
+            self._features_sem = nn.Parameter(torch.zeros(num_points, feature_dim, device=init_points.device))
         
         # Visibility tracking buffer for multi-view consistency (floater prevention)
-        # self.view_count = torch.zeros(num_points, device=init_points.device)
         self.register_buffer('view_count', torch.zeros(num_points, device=init_points.device))
 
     @property
@@ -90,35 +92,6 @@ class GaussianModel(nn.Module):
     
     @property
     def sh(self): return torch.cat([self._features_dc, self._features_rest], dim=1)
-    
-    def add_densification_stats(self, viewspace_point_tensor, update_filter, gaussian_ids=None):
-        """
-        [DEPRECATED] Use strategy.step_post_backward() instead.
-        
-        Legacy method kept for backward compatibility.
-        Accumulates gradient statistics in the old buffer format.
-        
-        Args:
-            viewspace_point_tensor: Screen-space positions with gradients [N_visible, 2]
-            update_filter: Boolean mask for which of the visible Gaussians to update [N_visible]
-            gaussian_ids: Optional indices mapping visible Gaussians to model Gaussians [N_visible]
-                         If None, assumes viewspace_point_tensor covers all model Gaussians
-        """
-        if gaussian_ids is not None:
-            # Frustum culling is active - map visible Gaussians to full model
-            visible_grads = torch.norm(
-                viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True
-            )
-            # Get indices of Gaussians to update in the full model
-            full_model_indices = gaussian_ids[update_filter]
-            self.xyz_gradient_accum[full_model_indices] += visible_grads
-            self.denom[full_model_indices] += 1
-        else:
-            # No culling - update_filter applies directly to full model
-            self.xyz_gradient_accum[update_filter] += torch.norm(
-                viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True
-            )
-            self.denom[update_filter] += 1
     
     def add_view_count(self, alpha_contributions, threshold=0.5):
         """

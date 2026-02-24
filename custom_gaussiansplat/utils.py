@@ -141,11 +141,12 @@ def create_viewer_render_fn(model, device, sh_degree):
     return render_fn
 
 
-def format_phase_description(phase, current_loss, current_l1, current_ssim, current_lpips, current_psnr, current_scale_loss, num_gaussians):
+def format_phase_description(step, phase, current_loss, current_l1, current_ssim, current_lpips, current_psnr, current_scale_loss, num_gaussians):
     """
     Format a compact phase description for progress bar.
     
     Args:
+        step: Current training step
         phase: Training phase string
         current_loss: Current total loss
         current_l1: Current L1 loss
@@ -159,6 +160,7 @@ def format_phase_description(phase, current_loss, current_l1, current_ssim, curr
         Formatted string
     """
     return (
+        f"[cyan]Step {step:,}[/cyan] │ "
         f"[cyan]{phase}[/cyan] │ "
         f"Loss: [yellow]{current_loss:.4f}[/yellow] │ "
         f"L1: {current_l1:.4f} │ "
@@ -247,21 +249,11 @@ def _estimate_lstsq(render_depth, prior_depth):
     X = torch.stack([prior_depth, ones], dim=1)  # [N, 2]
     Y = render_depth.unsqueeze(1)                # [N, 1]
     
-    # Validate inputs
-    if torch.isnan(X).any() or torch.isinf(X).any():
-        raise ValueError("Prior depth contains NaN/Inf")
-    if torch.isnan(Y).any() or torch.isinf(Y).any():
-        raise ValueError("Render depth contains NaN/Inf")
-    
-    # Solve least squares
+    # Solve least squares (GPU side)
     solution = torch.linalg.lstsq(X, Y, rcond=1e-6).solution
-    scale, shift = solution[0].item(), solution[1].item()
     
-    # Validate solution
-    if not torch.isfinite(solution).all():
-        raise ValueError("lstsq solution contains NaN/Inf")
-    if not (0.001 < abs(scale) < 1000.0):
-        raise ValueError(f"Scale factor {scale:.4f} out of reasonable range")
+    # Return as tensors to avoid CPU-GPU sync
+    scale, shift = solution[0, 0], solution[1, 0]
     
     return scale, shift
 
@@ -291,7 +283,7 @@ def _estimate_median(render_depth, prior_depth):
         scale = render_mad / prior_mad
         shift = render_median - scale * prior_median
     
-    return scale.item(), shift.item()
+    return scale, shift
 
 
 def _estimate_standardize(render_depth, prior_depth):
@@ -307,8 +299,113 @@ def _estimate_standardize(render_depth, prior_depth):
         raise ValueError("Standard deviation too small - depth is constant")
     
     # Transform: (prior - prior_mean) / prior_std * render_std + render_mean
-    # Which is: prior * (render_std / prior_std) + (render_mean - prior_mean * render_std / prior_std)
     scale = render_std / prior_std
     shift = render_mean - prior_mean * scale
     
-    return scale.item(), shift.item()
+    return scale, shift
+
+
+def torch_resize_image(image, target_size):
+    """
+    Resize image tensor to target size using bicubic interpolation.
+    
+    Args:
+        image: [C, H, W] tensor
+        target_size: (target_height, target_width) tuple
+    
+    Returns:
+        Resized image tensor of shape [C, target_height, target_width]
+    """
+    return torch.nn.functional.interpolate(
+        image.unsqueeze(0),  # Add batch dimension
+        size=target_size,
+        mode='bicubic',
+        align_corners=False
+    ).squeeze(0)  # Remove batch dimension
+
+
+def _numpy_thumbnail(img_np: np.ndarray, max_size: int = 128) -> np.ndarray:
+    """
+    Downscale a numpy image (H, W, C) so its longest dimension <= max_size.
+    Uses simple stride-based sampling (no PIL/cv2 required).
+    """
+    h, w = img_np.shape[:2]
+    longest = max(h, w)
+    if longest <= max_size:
+        return img_np
+    stride = int(np.ceil(longest / max_size))
+    return img_np[::stride, ::stride]
+
+
+def add_cameras_to_viewer(server, dataset, scale: float = 0.1,
+                          add_images: bool = True, max_image_size: int = 128):
+    """
+    Add all training camera frustums (and optional image thumbnails) to a
+    viser scene.  Cameras are displayed as persistent scene objects and are
+    visible from the first frame onward.
+
+    Coordinate convention
+    ---------------------
+    ``dataset.cameras`` stores world-to-camera extrinsics:
+        p_cam = R @ p_world + T
+    The camera centre in world space is therefore: C = -R^T @ T
+    The camera-to-world rotation is                R_c2w = R^T
+
+    Args:
+        server:         viser.ViserServer instance.
+        dataset:        ColmapDataset whose ``.cameras`` list has dicts with
+                        keys ``R``, ``T``, ``fx``, ``fy``, ``width``,
+                        ``height``, ``image_path``.
+        scale:          Visual scale of each frustum in world units.
+        add_images:     If True, attach a thumbnail of the corresponding image
+                        to each frustum.
+        max_image_size: Maximum thumbnail dimension (pixels) to limit memory.
+    """
+    import imageio.v2 as imageio
+    from scipy.spatial.transform import Rotation as ScipyRotation
+
+    num_cams = len(dataset.cameras)
+    handles = []
+    for i, cam_data in enumerate(dataset.cameras):
+        # ── Extrinsics ──────────────────────────────────────────────────────
+        R_w2c = cam_data['R'].numpy()  # (3, 3)  world → camera
+        T_w2c = cam_data['T'].numpy()  # (3,)
+
+        R_c2w = R_w2c.T                        # camera → world rotation
+        position = (-R_c2w @ T_w2c).astype(np.float32)  # camera centre
+
+        # scipy returns (x, y, z, w); viser wants (w, x, y, z)
+        qxyzw = ScipyRotation.from_matrix(R_c2w).as_quat()
+        wxyz = np.array([qxyzw[3], qxyzw[0], qxyzw[1], qxyzw[2]], dtype=np.float64)
+
+        # ── Intrinsics ───────────────────────────────────────────────────────
+        fov_y = float(2.0 * np.arctan(cam_data['height'] / (2.0 * cam_data['fy'])))
+        aspect = float(cam_data['width']) / float(cam_data['height'])
+
+        # ── Optional thumbnail ───────────────────────────────────────────────
+        thumbnail = None
+        if add_images:
+            try:
+                img = imageio.imread(cam_data['image_path'])
+                if img.ndim == 2:                    # grayscale → RGB
+                    img = np.stack([img] * 3, axis=-1)
+                elif img.shape[2] == 4:              # RGBA → RGB
+                    img = img[..., :3]
+                thumbnail = _numpy_thumbnail(img, max_image_size)
+            except Exception:
+                thumbnail = None
+
+        # ── Add to scene ─────────────────────────────────────────────────────
+        handle = server.scene.add_camera_frustum(
+            name=f"/training_cameras/cam_{i:04d}",
+            fov=fov_y,
+            aspect=aspect,
+            scale=scale,
+            color=(160, 220, 255),   # light blue so they stand out
+            image=thumbnail,
+            wxyz=wxyz,
+            position=position,
+        )
+        handles.append(handle)
+
+    return num_cams, handles

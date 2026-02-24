@@ -105,3 +105,28 @@ python custom_gaussiansplat/train.py \
     --enable-scale-reg --scale-reg-weight 0.01 \
     --enable-opacity-reg --opacity-reg-weight 0.0005 \
     --verbosity 3
+
+
+python custom_gaussiansplat/train.py \
+    --colmap-path $BASE_PATH/sparse/0 \
+    --images-path $BASE_PATH/images \
+    --output-dir $BASE_PATH/cust_gs_outputs \
+    --log-interval 10 \
+    --densify-from-iter 0 \
+    --densify-interval 1000 \
+    --densify-until-iter 15000 \
+    --tb-image-interval 100 \
+    --viewer \
+    --iterations 30000 \
+    --sh-degree 3 \
+    --lr-means 0.00002 \
+    --lr-quats 0.00002 \
+    --lr-scales 0.001 \
+    --lr-sh 0.002 \
+    --grad-threshold 0.0002 \
+    --enable-scale-reg --scale-reg-weight 0.01 \
+    --enable-opacity-reg --opacity-reg-weight 0.0005 \
+    --verbosity 3 \
+    --enable-depth-loss \
+    --depth-loss-weight 0.01 \
+    --depth-loss-start-iter 0

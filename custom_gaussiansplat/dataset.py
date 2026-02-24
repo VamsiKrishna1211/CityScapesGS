@@ -7,18 +7,20 @@ import imageio.v2 as imageio
 from torch.utils.data import Dataset
 from scipy.spatial.transform import Rotation
 from pathlib import Path
-
+from typing import Optional
 # Module-level logger
 logger = logging.getLogger("cityscape_gs.dataset")
 
 class ColmapDataset(Dataset):
-    def __init__(self, colmap_path, image_dir, device='cuda', use_dataloader=True):
+    def __init__(self, colmap_path, image_dir, train_semantics=False, semantics_data_path: Optional[Path] = None, device: torch.device=torch.device('cuda'), use_dataloader=True, point_cloud_extent_ratio: Optional[float] = None):
         # Handle both string and torch.device
         if isinstance(device, torch.device):
             device = str(device).replace('device(', '').replace(')', '').replace("'", '')
         self.device = device
         self.use_dataloader = use_dataloader  # Don't move to CUDA in workers
         self._preloaded_images = None  # Cache for pre-loaded images
+        self.train_semantics = train_semantics
+        self.semantics_data_path = semantics_data_path
         
         # 1. Load Reconstruction
         # pycolmap handles the binary/text parsing automatically
@@ -49,6 +51,19 @@ class ColmapDataset(Dataset):
         else:
             logger.warning("[yellow]⚠ Warning:[/yellow] No 3D points found in COLMAP reconstruction. Setting scene extent to 1.0")
             self.scene_extent = 1.0
+
+        # Prune point cloud to a fraction of scene extent if requested
+        if point_cloud_extent_ratio is not None and len(xyz) > 0:
+            pts_array = np.array(xyz)
+            scene_center = pts_array.mean(axis=0)
+            max_dist = np.linalg.norm(pts_array - scene_center, axis=1).max()
+            threshold = point_cloud_extent_ratio * max_dist
+            dists = np.linalg.norm(pts_array - scene_center, axis=1)
+            mask = dists <= threshold
+            n_before = len(xyz)
+            self.init_points = self.init_points[mask]
+            self.init_colors = self.init_colors[mask]
+            logger.info(f"[cyan]Point cloud pruned:[/cyan] kept {mask.sum()} / {n_before} points within {point_cloud_extent_ratio*100:.1f}% of scene extent (threshold={threshold:.3f})")
 
         # 3. Extract Cameras & Images
         self.cameras = []
@@ -124,97 +139,59 @@ class ColmapDataset(Dataset):
             img_tensor = self._preloaded_images[idx]
         else:
             img = imageio.imread(img_path)
-            # When using DataLoader workers, keep on CPU to avoid CUDA fork issues
-            if self.use_dataloader:
-                img_tensor = torch.from_numpy(img).float() / 255.0
-            else:
-                img_tensor = torch.from_numpy(img).float() / 255.0
+            img_tensor = torch.from_numpy(img).float() / 255.0
         
-        # Load depth map if available (from Depth Anything V2)
+        # Load and optimize depth map on demand
+        depth_tensor = self._load_depth(img_path, cam_data)
+        
+        return cam_data, img_tensor, depth_tensor if depth_tensor is not None else None
+
+    def _load_depth(self, img_path: Path, cam_data: dict) -> Optional[torch.Tensor]:
+        """Load and normalize depth map with validation."""
         depth_path = img_path.parent.parent / "depths_npy" / f"{img_path.stem}.npy"
-        if depth_path.exists():
-            try:
-                depth_map = np.load(depth_path)
-                
-                # Validate depth map shape
-                if depth_map.shape[:2] != (cam_data['height'], cam_data['width']):
-                    logger.warning(
-                        f"Depth map shape mismatch for {img_path.name}: "
-                        f"expected {(cam_data['height'], cam_data['width'])}, "
-                        f"got {depth_map.shape[:2]}. Skipping depth."
-                    )
-                    depth_tensor = None
-                    return cam_data, img_tensor, depth_tensor
-                
-                # Check for invalid values
+        if not depth_path.exists():
+            return None
+            
+        try:
+            depth_map = np.load(depth_path)
+            
+            # Fast shape and finite check
+            if depth_map.shape[:2] != (cam_data['height'], cam_data['width']):
+                return None
+            
+            # Efficient validation using numpy
+            if not np.isfinite(depth_map).all():
+                # Only handle NaN/Inf if present (rare but slow to check every pixel)
                 invalid_mask = ~np.isfinite(depth_map)
-                invalid_count = invalid_mask.sum()
+                if invalid_mask.all(): return None
+                depth_map[invalid_mask] = np.median(depth_map[~invalid_mask])
+            
+            # Min-Max normalization for numerical stability
+            d_min, d_max = depth_map.min(), depth_map.max()
+            d_range = d_max - d_min
+            
+            if d_range < 1e-8:
+                return None
                 
-                if invalid_count > 0:
-                    if invalid_count == depth_map.size:
-                        # All invalid - skip this depth map
-                        logger.warning(f"All depth values are NaN/Inf for {img_path.name}. Skipping depth.")
-                        depth_tensor = None
-                        return cam_data, img_tensor, depth_tensor
-                    
-                    # Replace invalid values with valid statistics
-                    valid_values = depth_map[~invalid_mask]
-                    median_value = np.median(valid_values)
-                    depth_map[invalid_mask] = median_value
-                    
-                    if invalid_count > depth_map.size * 0.1:  # More than 10% invalid
-                        logger.warning(
-                            f"Large number of invalid depth values ({invalid_count}/{depth_map.size}) "
-                            f"in {img_path.name}. Replaced with median."
-                        )
+            # depth_map = (depth_map - d_min) / (d_range + 1e-8)
+            return torch.from_numpy(depth_map).float() # Depth tensor may be None & if returned, is the raw value without normalization (handled in loss function)
                 
-                # Validate depth range
-                depth_min = float(depth_map.min())
-                depth_max = float(depth_map.max())
-                depth_range = depth_max - depth_min
-                
-                if depth_range < 1e-8:
-                    # Constant depth map - probably an error
-                    logger.warning(
-                        f"Depth map has no variation for {img_path.name} "
-                        f"(min={depth_min:.6f}, max={depth_max:.6f}). Skipping depth."
-                    )
-                    depth_tensor = None
-                    return cam_data, img_tensor, depth_tensor
-                
-                # Check for unreasonable depth values
-                if depth_max > 1e6 or depth_min < -1e6:
-                    logger.warning(
-                        f"Extreme depth values for {img_path.name}: "
-                        f"[{depth_min:.2f}, {depth_max:.2f}]. May cause numerical issues."
-                    )
-                
-                # Normalize to [0, 1] range for better stability
-                depth_map = (depth_map - depth_min) / (depth_range + 1e-8)
-                
-                # Final validation after normalization
-                if not np.isfinite(depth_map).all():
-                    logger.error(f"Depth normalization produced NaN/Inf for {img_path.name}. Skipping depth.")
-                    depth_tensor = None
-                    return cam_data, img_tensor, depth_tensor
-                
-                depth_tensor = torch.from_numpy(depth_map).float()
-                
-            except Exception as e:
-                logger.error(f"Failed to load depth map for {img_path.name}: {str(e)}. Skipping depth.")
-                depth_tensor = None
-        else:
-            depth_tensor = None
-        
-        return cam_data, img_tensor, depth_tensor
+        except Exception as e:
+            logger.debug(f"Depth load failed for {img_path.name}: {e}")
+            return None
     
     def preload_all_images(self):
-        """Pre-load all images into RAM for faster training."""
+        """Pre-load all images into RAM for faster training.
+        
+        Keeps images on CPU to save VRAM. They will be moved to GPU during training.
+        """
         self._preloaded_images = []
         for cam_data in self.cameras:
             img = imageio.imread(cam_data['image_path'])
-            img_tensor = torch.from_numpy(img).float().to(self.device) / 255.0
+            # Keep on CPU to avoid VRAM exhaustion
+            img_tensor = torch.from_numpy(img).float() / 255.0
             self._preloaded_images.append(img_tensor)
+        logger.info(f"[green]✓ Preloaded {len(self.cameras)} images to CPU RAM[/green]")
 
     def collate_fn(self, batch):
         """
