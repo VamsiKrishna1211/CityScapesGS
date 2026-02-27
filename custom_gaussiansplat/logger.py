@@ -12,6 +12,12 @@ from typing import Optional, Dict
 import random
 from datetime import datetime
 import warnings
+import logging
+
+from torchvision.utils import make_grid
+
+
+logger = logging.getLogger("cityscape_gs.logger")
 
 # Optional imports for system metrics
 try:
@@ -75,7 +81,7 @@ class GaussianSplattingLogger:
         timestamp = datetime.now().strftime('%m%d-%H%M')
         return f"{adjective}-{noun}-{timestamp}"
     
-    def __init__(self, log_dir: str, enabled: bool = True, run_name: Optional[str] = None):
+    def __init__(self, log_dir: str, enabled: bool = True, run_name: Optional[str] = None, purge_step: Optional[int] = None):
         """
         Initialize TensorBoard logger.
         
@@ -83,8 +89,10 @@ class GaussianSplattingLogger:
             log_dir: Base directory to save TensorBoard logs
             enabled: Whether logging is enabled (default: True)
             run_name: Optional custom run name. If None, generates a unique name automatically
+            purge_step: Optional step to purge stale events when resuming an existing run
         """
         self.enabled = enabled
+        self.purge_step = purge_step
         if self.enabled:
             # Generate unique run name if not provided
             self.run_name = run_name if run_name else self.generate_run_name()
@@ -93,7 +101,7 @@ class GaussianSplattingLogger:
             self.log_dir = Path(log_dir) / self.run_name
             self.log_dir.mkdir(parents=True, exist_ok=True)
             
-            self.writer = SummaryWriter(str(self.log_dir))
+            self.writer = SummaryWriter(str(self.log_dir), purge_step=purge_step)
             
             # Initialize NVML for GPU monitoring (once at startup)
             self._nvml_initialized = False
@@ -113,9 +121,15 @@ class GaussianSplattingLogger:
                    l1_loss: float, 
                    ssim_loss: float, 
                    lpips_loss: float,
+                   patch_l1_loss: float = None,
+                   patch_ssim_loss: float = None,
                    scale_reg_loss: float = None,
                    opacity_reg_loss: float = None,
+                   opacity_entropy_reg_loss: float = None,
                    depth_loss: float = None,
+                   depth_corr_abs: float = None,
+                   sam_loss: float = None,
+                   semantic_loss: float = None,
                    step: int = 0):
         """
         Log all loss components.
@@ -125,9 +139,16 @@ class GaussianSplattingLogger:
             l1_loss: L1 reconstruction loss
             ssim_loss: SSIM loss component
             lpips_loss: LPIPS perceptual loss
+            patch_l1_loss: Optional patch-level L1 reconstruction loss
+            patch_ssim_loss: Optional patch-level SSIM loss component
             scale_reg_loss: Scale regularization loss
-            step: Current training iteration
+            opacity_reg_loss: Optional opacity regularization loss
+            opacity_entropy_reg_loss: Optional opacity entropy regularization loss
             depth_loss: Optional depth supervision loss
+            depth_corr_abs: Optional absolute Pearson depth correlation in [0, 1]
+            sam_loss: Optional sharpness-aware minimization loss
+            semantic_loss: Optional semantic reconstruction loss
+            step: Current training step
         """
         if not self.enabled:
             return
@@ -135,14 +156,26 @@ class GaussianSplattingLogger:
         self.writer.add_scalar('Loss/Total', total_loss, step)
         self.writer.add_scalar('Loss/L1', l1_loss, step)
         self.writer.add_scalar('Loss/SSIM', ssim_loss, step)
+        if patch_l1_loss is not None and patch_l1_loss > 0:
+            self.writer.add_scalar('Loss/PatchL1', patch_l1_loss, step)
+        if patch_ssim_loss is not None and patch_ssim_loss > 0:
+            self.writer.add_scalar('Loss/PatchSSIM', patch_ssim_loss, step)
         if lpips_loss > 0:
             self.writer.add_scalar('Loss/LPIPS', lpips_loss, step)
         if scale_reg_loss > 0:
             self.writer.add_scalar('Loss/ScaleRegularization', scale_reg_loss, step)
         if opacity_reg_loss is not None and opacity_reg_loss > 0:
             self.writer.add_scalar('Loss/OpacityRegularization', opacity_reg_loss, step)
+        if opacity_entropy_reg_loss is not None and opacity_entropy_reg_loss > 0:
+            self.writer.add_scalar('Loss/OpacityEntropyRegularization', opacity_entropy_reg_loss, step)
         if depth_loss is not None and depth_loss > 0:
             self.writer.add_scalar('Loss/Depth', depth_loss, step)
+        if depth_corr_abs is not None:
+            self.writer.add_scalar('Depth/PearsonCorrAbs', depth_corr_abs, step)
+        if sam_loss is not None and sam_loss > 0:
+            self.writer.add_scalar('Loss/SAM', sam_loss, step)
+        if semantic_loss is not None and semantic_loss > 0:
+            self.writer.add_scalar('Loss/Semantic', semantic_loss, step)
     
     def log_quality_metrics(self, psnr: float, ssim_loss: float, lpips: float, step: int):
         """
@@ -162,7 +195,7 @@ class GaussianSplattingLogger:
         self.writer.add_scalar('Quality/SSIM', 1.0 - ssim_loss, step)
         if lpips > 0:
             self.writer.add_scalar('Quality/LPIPS', lpips, step)
-    
+
     def log_model_stats(self, num_gaussians: int, max_radii: Optional[torch.Tensor] = None, step: int = 0):
         """
         Log model statistics.
@@ -181,11 +214,12 @@ class GaussianSplattingLogger:
             # Ensure max_radii is float before computing mean
             self.writer.add_scalar('Model/AvgMaxRadii', max_radii.float().mean().item(), step)
     
-    def log_images(self, rendered: torch.Tensor, ground_truth: torch.Tensor, 
-                   alpha: Optional[torch.Tensor] = None, 
-                   inv_rendered_depth: Optional[torch.Tensor] = None, 
+    def log_images(self, rendered: torch.Tensor, ground_truth: torch.Tensor,
+                   alpha: Optional[torch.Tensor] = None,
+                   inv_rendered_depth: Optional[torch.Tensor] = None,
                    inv_prior_depth: Optional[torch.Tensor] = None,
-                step: int = 0):
+                   image_patches: Optional[torch.Tensor] = None,
+                   step: int = 0):
         """
         Log rendered and ground truth images with optional alpha mask.
         
@@ -195,6 +229,7 @@ class GaussianSplattingLogger:
             alpha: Optional alpha mask [H, W, 1]
             inv_rendered_depth: Optional inverse rendered depth map [H, W]
             inv_prior_depth: Optional inverse prior depth map [H, W]
+            image_patches: Optional patch tensor [N, H, W, C] or [B, N, H, W, C]
             step: Current training iteration
         """
         try:
@@ -227,6 +262,27 @@ class GaussianSplattingLogger:
                 # gt_depth_tb = gt_depth.unsqueeze(0).clamp(0, 1)  # [1, H, W]
                 norm_gt_depth = (inv_prior_depth - inv_prior_depth.min()) / (inv_prior_depth.max() - inv_prior_depth.min() + 1e-8)
                 self.writer.add_image('Images/GroundTruthDepth', norm_gt_depth.unsqueeze(0), step)
+
+            if image_patches is not None:
+                patches = image_patches
+
+                if patches.dim() == 5:
+                    patches = patches[0]
+
+                if patches.dim() != 4:
+                    raise ValueError(
+                        f"Expected image_patches shape [N,H,W,C] or [B,N,H,W,C], got {tuple(patches.shape)}"
+                    )
+
+                # [N, H, W, C] -> [N, C, H, W]
+                patches_nchw = patches.permute(0, 3, 1, 2).contiguous().float().clamp(0, 1)
+
+                max_patches_to_log = min(64, patches_nchw.shape[0])
+                patches_nchw = patches_nchw[:max_patches_to_log]
+
+                nrow = int(max(1, round(max_patches_to_log ** 0.5)))
+                patch_grid = make_grid(patches_nchw, nrow=nrow, padding=2)
+                self.writer.add_image('Images/Patches', patch_grid, step)
         except Exception as e:
             logger.warning(f"Failed to log depth images: {e}")
     

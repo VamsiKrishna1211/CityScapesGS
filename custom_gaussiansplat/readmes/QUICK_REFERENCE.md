@@ -74,19 +74,20 @@ python custom_gaussiansplat/train.py \
     --opacity-reset-interval 2000 \
     --opacity-reset-value 0.01 \
     --enable-scale-reg \
-    --scale-reg-weight 0.05 \
-    --enable-aggressive-pruning \
     --max-world-scale 0.1 \
     --enable-visibility-tracking \
     --min-view-count 4
-```
-- Maximum floater prevention
 - +3-7% training time
 - May remove thin structures
 
----
-
 ## Tuning Guide
+    ### Depth Supervision
+    ```bash
+    --enable-depth-loss                 # Enable depth supervision
+    --depth-loss-weight 0.1             # Weight for depth loss
+    --depth-loss-start-iter 1000        # Start iteration for depth loss
+    --depth-objective pearson           # Depth objective: pearson or silog
+    ```
 
 ### Scene is too sparse (too many Gaussians pruned)
 1. Increase `--opacity-reset-value` to 0.05
@@ -96,52 +97,47 @@ python custom_gaussiansplat/train.py \
 
 ### Still seeing floaters
 1. Decrease `--opacity-reset-interval` to 2000
-2. Increase `--scale-reg-weight` to 0.05
-3. Enable `--enable-aggressive-pruning`
-4. Enable `--enable-visibility-tracking`
-
-### Thin structures disappearing
+        --scale-reg-weight 0.05 \
+        --enable-opacity-reg \
+        --opacity-reg-weight 0.0005 \
+        --enable-opacity-entropy-reg
 1. Increase `--opacity-reset-value` to 0.05
-2. Disable `--enable-scale-reg`
-3. Increase `--max-world-scale` to 0.2
-4. Disable `--enable-aggressive-pruning`
 
 ---
+    1. Disable `--enable-opacity-entropy-reg`
+    2. Lower `--scale-reg-weight` to 0.005
 
 ## Monitoring Training
 
 ### Verbosity Levels
 ```bash
+    3. Reduce `--scale-reg-weight` to 0.005
+    4. Disable `--enable-opacity-entropy-reg`
 --verbosity 0  # QUIET - Minimal output
---verbosity 1  # NORMAL - Progress bar + summaries (default)
---verbosity 2  # VERBOSE - Detailed operations
+    **Verbosity 3 (Debug):**
+    - Detailed loss/component diagnostics
+    - Densification and depth-loss behavior
 --verbosity 3  # DEBUG - All details
 ```
 
-### What to Watch For
-
 **Verbosity 1 (Normal):**
 - Configuration table shows enabled techniques
-- Gaussian count changes during densification
-
+    --enable-scale-reg --scale-reg-weight 0.005
+    --enable-opacity-entropy-reg --opacity-entropy-reg-weight 0.0001
 **Verbosity 2 (Verbose):**
 - Opacity reset messages
 - Densification operations (clone/split/prune counts)
-- Net Gaussian change per densification
-
-**Verbosity 3 (Debug):**
 - Per-frame depth culling counts (if enabled)
 - Visibility tracking updates
 
----
 
-## Scene-Specific Recommendations
-
-### Indoor (extent < 20m)
-```bash
+        --enable-opacity-reg \
+        --opacity-reg-weight 0.0005 \
 --enable-scale-reg --scale-reg-weight 0.01
 --enable-visibility-tracking --min-view-count 3
 ```
+    2. Lower `--scale-reg-weight`
+    3. Disable `--enable-opacity-entropy-reg`
 
 ### Outdoor/Urban (extent 20-200m)
 ```bash

@@ -2,13 +2,169 @@
 Loss functions for Gaussian Splatting training.
 """
 import torch
-from utils import estimate_depth_scale_shift
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
 
 logger = logging.getLogger("cityscape_gs.model")
+
+
+def _to_bhw_depth(tensor: torch.Tensor) -> torch.Tensor:
+    """Normalize depth-like tensors to shape [B, H, W]."""
+    if tensor.dim() == 2:
+        return tensor.unsqueeze(0)
+    if tensor.dim() == 3:
+        if tensor.shape[-1] == 1:
+            return tensor.squeeze(-1).unsqueeze(0)
+        return tensor
+    if tensor.dim() == 4:
+        if tensor.shape[1] == 1:
+            return tensor[:, 0]
+        if tensor.shape[-1] == 1:
+            return tensor[..., 0]
+    raise ValueError(f"Expected depth tensor with shape [H,W], [B,H,W], [B,1,H,W], or [B,H,W,1], got {tuple(tensor.shape)}")
+
+
+def _to_bhw_mask(mask: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """Normalize masks to shape [B, H, W] and align to ref depth tensor shape."""
+    mask_bhw = _to_bhw_depth(mask).bool()
+    if mask_bhw.shape != ref.shape:
+        raise ValueError(f"Mask shape {tuple(mask_bhw.shape)} does not match reference shape {tuple(ref.shape)}")
+    return mask_bhw
+
+
+def pearson_correlation_depth_loss(
+    rendered_depth,
+    prior_depth,
+    mask=None,
+    min_valid_pixels=100,
+    eps=1e-8,
+):
+    """
+    Scale-invariant depth supervision using absolute Pearson correlation.
+
+    This is suitable for monocular depth priors (e.g., Depth Anything V2)
+    where absolute metric scale is ambiguous.
+
+    Args:
+        rendered_depth: [H, W] rendered metric depth from 3DGS
+        prior_depth: [H, W] monocular estimated depth (scale-invariant)
+        mask: Optional [H, W] boolean mask for valid pixels
+        min_valid_pixels: Minimum valid samples required to compute correlation
+        eps: Numerical stability epsilon
+
+    Returns:
+        loss: Scalar loss = 1 - |corr|
+        corr: Pearson correlation in [-1, 1]
+
+    Raises:
+        RuntimeError: If insufficient valid pixels or degenerate variance
+    """
+    d_ren = _to_bhw_depth(rendered_depth)
+    d_pri = _to_bhw_depth(prior_depth)
+
+    if d_ren.shape != d_pri.shape:
+        raise ValueError(f"Depth shape mismatch: rendered {tuple(d_ren.shape)} vs prior {tuple(d_pri.shape)}")
+
+    finite = torch.isfinite(d_ren) & torch.isfinite(d_pri)
+    valid = finite if mask is None else (_to_bhw_mask(mask, d_ren) & finite)
+
+    batch_size = d_ren.shape[0]
+    valid_flat = valid.reshape(batch_size, -1)
+    valid_counts = valid_flat.sum(dim=1)
+
+    if (valid_counts < min_valid_pixels).any():
+        raise RuntimeError(
+            "Insufficient valid pixels for Pearson depth loss in batch. "
+            f"min={int(valid_counts.min().item())}, required={min_valid_pixels}, "
+            f"counts={valid_counts.tolist()}"
+        )
+
+    x = d_ren.reshape(batch_size, -1)
+    y = d_pri.reshape(batch_size, -1)
+    v = valid_flat.to(x.dtype)
+
+    denom = valid_counts.clamp_min(1).to(x.dtype)
+
+    sum_x = (x * v).sum(dim=1)
+    sum_y = (y * v).sum(dim=1)
+    mean_x = sum_x / denom
+    mean_y = sum_y / denom
+
+    x_centered = (x - mean_x[:, None]) * v
+    y_centered = (y - mean_y[:, None]) * v
+
+    var_x = (x_centered * x_centered).sum(dim=1) / denom
+    var_y = (y_centered * y_centered).sum(dim=1) / denom
+
+    if (var_x < eps).any() or (var_y < eps).any():
+        raise RuntimeError(
+            "Degenerate variance in Pearson depth loss for at least one batch element. "
+            f"min_var_x={var_x.min().item():.4e}, min_var_y={var_y.min().item():.4e}"
+        )
+
+    cov_xy = (x_centered * y_centered).sum(dim=1) / denom
+    corr = cov_xy / torch.sqrt(var_x * var_y + eps)
+    corr = torch.clamp(corr, min=-1.0, max=1.0)
+
+    loss = (1.0 - torch.abs(corr)).mean()
+    return loss, corr
+
+def silog_depth_loss(
+    rendered_depth,
+    prior_depth,
+    mask=None,
+    min_valid_pixels=100,
+    lambda_factor=1.0, # 1.0 for full scale invariance
+    eps=1e-8,
+):
+    """
+    Scale-Invariant Logarithmic (Si-Log) depth loss.
+    Commonly used in NYU Depth V2 and KITTI benchmarks.
+    
+    Args:
+        rendered_depth: [H, W] rendered metric depth from 3DGS
+        prior_depth: [H, W] monocular estimated depth
+        mask: Optional [H, W] boolean mask
+        lambda_factor: The scale-invariance weight (0 to 1). 
+                       1.0 means fully scale-invariant.
+    """
+    d_ren = _to_bhw_depth(rendered_depth)
+    d_pri = _to_bhw_depth(prior_depth)
+
+    if d_ren.shape != d_pri.shape:
+        raise ValueError(f"Depth shape mismatch: rendered {tuple(d_ren.shape)} vs prior {tuple(d_pri.shape)}")
+
+    finite = torch.isfinite(d_ren) & torch.isfinite(d_pri)
+    positive = (d_ren > eps) & (d_pri > eps)
+    valid = finite & positive
+    if mask is not None:
+        valid = valid & _to_bhw_mask(mask, d_ren)
+
+    batch_size = d_ren.shape[0]
+    valid_flat = valid.reshape(batch_size, -1)
+    valid_counts = valid_flat.sum(dim=1)
+    valid_batches = valid_counts >= min_valid_pixels
+
+    if not valid_batches.any():
+        return torch.tensor(0.0, device=d_ren.device, requires_grad=True)
+
+    log_ren = torch.zeros_like(d_ren)
+    log_pri = torch.zeros_like(d_pri)
+    log_ren[valid] = torch.log(d_ren[valid])
+    log_pri[valid] = torch.log(d_pri[valid])
+
+    diff = (log_ren - log_pri).reshape(batch_size, -1)
+    diff = diff * valid_flat.to(diff.dtype)
+
+    denom = valid_counts.clamp_min(1).to(diff.dtype)
+    mse_term = (diff * diff).sum(dim=1) / denom
+    scale_term = (diff.sum(dim=1) ** 2) / (denom ** 2)
+
+    loss_per_batch = mse_term - lambda_factor * scale_term
+    loss = loss_per_batch[valid_batches].mean()
+
+    return loss * 10.0
 
 def scale_regularization(scales, weight=0.01, scene_extent=1.0):
     """
@@ -50,6 +206,47 @@ def opacity_regularization(opacities, weight=0.0001):
     # Use L2 penalty to gently discourage very low opacities
 
     return weight * opacities.mean()
+
+
+def opacity_entropy_regularization(opacities, weight=0.0001, eps=1e-8):
+    """
+    Entropy regularization on opacity to push alpha toward binary values (0 or 1).
+
+    This discourages many tiny semi-transparent "ghost" Gaussians and favors
+    solid, geometry-consistent representations.
+
+    Args:
+        opacities: Tensor of shape [N, 1] or [N] containing opacity values in [0, 1]
+        weight: Regularization weight
+        eps: Numerical stability epsilon for log
+
+    Returns:
+        Scalar entropy regularization loss
+    """
+    alpha = opacities
+
+    if alpha.numel() == 0:
+        return torch.zeros((), device=alpha.device, dtype=alpha.dtype)
+
+    finite_mask = torch.isfinite(alpha)
+    if not finite_mask.any():
+        return torch.zeros((), device=alpha.device, dtype=alpha.dtype)
+
+    alpha = alpha[finite_mask]
+
+    # If logits were accidentally passed instead of probabilities, map to [0, 1].
+    if ((alpha < 0.0) | (alpha > 1.0)).any():
+        alpha = torch.sigmoid(alpha)
+
+    # Numerically stable binary entropy:
+    # xlogy handles 0 * log(0) safely as 0 without requiring clamp.
+    entropy = -(
+        torch.special.xlogy(alpha, alpha)
+        + torch.special.xlogy(1.0 - alpha, 1.0 - alpha)
+    )
+
+    entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
+    return weight * entropy.mean()
 
 
 def depth_regularization(depths, near_plane=0.1, weight=0.01):
@@ -114,28 +311,44 @@ def gradient_loss(render, gt):
     Calculates the L1 difference between the gradients of the rendered and GT images.
     Inputs: [H, W, C] tensors.
     """
-    # 1. Compute Gradients in X and Y
-    # We simply subtract adjacent pixels.
-    # Diff X: (Pixel[i+1] - Pixel[i])
-    # Diff Y: (Pixel[j+1] - Pixel[j])
-    
-    # Slice to shift images
-    # [:-1, :, :] = All rows except last
-    # [1:, :, :]  = All rows except first
-    
-    # Gradient X
-    r_grad_x = render[:, 1:, :] - render[:, :-1, :]
-    g_grad_x = gt[:, 1:, :] - gt[:, :-1, :]
-    
-    # Gradient Y
-    r_grad_y = render[1:, :, :] - render[:-1, :, :]
-    g_grad_y = gt[1:, :, :] - gt[:-1, :, :]
-    
-    # 2. L1 Loss on the Gradients
-    loss_x = torch.abs(r_grad_x - g_grad_x).mean()
-    loss_y = torch.abs(r_grad_y - g_grad_y).mean()
-    
-    return loss_x + loss_y
+    # Accept both [H, W, C] and [B, H, W, C]
+    if render.dim() == 3:
+        render = render.unsqueeze(0)
+    if gt.dim() == 3:
+        gt = gt.unsqueeze(0)
+
+    if render.shape != gt.shape:
+        raise ValueError(f"Shape mismatch in gradient_loss: render {tuple(render.shape)} vs gt {tuple(gt.shape)}")
+
+    # Gradient X (width direction)
+    r_grad_x = render[:, :, 1:, :] - render[:, :, :-1, :]
+    g_grad_x = gt[:, :, 1:, :] - gt[:, :, :-1, :]
+
+    # Gradient Y (height direction)
+    r_grad_y = render[:, 1:, :, :] - render[:, :-1, :, :]
+    g_grad_y = gt[:, 1:, :, :] - gt[:, :-1, :, :]
+
+    loss_x = torch.abs(r_grad_x - g_grad_x).mean(dim=(1, 2, 3))
+    loss_y = torch.abs(r_grad_y - g_grad_y).mean(dim=(1, 2, 3))
+
+    return (loss_x + loss_y).mean()
+
+
+def sharpness_aware_minimization_loss(render, gt):
+    """
+    Sharpness-aware reconstruction loss in image-gradient space.
+
+    This proxy encourages rendered images to preserve high-frequency details
+    by matching edge gradients with the ground truth image.
+
+    Args:
+        render: [H, W, C] rendered RGB image
+        gt: [H, W, C] ground-truth RGB image
+
+    Returns:
+        Scalar sharpness-aware loss
+    """
+    return gradient_loss(render, gt)
 
 
 def convert_relative_to_metric_depth(render_depth, prior_depth, mask=None):
@@ -157,57 +370,52 @@ def convert_relative_to_metric_depth(render_depth, prior_depth, mask=None):
         RuntimeError: If depth data is completely invalid and cannot be processed
     """
     
-    device = render_depth.device
-    
-    # Apply mask if provided
-    if mask is not None:
-        num_masked = mask.sum().item()
-        if num_masked < 10:
-            raise RuntimeError(
-                f"Insufficient valid pixels for depth loss: only {num_masked} pixels with mask. "
-                f"Check alpha/opacity values and depth rendering."
-            )
-        render_flat = render_depth[mask]
-        prior_flat = prior_depth[mask]
-    else:
-        render_flat = render_depth.reshape(-1)
-        prior_flat = prior_depth.reshape(-1)
-    
-    # Remove invalid values (NaN, Inf, negative/zero depths)
+    d_ren = _to_bhw_depth(render_depth)
+    d_pri = _to_bhw_depth(prior_depth)
+
+    if d_ren.shape != d_pri.shape:
+        raise ValueError(f"Depth shape mismatch: rendered {tuple(d_ren.shape)} vs prior {tuple(d_pri.shape)}")
+
     valid = (
-        torch.isfinite(render_flat) & 
-        torch.isfinite(prior_flat) & 
-        (render_flat > 1e-6) &  # Avoid near-zero depths
-        (prior_flat > 1e-6)     # Avoid near-zero priors
+        torch.isfinite(d_ren)
+        & torch.isfinite(d_pri)
+        & (d_ren > 1e-6)
+        & (d_pri > 1e-6)
     )
-    num_valid = valid.sum().item()
-    
-    if num_valid < 10:
+    if mask is not None:
+        valid = valid & _to_bhw_mask(mask, d_ren)
+
+    batch_size = d_ren.shape[0]
+    valid_flat = valid.reshape(batch_size, -1)
+    valid_counts = valid_flat.sum(dim=1)
+
+    if (valid_counts < 10).any():
         raise RuntimeError(
-            f"Insufficient valid depth values: only {num_valid}/{len(render_flat)} pixels are valid. "
-            f"Rendered depth range: [{render_flat.min().item():.4f}, {render_flat.max().item():.4f}], "
-            f"Prior depth range: [{prior_flat.min().item():.4f}, {prior_flat.max().item():.4f}]. "
-            f"Check for NaN/Inf in depth maps."
+            "Insufficient valid depth values for scale-shift alignment in batch. "
+            f"min_valid={int(valid_counts.min().item())}, counts={valid_counts.tolist()}"
         )
-    
-    render_flat = render_flat[valid]
-    prior_flat = prior_flat[valid]
-    
-    # Estimate scale and shift to convert prior depth to metric depth
-    try:
-        scale, shift = estimate_depth_scale_shift(render_flat, prior_flat)
-    except ValueError as e:
-        raise RuntimeError(
-            f"Depth alignment failed. "
-            f"Valid pixels: {num_valid}, "
-            f"Render depth: mean={render_flat.mean():.4f}, std={render_flat.std():.4f}, "
-            f"Prior depth: mean={prior_flat.mean():.4f}, std={prior_flat.std():.4f}. "
-            f"Error: {str(e)}"
-        )
-    
-    # Convert full prior depth to metric space (preserving original shape)
-    prior_depth_metric = prior_depth * scale + shift
-    
+
+    x = d_pri.reshape(batch_size, -1)
+    y = d_ren.reshape(batch_size, -1)
+    v = valid_flat.to(x.dtype)
+    n = valid_counts.to(x.dtype).clamp_min(1.0)
+
+    sum_x = (x * v).sum(dim=1)
+    sum_y = (y * v).sum(dim=1)
+    sum_xx = (x * x * v).sum(dim=1)
+    sum_xy = (x * y * v).sum(dim=1)
+
+    denom = n * sum_xx - sum_x * sum_x
+    if (torch.abs(denom) < 1e-8).any():
+        raise RuntimeError("Depth alignment failed due to near-zero denominator in batched least squares")
+
+    scale = (n * sum_xy - sum_x * sum_y) / denom
+    shift = (sum_y - scale * sum_x) / n
+
+    prior_depth_metric = d_pri * scale[:, None, None] + shift[:, None, None]
+
+    if render_depth.dim() == 2:
+        return prior_depth_metric[0]
     return prior_depth_metric
 
 
@@ -230,33 +438,34 @@ def depth_loss(render_depth, prior_depth, mask=None):
     Raises:
         RuntimeError: If depth data is completely invalid and cannot be processed
     """
-    # Convert relative depth to metric space
-    prior_depth_metric = convert_relative_to_metric_depth(render_depth, prior_depth, mask)
-    
-    # Compute L1 loss between metric depths (on valid pixels only)
-    if mask is not None:
-        render_flat = render_depth[mask]
-        prior_metric_flat = prior_depth_metric[mask]
-    else:
-        render_flat = render_depth.reshape(-1)
-        prior_metric_flat = prior_depth_metric.reshape(-1)
-    
-    # Filter out invalid values for loss computation
-    valid = (
-        torch.isfinite(render_flat) & 
-        torch.isfinite(prior_metric_flat) & 
-        (render_flat > 1e-6) &
-        (prior_metric_flat > 1e-6)
-    )
-    
-    if valid.sum() < 10:
-        raise RuntimeError("Insufficient valid pixels for depth loss computation")
-    
-    loss = torch.abs(render_flat[valid] - prior_metric_flat[valid]).mean()
+    d_ren = _to_bhw_depth(render_depth)
+    prior_depth_metric = convert_relative_to_metric_depth(d_ren, prior_depth, mask)
+    d_pri_metric = _to_bhw_depth(prior_depth_metric)
 
-    print(f"Depth Loss: {loss.item():.4f}, Rendered Depth Range: [{render_flat[valid].min().item():.4f}, {render_flat[valid].max().item():.4f}], Prior Depth Range: [{prior_metric_flat[valid].min().item():.4f}, {prior_metric_flat[valid].max().item():.4f}], Valid Pixels: {valid.sum().item()}")
-    
-    return loss, prior_depth_metric
+    valid = (
+        torch.isfinite(d_ren)
+        & torch.isfinite(d_pri_metric)
+        & (d_ren > 1e-6)
+        & (d_pri_metric > 1e-6)
+    )
+    if mask is not None:
+        valid = valid & _to_bhw_mask(mask, d_ren)
+
+    batch_size = d_ren.shape[0]
+    valid_flat = valid.reshape(batch_size, -1)
+    valid_counts = valid_flat.sum(dim=1)
+
+    if (valid_counts < 10).any():
+        raise RuntimeError("Insufficient valid pixels for depth loss computation in batch")
+
+    diff = torch.abs(d_ren - d_pri_metric).reshape(batch_size, -1)
+    diff = diff * valid_flat.to(diff.dtype)
+    loss_per_batch = diff.sum(dim=1) / valid_counts.to(diff.dtype).clamp_min(1.0)
+    loss = loss_per_batch.mean()
+
+    if render_depth.dim() == 2:
+        return loss, d_pri_metric[0]
+    return loss, d_pri_metric
 
 # def ssim_depth_loss(rendered_depth, prior_depth, mask, ssim_module=None):
 #     """
@@ -424,15 +633,17 @@ class DepthPriorLoss(nn.Module):
         self.thresh = thresh
 
     def forward(self, rendered_depth, prior_disparity, mask=None, ssim_module=None):
-        d_ren = rendered_depth.squeeze()
-        d_pri = prior_disparity.squeeze()
+        d_ren = _to_bhw_depth(rendered_depth)
+        d_pri = _to_bhw_depth(prior_disparity)
+        if d_ren.shape != d_pri.shape:
+            raise ValueError(f"Depth/disparity shape mismatch: rendered {tuple(d_ren.shape)} vs prior {tuple(d_pri.shape)}")
         
         # 1. Stricter Masking
         if mask is None:
             # Ignore depth=0 (uninitialized) and very far depth (sky)
             mask = (d_ren > 0.1) & (d_ren < 100.0) & torch.isfinite(d_ren)
         else:
-            mask = mask.squeeze() & (d_ren > 0.1)
+            mask = _to_bhw_mask(mask, d_ren) & (d_ren > 0.1) & torch.isfinite(d_ren)
 
         # 2. Target is INVERSE depth
         target_inv_ren = 1.0 / (d_ren + 1e-6)
@@ -462,8 +673,8 @@ class DepthPriorLoss(nn.Module):
         if ssim_module is not None:
             # Use disparity for SSIM
             ssim_val = ssim_module(
-                target_inv_ren.view(1, 1, *d_ren.shape[-2:]), 
-                aligned_prior_disp.view(1, 1, *d_pri.shape[-2:])
+                target_inv_ren.unsqueeze(1),
+                aligned_prior_disp.unsqueeze(1)
             )
             ssim_loss = 1.0 - ssim_val
 
@@ -536,8 +747,10 @@ class DepthPriorLossLeastSquares(nn.Module):
 
     def forward(self, rendered_depth, prior_disparity, mask=None, ssim_module=None):
         # 1. Dimensions
-        d_ren = rendered_depth.squeeze()
-        d_pri = prior_disparity.squeeze()
+        d_ren = _to_bhw_depth(rendered_depth)
+        d_pri = _to_bhw_depth(prior_disparity)
+        if d_ren.shape != d_pri.shape:
+            raise ValueError(f"Depth/disparity shape mismatch: rendered {tuple(d_ren.shape)} vs prior {tuple(d_pri.shape)}")
         
         # 2. Convert Rendered Metric Depth (Z) to Rendered Disparity (1/Z)
         # Depth Anything V2 is disparity (larger = closer). We must match this format.
@@ -548,7 +761,7 @@ class DepthPriorLossLeastSquares(nn.Module):
         if mask is None:
             mask = (d_ren > 0.1) & (d_ren < 100.0) & torch.isfinite(d_ren)
         else:
-            mask = mask.squeeze() & (d_ren > 0.1) & torch.isfinite(d_ren)
+            mask = _to_bhw_mask(mask, d_ren) & (d_ren > 0.1) & torch.isfinite(d_ren)
 
         # Safety Check: Prevent NaN crashes
         if mask.sum() < 100:
@@ -572,8 +785,8 @@ class DepthPriorLossLeastSquares(nn.Module):
         ssim_loss = torch.tensor(0.0, device=d_ren.device)
         if ssim_module is not None:
             # SSIM requires [B, C, H, W] and performs best when values are 0-1
-            norm_disp_ren = self.normalize_01(disp_ren, mask).view(1, 1, *d_ren.shape[-2:])
-            norm_target_disp = self.normalize_01(target_disp, mask).view(1, 1, *d_pri.shape[-2:])
+            norm_disp_ren = self.normalize_01(disp_ren, mask).unsqueeze(1)
+            norm_target_disp = self.normalize_01(target_disp, mask).unsqueeze(1)
             
             ssim_val = ssim_module(norm_disp_ren, norm_target_disp)
             ssim_loss = 1.0 - ssim_val
@@ -624,3 +837,4 @@ class DepthPriorLossLeastSquares(nn.Module):
         t = mean_t - s * mean_p
         
         return s, t
+

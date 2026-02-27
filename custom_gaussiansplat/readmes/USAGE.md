@@ -61,15 +61,16 @@ python train.py \
     --densify-until-iter 18000 \
     --densify-interval 100 \
     --grad-threshold 0.0002 \
-    --max-screen-size 20 \
+    --max-screen-size 5000 \
     --opacity-reset-interval 3000 \
+    --opacity-reset-value 0.01 \
     --lr-means 0.00016 \
     --lr-scales 0.005 \
     --lr-quats 0.001 \
     --lr-opacities 0.05 \
     --lr-sh 0.0025 \
     --save-interval 1000 \
-    --log-interval 500 \
+    --log-interval 100 \
     --export-ply
 ```
 
@@ -95,7 +96,7 @@ python train.py \
 |----------|---------|-------------|
 | `--iterations` | `7000` | Total training iterations |
 | `--save-interval` | `1000` | Save checkpoint every N iterations |
-| `--log-interval` | `500` | Log progress every N iterations |
+| `--log-interval` | `1` | Log progress every N iterations |
 
 ### Densification Parameters
 
@@ -105,8 +106,25 @@ python train.py \
 | `--densify-until-iter` | `15000` | Stop densification iteration |
 | `--densify-interval` | `100` | Densify every N iterations |
 | `--grad-threshold` | `0.0002` | Gradient threshold for densification |
-| `--max-screen-size` | `20` | Max screen size (pixels) for pruning |
+| `--max-screen-size` | `5000` | Max screen size (pixels) for pruning |
 | `--opacity-reset-interval` | `3000` | Reset opacity every N iterations |
+| `--opacity-reset-value` | `0.01` | Opacity reset value |
+
+### Depth & Regularization
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--enable-depth-loss` | `False` | Enable depth supervision |
+| `--depth-loss-weight` | `0.1` | Weight for depth supervision |
+| `--depth-loss-start-iter` | `1000` | Start iteration for depth loss |
+| `--depth-objective` | `pearson` | Depth objective (`pearson` or `silog`) |
+| `--sam-loss-weight` | `0.0` | Gradient-domain SAM loss weight |
+| `--enable-scale-reg` | `False` | Enable scale regularization |
+| `--scale-reg-weight` | `0.01` | Scale regularization weight |
+| `--enable-opacity-reg` | `False` | Enable opacity regularization |
+| `--opacity-reg-weight` | `0.0005` | Opacity regularization weight |
+| `--enable-opacity-entropy-reg` | `False` | Enable opacity entropy regularization |
+| `--opacity-entropy-reg-weight` | `0.0001` | Opacity entropy regularization weight |
 
 ### Learning Rates
 
@@ -173,7 +191,7 @@ python train.py \
     --output-dir outputs/conservative \
     --grad-threshold 0.0005 \
     --densify-interval 200 \
-    --max-screen-size 15
+    --max-screen-size 2000
 ```
 
 ### Aggressive Densification
@@ -185,27 +203,25 @@ python train.py \
     --output-dir outputs/aggressive \
     --grad-threshold 0.0001 \
     --densify-interval 50 \
-    --max-screen-size 30
+    --max-screen-size 8000
 ```
 
 ## Python API
 
-You can also use the training function directly in Python:
+The primary supported interface is CLI-based. For scripted execution, call the CLI from Python:
 
 ```python
-from custom_gaussiansplat.train import train_pipeline
+import subprocess
 
-model = train_pipeline(
-    colmap_path='data/boston_colmap/sparse/0',
-    images_path='data/boston/images',
-    output_dir='outputs/my_run',
-    iterations=10000,
-    grad_threshold=0.0003,
-    lr_means=0.0002
-)
-
-# Save as PLY
-model.save_ply('outputs/my_run/final.ply')
+subprocess.run([
+    "python", "custom_gaussiansplat/train.py",
+    "--colmap-path", "data/boston_colmap/sparse/0",
+    "--images-path", "data/boston/images",
+    "--output-dir", "outputs/my_run",
+    "--iterations", "10000",
+    "--grad-threshold", "0.0003",
+    "--lr-means", "0.0002",
+], check=True)
 ```
 
 ## Tips

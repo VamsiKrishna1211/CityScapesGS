@@ -29,6 +29,7 @@ class GSOptimizers:
     opacities: torch.optim.Optimizer
     features_dc: torch.optim.Optimizer
     features_rest: torch.optim.Optimizer
+    features_semantics: torch.optim.Optimizer | None = None
 
     def __getitem__(self, key):
         return getattr(self, key)
@@ -73,6 +74,8 @@ class GS_LR_Schedulers:
     def create_schedulers(cls, optimizers: GSOptimizers, step_size: int, gamma: float):
         schedulers_dict = {}
         for name, optimizer in optimizers.__dict__.items():
+            if optimizer is None:
+                continue
             initial_lr = optimizer.param_groups[0]['lr']
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,

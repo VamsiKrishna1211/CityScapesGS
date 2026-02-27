@@ -3,7 +3,7 @@ from gsplat import spherical_harmonics
 import torch
 import logging
 from gs_types import Parameters, GSOptimizers
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 
 # Module-level logger
 logger = logging.getLogger("cityscape_gs.model")
@@ -26,9 +26,9 @@ def inverse_sigmoid(x):
 class GaussianModel(nn.Module):
     def __init__(self, init_points: torch.Tensor, 
                  init_colors: torch.Tensor, 
-                 sh_degree=3, 
+                 sh_degree=3,
                  train_semantics=False,
-                 feature_dim: Optional[int] = None,
+                 semantics_dim=3,
                  console=None):
         super().__init__()
         num_points = init_points.shape[0]
@@ -72,8 +72,11 @@ class GaussianModel(nn.Module):
         self._features_dc = nn.Parameter(init_colors.unsqueeze(1)) # [N, 1, 3]
         self._features_rest = nn.Parameter(torch.zeros(num_points, (sh_degree + 1)**2 - 1, 3, device=init_points.device)) # [N, D, 3]
 
-        if feature_dim is not None:
-            self._features_sem = nn.Parameter(torch.zeros(num_points, feature_dim, device=init_points.device))
+        if train_semantics:
+            # 6. Optional Semantic Features (e.g., for semantic segmentation)
+            if semantics_dim is None or semantics_dim <= 0:
+                raise ValueError("semantics_dim must be a positive integer when train_semantics is True.")
+            self._features_semantics = nn.Parameter(torch.zeros(num_points, semantics_dim, device=init_points.device)) # [N, semantics_dim]
         
         # Visibility tracking buffer for multi-view consistency (floater prevention)
         self.register_buffer('view_count', torch.zeros(num_points, device=init_points.device))
@@ -92,6 +95,12 @@ class GaussianModel(nn.Module):
     
     @property
     def sh(self): return torch.cat([self._features_dc, self._features_rest], dim=1)
+
+    @property
+    def semantics(self):
+        if hasattr(self, '_features_semantics'):
+            return self._features_semantics
+        return None
     
     def add_view_count(self, alpha_contributions, threshold=0.5):
         """
@@ -111,7 +120,7 @@ class GaussianModel(nn.Module):
         Returns:
             Dictionary mapping parameter names to Parameter tensors
         """
-        return {
+        params = {
             "means": self._means,
             "scales": self._scales,
             "quats": self._quats,
@@ -119,6 +128,9 @@ class GaussianModel(nn.Module):
             "features_dc": self._features_dc,
             "features_rest": self._features_rest,
         }
+        if hasattr(self, '_features_semantics'):
+            params["features_semantics"] = self._features_semantics
+        return params
     
     def get_optimizers_dict(self, optimizers: GSOptimizers) -> Dict[str, torch.optim.Optimizer]:
         """Convert GSOptimizers to dictionary for strategy interface.
@@ -129,7 +141,7 @@ class GaussianModel(nn.Module):
         Returns:
             Dictionary mapping parameter names to optimizers
         """
-        return {
+        optimizers_dict = {
             "means": optimizers.means,
             "scales": optimizers.scales,
             "quats": optimizers.quats,
@@ -137,6 +149,9 @@ class GaussianModel(nn.Module):
             "features_dc": optimizers.features_dc,
             "features_rest": optimizers.features_rest,
         }
+        if optimizers.features_semantics is not None:
+            optimizers_dict["features_semantics"] = optimizers.features_semantics
+        return optimizers_dict
     
     def update_params_from_dict(self, params: Dict[str, nn.Parameter]):
         """Update model parameters from dictionary after strategy operations.
@@ -154,6 +169,8 @@ class GaussianModel(nn.Module):
         self._opacities = params["opacities"]
         self._features_dc = params["features_dc"]
         self._features_rest = params["features_rest"]
+        if "features_semantics" in params:
+            self._features_semantics = params["features_semantics"]
     
     def create_optimizers(
         self,
@@ -162,6 +179,7 @@ class GaussianModel(nn.Module):
         lr_quats: float = 0.001,
         lr_opacities: float = 0.05,
         lr_sh: float = 0.0025,
+        lr_semantics: float | None = None,
         means_lr_multiplier: float = 5.0,
     ) -> GSOptimizers:
         """Create optimizers for all model parameters.
@@ -172,11 +190,19 @@ class GaussianModel(nn.Module):
             lr_quats: Learning rate for Gaussian rotations
             lr_opacities: Learning rate for Gaussian opacities
             lr_sh: Learning rate for spherical harmonics coefficients
+            lr_semantics: Learning rate for semantic features (defaults to lr_sh)
             means_lr_multiplier: Multiplier for means learning rate (default: 5.0)
             
         Returns:
             GSOptimizers: Named tuple containing optimizers for each parameter group
         """
+        if lr_semantics is None:
+            lr_semantics = lr_sh
+
+        semantics_optimizer = None
+        if hasattr(self, '_features_semantics'):
+            semantics_optimizer = torch.optim.Adam([self._features_semantics], lr=lr_semantics)
+
         return GSOptimizers(
             means=torch.optim.Adam([self._means], lr=lr_means * means_lr_multiplier),
             scales=torch.optim.Adam([self._scales], lr=lr_scales),
@@ -184,6 +210,7 @@ class GaussianModel(nn.Module):
             opacities=torch.optim.Adam([self._opacities], lr=lr_opacities),
             features_dc=torch.optim.Adam([self._features_dc], lr=lr_sh),
             features_rest=torch.optim.Adam([self._features_rest], lr=lr_sh*0.1),
+            features_semantics=semantics_optimizer,
         )
     
     def save_ply(self, path):
@@ -224,23 +251,108 @@ class GaussianModel(nn.Module):
         logger.info(f"[green]✓ Saved {xyz.shape[0]:,} Gaussians to[/green] {path}")
     
     @classmethod
-    def load_checkpoint(cls, checkpoint_path, device='cuda'):
-        """Load model from checkpoint."""
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        
-        # Create a dummy model to get structure (will be overwritten)
-        dummy_points = torch.zeros((1, 3), device=device)
-        dummy_colors = torch.zeros((1, 3), device=device)
-        model = cls(dummy_points, dummy_colors)
-        
-        # Load state dict
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model = model.to(device)
-        
+    def from_checkpoint(
+        cls,
+        checkpoint_path,
+        device='cuda',
+        sh_degree=None,
+        train_semantics=False,
+        semantics_dim=3,
+        console=None,
+        strict=False,
+        return_checkpoint=False,
+    ):
+        """Construct a GaussianModel from a training checkpoint.
+
+        Args:
+            checkpoint_path: Path to checkpoint file.
+            device: Target device.
+            sh_degree: Optional SH degree override. If None, inferred from checkpoint.
+            train_semantics: Whether to initialize semantic features if not inferable.
+            semantics_dim: Semantic feature dimension fallback.
+            console: Optional rich console.
+            strict: Whether to enforce strict state-dict loading.
+            return_checkpoint: If True, returns (model, checkpoint_dict).
+
+        Returns:
+            model or (model, checkpoint)
+        """
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        if 'model_state_dict' not in checkpoint:
+            raise KeyError(f"Checkpoint missing 'model_state_dict': {checkpoint_path}")
+
+        state_dict = dict(checkpoint['model_state_dict'])
+
+        if '_means' not in state_dict:
+            raise KeyError("Checkpoint state_dict missing '_means'")
+
+        num_gaussians = state_dict['_means'].shape[0]
+
+        if sh_degree is None:
+            features_rest = state_dict.get('_features_rest', None)
+            if features_rest is not None:
+                sh_degree = int((features_rest.shape[1] + 1) ** 0.5) - 1
+            else:
+                sh_degree = 3
+
+        if '_features_semantics' in state_dict:
+            train_semantics = True
+            semantics_dim = state_dict['_features_semantics'].shape[1]
+
+        dummy_points = torch.zeros((num_gaussians, 3), device=device)
+        dummy_colors = torch.zeros((num_gaussians, 3), device=device)
+        model = cls(
+            dummy_points,
+            dummy_colors,
+            sh_degree=sh_degree,
+            train_semantics=train_semantics,
+            semantics_dim=semantics_dim,
+            console=console,
+        ).to(device)
+
+        if 'view_count' in state_dict:
+            del state_dict['view_count']
+
+        model.load_state_dict(state_dict, strict=strict)
+        model.view_count = torch.zeros(len(model._means), device=device)
+
         logger.info(f"[green]✓ Loaded model from[/green] {checkpoint_path}")
         if 'iteration' in checkpoint:
             logger.debug(f"[dim]Checkpoint iteration: {checkpoint['iteration']}[/dim]")
-        if 'num_gaussians' in checkpoint:
-            logger.debug(f"[dim]Number of Gaussians: {checkpoint['num_gaussians']:,}[/dim]")
-        
+        logger.debug(f"[dim]Number of Gaussians: {num_gaussians:,}[/dim]")
+
+        if return_checkpoint:
+            return model, checkpoint
         return model
+
+    @classmethod
+    def load_checkpoint(cls, checkpoint_path, device='cuda'):
+        """Load model from checkpoint (backward-compatible helper)."""
+        return cls.from_checkpoint(
+            checkpoint_path=checkpoint_path,
+            device=device,
+            return_checkpoint=False,
+        )
+
+    @classmethod
+    def resume_from_checkpoint(
+        cls,
+        checkpoint_path,
+        device='cuda',
+        sh_degree=None,
+        train_semantics=False,
+        semantics_dim=3,
+        console=None,
+        strict=False,
+    ) -> Tuple["GaussianModel", Dict]:
+        """Load model and checkpoint dict for training resume workflows."""
+        return cls.from_checkpoint(
+            checkpoint_path=checkpoint_path,
+            device=device,
+            sh_degree=sh_degree,
+            train_semantics=train_semantics,
+            semantics_dim=semantics_dim,
+            console=console,
+            strict=strict,
+            return_checkpoint=True,
+        )
