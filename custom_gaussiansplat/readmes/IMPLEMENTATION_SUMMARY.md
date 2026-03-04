@@ -65,7 +65,6 @@ This implementation adds comprehensive anti-floater optimizations to the 3D Gaus
 ### 1. [losses.py](custom_gaussiansplat/losses.py) - NEW FILE
 - `scale_regularization()` - Penalize large scales
 - `depth_regularization()` - Penalize near-camera Gaussians (helper)
-- `opacity_scale_regularization()` - Combined penalty for large+transparent Gaussians
 
 ### 2. [model.py](custom_gaussiansplat/model.py) - MODIFIED
 - Added `view_count` buffer for visibility tracking (line 48)

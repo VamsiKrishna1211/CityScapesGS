@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
+from typing import cast
 
 logger = logging.getLogger("cityscape_gs.model")
 
@@ -33,6 +34,11 @@ def _to_bhw_mask(mask: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return mask_bhw
 
 
+def _to_inverse_depth(depth: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Convert metric depth to inverse depth/disparity safely."""
+    return 1.0 / torch.clamp(depth, min=eps)
+
+
 def pearson_correlation_depth_loss(
     rendered_depth,
     prior_depth,
@@ -41,33 +47,38 @@ def pearson_correlation_depth_loss(
     eps=1e-8,
 ):
     """
-    Scale-invariant depth supervision using absolute Pearson correlation.
+    Scale-invariant depth/disparity supervision using signed Pearson correlation.
 
     This is suitable for monocular depth priors (e.g., Depth Anything V2)
     where absolute metric scale is ambiguous.
 
     Args:
         rendered_depth: [H, W] rendered metric depth from 3DGS
-        prior_depth: [H, W] monocular estimated depth (scale-invariant)
+        prior_depth: [H, W] monocular prior (typically disparity / inverse depth)
         mask: Optional [H, W] boolean mask for valid pixels
         min_valid_pixels: Minimum valid samples required to compute correlation
         eps: Numerical stability epsilon
 
     Returns:
-        loss: Scalar loss = 1 - |corr|
+        loss: Scalar loss = 1 - corr
         corr: Pearson correlation in [-1, 1]
 
     Raises:
         RuntimeError: If insufficient valid pixels or degenerate variance
     """
-    d_ren = _to_bhw_depth(rendered_depth)
+    d_ren_metric = _to_bhw_depth(rendered_depth)
     d_pri = _to_bhw_depth(prior_depth)
 
-    if d_ren.shape != d_pri.shape:
-        raise ValueError(f"Depth shape mismatch: rendered {tuple(d_ren.shape)} vs prior {tuple(d_pri.shape)}")
+    if d_ren_metric.shape != d_pri.shape:
+        raise ValueError(f"Depth shape mismatch: rendered {tuple(d_ren_metric.shape)} vs prior {tuple(d_pri.shape)}")
 
-    finite = torch.isfinite(d_ren) & torch.isfinite(d_pri)
-    valid = finite if mask is None else (_to_bhw_mask(mask, d_ren) & finite)
+    d_ren = _to_inverse_depth(d_ren_metric, eps=eps)
+
+    finite = torch.isfinite(d_ren_metric) & torch.isfinite(d_ren) & torch.isfinite(d_pri)
+    positive = d_ren_metric > eps
+    valid = finite & positive
+    if mask is not None:
+        valid = valid & _to_bhw_mask(mask, d_ren)
 
     batch_size = d_ren.shape[0]
     valid_flat = valid.reshape(batch_size, -1)
@@ -107,7 +118,7 @@ def pearson_correlation_depth_loss(
     corr = cov_xy / torch.sqrt(var_x * var_y + eps)
     corr = torch.clamp(corr, min=-1.0, max=1.0)
 
-    loss = (1.0 - torch.abs(corr)).mean()
+    loss = (1.0 - corr).mean()
     return loss, corr
 
 def silog_depth_loss(
@@ -119,24 +130,26 @@ def silog_depth_loss(
     eps=1e-8,
 ):
     """
-    Scale-Invariant Logarithmic (Si-Log) depth loss.
+    Scale-Invariant Logarithmic (Si-Log) loss in disparity space.
     Commonly used in NYU Depth V2 and KITTI benchmarks.
     
     Args:
         rendered_depth: [H, W] rendered metric depth from 3DGS
-        prior_depth: [H, W] monocular estimated depth
+        prior_depth: [H, W] monocular prior disparity / inverse depth
         mask: Optional [H, W] boolean mask
         lambda_factor: The scale-invariance weight (0 to 1). 
                        1.0 means fully scale-invariant.
     """
-    d_ren = _to_bhw_depth(rendered_depth)
+    d_ren_metric = _to_bhw_depth(rendered_depth)
     d_pri = _to_bhw_depth(prior_depth)
 
-    if d_ren.shape != d_pri.shape:
-        raise ValueError(f"Depth shape mismatch: rendered {tuple(d_ren.shape)} vs prior {tuple(d_pri.shape)}")
+    if d_ren_metric.shape != d_pri.shape:
+        raise ValueError(f"Depth shape mismatch: rendered {tuple(d_ren_metric.shape)} vs prior {tuple(d_pri.shape)}")
 
-    finite = torch.isfinite(d_ren) & torch.isfinite(d_pri)
-    positive = (d_ren > eps) & (d_pri > eps)
+    d_ren = _to_inverse_depth(d_ren_metric, eps=eps)
+
+    finite = torch.isfinite(d_ren_metric) & torch.isfinite(d_ren) & torch.isfinite(d_pri)
+    positive = (d_ren_metric > eps) & (d_pri > eps)
     valid = finite & positive
     if mask is not None:
         valid = valid & _to_bhw_mask(mask, d_ren)
@@ -181,19 +194,28 @@ def scale_regularization(scales, weight=0.01, scene_extent=1.0):
     Returns:
         Scalar regularization loss
     """
-    # Compute max scale for each Gaussian
+    # 1. Get the max dimension of each Gaussian
     max_scales = torch.max(scales, dim=1).values
     
-    # Penalize scales proportional to scene extent
-    # Use L2 penalty to gently discourage large scales
-    normalized_scales = max_scales / scene_extent
-    loss = weight * (normalized_scales ** 2).mean()
+    # 2. Define the absolute maximum allowed size (e.g., 5% of the scene)
+    # Adjust this threshold based on your specific scene size.
+    size_limit = scene_extent * 0.05 
+    
+    # 3. Only calculate penalty for Gaussians larger than the limit
+    # ReLU ensures anything smaller than the limit gets 0 penalty.
+    excess_scale = torch.relu(max_scales - size_limit)
+    
+    # 4. CRITICAL: Use .sum(), NOT .mean()
+    # This ensures a massive blob gets hit with the full weight of the penalty,
+    # regardless of how many millions of tiny Gaussians exist.
+    loss = weight * excess_scale.sum()
     
     return loss
+    
 
 def opacity_regularization(opacities, weight=0.0001):
     """
-    Penalize low-opacity Gaussians to prevent them from becoming floaters.
+    Penalize high-opacity Gaussians to encourage sparsity.
     
     Args:
         opacities: Tensor of shape [N, 1] containing opacity values
@@ -202,8 +224,8 @@ def opacity_regularization(opacities, weight=0.0001):
     Returns:
         Scalar regularization loss
     """
-    # Penalize very low opacities (e.g., < 0.1)
-    # Use L2 penalty to gently discourage very low opacities
+    # This term pushes opacities downward on average.
+    # Use together with entropy regularization when binary alpha is desired.
 
     return weight * opacities.mean()
 
@@ -269,43 +291,6 @@ def depth_regularization(depths, near_plane=0.1, weight=0.01):
     return loss
 
 
-def opacity_scale_regularization(opacities, scales, opacity_threshold=0.1, scale_threshold=0.1, scene_extent=1.0):
-    """
-    Penalize Gaussians that are both large AND transparent (classic floater signature).
-    
-    Logic: Floaters are often large, semi-transparent blobs. Real geometry is usually
-    small and opaque. This combines both criteria.
-    
-    Args:
-        opacities: Tensor of shape [N, 1] containing opacity values
-        scales: Tensor of shape [N, 3] containing Gaussian scales
-        opacity_threshold: Opacity below which a Gaussian is considered transparent
-        scale_threshold: Scale threshold as fraction of scene_extent
-        scene_extent: Scene extent for normalization
-    
-    Returns:
-        Scalar regularization loss
-    """
-    max_scales = torch.max(scales, dim=1).values
-    normalized_scales = max_scales / scene_extent
-    
-    # Identify large, transparent Gaussians
-    is_large = normalized_scales > scale_threshold
-    is_transparent = opacities.squeeze(-1) < opacity_threshold
-    floater_mask = is_large & is_transparent
-    
-    # Penalize these Gaussians
-    # We penalize both their scale and inverse opacity
-    if floater_mask.any():
-        scale_penalty = normalized_scales[floater_mask].sum()
-        opacity_penalty = (1.0 - opacities.squeeze(-1)[floater_mask]).sum()
-        loss = scale_penalty + opacity_penalty
-    else:
-        loss = torch.tensor(0.0, device=opacities.device)
-    
-    return loss
-
-
 def gradient_loss(render, gt):
     """
     Calculates the L1 difference between the gradients of the rendered and GT images.
@@ -353,14 +338,15 @@ def sharpness_aware_minimization_loss(render, gt):
 
 def convert_relative_to_metric_depth(render_depth, prior_depth, mask=None):
     """
-    Convert relative depth to metric depth using scale-shift alignment.
+    Convert relative disparity/inverse-depth prior to metric depth.
     
-    Estimates scale and shift parameters to align prior (relative) depth with
-    rendered (metric) depth, then converts the full prior depth map to metric space.
+    Estimates scale and shift in disparity space:
+        inv(Z_render) ≈ s * D_prior + t
+    then converts aligned disparity back to metric depth.
     
     Args:
         render_depth: [H, W] - Metric depth from Gaussian Splatting rendering
-        prior_depth: [H, W] - Relative depth from Depth Anything V2 (normalized to [0, 1])
+        prior_depth: [H, W] - Relative disparity / inverse depth prior
         mask: [H, W] - Boolean mask for valid pixels (e.g., high opacity regions)
     
     Returns:
@@ -376,8 +362,11 @@ def convert_relative_to_metric_depth(render_depth, prior_depth, mask=None):
     if d_ren.shape != d_pri.shape:
         raise ValueError(f"Depth shape mismatch: rendered {tuple(d_ren.shape)} vs prior {tuple(d_pri.shape)}")
 
+    d_ren_disp = _to_inverse_depth(d_ren)
+
     valid = (
         torch.isfinite(d_ren)
+        & torch.isfinite(d_ren_disp)
         & torch.isfinite(d_pri)
         & (d_ren > 1e-6)
         & (d_pri > 1e-6)
@@ -396,7 +385,7 @@ def convert_relative_to_metric_depth(render_depth, prior_depth, mask=None):
         )
 
     x = d_pri.reshape(batch_size, -1)
-    y = d_ren.reshape(batch_size, -1)
+    y = d_ren_disp.reshape(batch_size, -1)
     v = valid_flat.to(x.dtype)
     n = valid_counts.to(x.dtype).clamp_min(1.0)
 
@@ -410,9 +399,11 @@ def convert_relative_to_metric_depth(render_depth, prior_depth, mask=None):
         raise RuntimeError("Depth alignment failed due to near-zero denominator in batched least squares")
 
     scale = (n * sum_xy - sum_x * sum_y) / denom
+    scale = torch.clamp(scale, min=1e-4)
     shift = (sum_y - scale * sum_x) / n
 
-    prior_depth_metric = d_pri * scale[:, None, None] + shift[:, None, None]
+    aligned_disp = d_pri * scale[:, None, None] + shift[:, None, None]
+    prior_depth_metric = 1.0 / torch.clamp(aligned_disp, min=1e-6)
 
     if render_depth.dim() == 2:
         return prior_depth_metric[0]
@@ -784,12 +775,16 @@ class DepthPriorLossLeastSquares(nn.Module):
         # SSIM Loss (Structure)
         ssim_loss = torch.tensor(0.0, device=d_ren.device)
         if ssim_module is not None:
-            # SSIM requires [B, C, H, W] and performs best when values are 0-1
-            norm_disp_ren = self.normalize_01(disp_ren, mask).unsqueeze(1)
-            norm_target_disp = self.normalize_01(target_disp, mask).unsqueeze(1)
-            
-            ssim_val = ssim_module(norm_disp_ren, norm_target_disp)
-            ssim_loss = 1.0 - ssim_val
+            # Use shared normalization bounds to preserve alignment.
+            target_valid = target_disp[mask]
+            if target_valid.numel() > 0:
+                vmin, vmax = target_valid.min(), target_valid.max()
+                denom = vmax - vmin + 1e-8
+                norm_disp_ren = ((disp_ren - vmin) / denom).clamp(0.0, 1.0).unsqueeze(1)
+                norm_target_disp = ((target_disp - vmin) / denom).clamp(0.0, 1.0).unsqueeze(1)
+
+                ssim_val = ssim_module(norm_disp_ren, norm_target_disp)
+                ssim_loss = 1.0 - ssim_val
 
         total_loss = self.lambda_l1 * l1_loss + self.lambda_ssim * ssim_loss
 
@@ -838,3 +833,270 @@ class DepthPriorLossLeastSquares(nn.Module):
         
         return s, t
 
+
+class DynamicEdgeAwareDepthSmoothnessLoss(nn.Module):
+    def __init__(self, start_alpha=0.5, end_alpha=2.5, max_steps=15000):
+        """Edge-aware depth smoothness loss with dynamic scheduling of the edge sensitivity parameter (alpha)."""
+        super().__init__()
+        
+        # 1. Scheduler State Variables
+        self.start_alpha = start_alpha
+        self.end_alpha = end_alpha
+        self.max_steps = max_steps
+        self.current_step = 0
+        self.current_alpha = start_alpha
+
+        # 2. Mathematical Constants (Sobel Kernels)
+        sobel_x = torch.tensor([[-1.,  0.,  1.], 
+                                [-2.,  0.,  2.], 
+                                [-1.,  0.,  1.]], dtype=torch.float32).view(1, 1, 3, 3)
+                                
+        sobel_y = torch.tensor([[-1., -2., -1.], 
+                                [ 0.,  0.,  0.], 
+                                [ 1.,  2.,  1.]], dtype=torch.float32).view(1, 1, 3, 3)
+        
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+
+    def step(self):
+        """Mimics a PyTorch LR Scheduler. Call this once per training iteration."""
+        self.current_step += 1
+        factor = min(1.0, self.current_step / self.max_steps)
+        self.current_alpha = self.start_alpha + factor * (self.end_alpha - self.start_alpha)
+
+    def get_last_alpha(self):
+        return self.current_alpha
+
+    def compute_loss(self, depth: torch.Tensor, image: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Executes the robust edge-aware smoothness calculation strictly on valid geometry.
+        
+        Args:
+            depth: Rendered metric depth map [B, 1, H, W]
+            image: Corresponding GT RGB image [B, 3, H, W]
+            mask: Boolean or Float mask of valid pixels [B, 1, H, W]
+        """
+        # 0. Fast Safety Check
+        if mask.sum() < 100:
+            return torch.tensor(0.0, device=depth.device, requires_grad=True)
+
+        # 1. Erode the mask to prevent border artifacts from the 3x3 kernel
+        # We invert the mask, run max_pool (which expands the invalid areas by 1 pixel), and invert back.
+        mask_float = mask.float()
+        invalid_mask = 1.0 - mask_float
+        eroded_invalid = F.max_pool2d(invalid_mask, kernel_size=3, stride=1, padding=1)
+        eroded_valid_mask = (1.0 - eroded_invalid) > 0.5
+
+        # 2. Pad inputs to prevent edge artifacts (Reflection padding)
+        depth_padded = F.pad(depth, (1, 1, 1, 1), mode='reflect')
+        
+        # 3. Calculate depth gradients using the registered buffers
+        sobel_x = cast(torch.Tensor, self.sobel_x)
+        sobel_y = cast(torch.Tensor, self.sobel_y)
+        depth_dx = torch.abs(F.conv2d(depth_padded, sobel_x))
+        depth_dy = torch.abs(F.conv2d(depth_padded, sobel_y))
+
+        # 4. Calculate image gradients (Convert RGB to Grayscale first)
+        gray_image = image.mean(dim=1, keepdim=True)
+        gray_padded = F.pad(gray_image, (1, 1, 1, 1), mode='reflect')
+        
+        image_dx = torch.abs(F.conv2d(gray_padded, sobel_x))
+        image_dy = torch.abs(F.conv2d(gray_padded, sobel_y))
+
+        # 5. Apply Edge-Aware Weights
+        weight_x = torch.exp(-self.current_alpha * image_dx)
+        weight_y = torch.exp(-self.current_alpha * image_dy)
+
+        # 6. Compute Final Weighted Tensors
+        loss_x = depth_dx * weight_x
+        loss_y = depth_dy * weight_y
+
+        # 7. Strictly extract and average only the safe, eroded valid pixels
+        valid_count = eroded_valid_mask.sum()
+        
+        if valid_count < 10:
+            return torch.tensor(0.0, device=depth.device, requires_grad=True)
+            
+        final_loss = (loss_x[eroded_valid_mask].sum() + loss_y[eroded_valid_mask].sum()) / valid_count
+        return final_loss
+    
+    def forward(self, depth, image, mask):
+        return self.compute_loss(depth, image, mask)
+
+
+class PriorGradientMatchingLoss(nn.Module):
+    def __init__(self):
+        """
+        Matches the spatial gradients (slopes/edges) of the rendered disparity 
+        directly to the unnormalized prior disparity by locally normalizing both 
+        to a [0, 1] range before gradient calculation.
+        """
+        super().__init__()
+        
+        # Fixed Mathematical Constants (Sobel Kernels)
+        sobel_x = torch.tensor([[-1.,  0.,  1.], 
+                                [-2.,  0.,  2.], 
+                                [-1.,  0.,  1.]], dtype=torch.float32).view(1, 1, 3, 3)
+                                
+        sobel_y = torch.tensor([[-1., -2., -1.], 
+                                [ 0.,  0.,  0.], 
+                                [ 1.,  2.,  1.]], dtype=torch.float32).view(1, 1, 3, 3)
+        
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+
+    def compute_loss(self, render_disp: torch.Tensor, prior_disp: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Executes structural gradient matching.
+        
+        Args:
+            render_disp: Rendered disparity map (1 / Z) [B, 1, H, W]
+            prior_disp: Raw, unnormalized DA-v2 disparity map [B, 1, H, W]
+            mask: Boolean or Float mask of valid geometry [B, 1, H, W]
+        """
+        # 0. Fast Safety Check
+        if mask.sum() < 100:
+            return torch.tensor(0.0, device=render_disp.device, requires_grad=True)
+
+        # 1. Independent Min-Max Normalization to [0, 1]
+        ren_valid = render_disp[mask]
+        pri_valid = prior_disp[mask]
+        
+        # Protect against empty slices
+        if ren_valid.numel() < 10 or pri_valid.numel() < 10:
+            return torch.tensor(0.0, device=render_disp.device, requires_grad=True)
+            
+        ren_min, ren_max = ren_valid.min(), ren_valid.max()
+        pri_min, pri_max = pri_valid.min(), pri_valid.max()
+        
+        # Normalize the full tensors (invalid regions will be excluded by the eroded mask later)
+        norm_ren_disp = (render_disp - ren_min) / (ren_max - ren_min + 1e-8)
+        norm_pri_disp = (prior_disp - pri_min) / (pri_max - pri_min + 1e-8)
+
+        # 2. Erode the mask to prevent 3x3 kernel border artifacts
+        # If a pixel touches the sky, its gradient is fake. We must exclude it.
+        mask_float = mask.float()
+        invalid_mask = 1.0 - mask_float
+        eroded_invalid = F.max_pool2d(invalid_mask, kernel_size=3, stride=1, padding=1)
+        eroded_valid_mask = (1.0 - eroded_invalid) > 0.5
+
+        # 3. Reflection Padding to prevent edge ringing
+        ren_padded = F.pad(norm_ren_disp, (1, 1, 1, 1), mode='reflect')
+        pri_padded = F.pad(norm_pri_disp, (1, 1, 1, 1), mode='reflect')
+        
+        # 4. Calculate Spatial Gradients (Sobel)
+        sobel_x = cast(torch.Tensor, self.sobel_x)
+        sobel_y = cast(torch.Tensor, self.sobel_y)
+        
+        # We do NOT use absolute values yet. We need the exact directional slope.
+        ren_dx = F.conv2d(ren_padded, sobel_x)
+        ren_dy = F.conv2d(ren_padded, sobel_y)
+        
+        pri_dx = F.conv2d(pri_padded, sobel_x)
+        pri_dy = F.conv2d(pri_padded, sobel_y)
+
+        # 5. Compute the L1 difference between the gradients
+        # This penalizes the rendered geometry if its normalized slope does not exactly match the prior's slope
+        diff_dx = torch.abs(ren_dx - pri_dx)
+        diff_dy = torch.abs(ren_dy - pri_dy)
+
+        # 6. Extract and average over safe, eroded valid pixels
+        valid_count = eroded_valid_mask.sum()
+        
+        if valid_count < 10:
+            return torch.tensor(0.0, device=render_disp.device, requires_grad=True)
+            
+        final_loss = (diff_dx[eroded_valid_mask].sum() + diff_dy[eroded_valid_mask].sum()) / valid_count
+        
+        return final_loss
+    
+    def forward(self, render_disp, prior_disp, mask):
+        return self.compute_loss(render_disp, prior_disp, mask)
+
+
+class FastPriorGradientMatchingLoss(nn.Module):
+    def __init__(self):
+        """
+        Matches the spatial gradients (slopes/edges) of the rendered disparity 
+        directly to the unnormalized prior disparity by locally normalizing both 
+        to a [0, 1] range before gradient calculation.
+        """
+        super().__init__()
+        
+        # 1. Fuse the Sobel kernels into a single tensor [Out_C, In_C, H, W]
+        # Out_C = 2 (channel 0 is dx, channel 1 is dy)
+        sobel_x = torch.tensor([[[-1.,  0.,  1.], 
+                                 [-2.,  0.,  2.], 
+                                 [-1.,  0.,  1.]]], dtype=torch.float32)
+                                
+        sobel_y = torch.tensor([[[-1., -2., -1.], 
+                                 [ 0.,  0.,  0.], 
+                                 [ 1.,  2.,  1.]]], dtype=torch.float32)
+        
+        # Shape: [2, 1, 3, 3]
+        sobel_xy = torch.stack([sobel_x, sobel_y], dim=0)
+        self.register_buffer("sobel_xy", sobel_xy)
+
+    def compute_loss(self, render_depth: torch.Tensor, prior_disp: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Executes structural gradient matching.
+        
+        Args:
+            render_depth: Rendered metric depth map (Z) [B, 1, H, W]
+            prior_disp: Raw, unnormalized DA-v2 disparity map (1/Z) [B, 1, H, W]
+            mask: Boolean mask of valid geometry [B, 1, H, W]
+        """
+        mask_f = mask.float()
+        
+        # 0. Erode mask first (using float math to avoid boolean syncs later)
+        eroded_invalid = F.max_pool2d(1.0 - mask_f, kernel_size=3, stride=1, padding=1)
+        eroded_mask_f = 1.0 - eroded_invalid
+        
+        valid_count = eroded_mask_f.sum()
+        
+        # Safe early exit that doesn't break the graph
+        if valid_count < 10:
+             return (render_depth * 0.0).sum()
+
+        # --- THE FUNDAMENTAL FIX ---
+        # Convert the linear rendered depth into inverse depth (disparity).
+        # We clamp to 1e-4 to prevent ZeroDivisionError, which would flood the graph with NaNs.
+        safe_render_depth = render_depth.clamp(min=1e-4)
+        render_disp = 1.0 / safe_render_depth
+
+        # 1. Min-Max Normalization WITHOUT CUDA Syncs
+        # Apply normalization to the newly computed render_disp and the prior_disp
+        ren_min = torch.where(mask, render_disp, torch.inf).amin(dim=(1, 2, 3), keepdim=True)
+        ren_max = torch.where(mask, render_disp, -torch.inf).amax(dim=(1, 2, 3), keepdim=True)
+        
+        pri_min = torch.where(mask, prior_disp, torch.inf).amin(dim=(1, 2, 3), keepdim=True)
+        pri_max = torch.where(mask, prior_disp, -torch.inf).amax(dim=(1, 2, 3), keepdim=True)
+        
+        norm_ren = (render_disp - ren_min) / (ren_max - ren_min + 1e-8)
+        norm_pri = (prior_disp - pri_min) / (pri_max - pri_min + 1e-8)
+
+        # 2. Fuse the inputs into a single batch for a single padding/conv operation
+        # Shape becomes [2 * B, 1, H, W]
+        combined_disp = torch.cat([norm_ren, norm_pri], dim=0)
+        
+        # 3. Single Pad
+        padded = F.pad(combined_disp, (1, 1, 1, 1), mode='reflect')
+        
+        # 4. Single Fused Convolution
+        # Input: [2*B, 1, H, W], Kernel: [2, 1, 3, 3] -> Output: [2*B, 2, H, W]
+        # Channel 0 is dx, Channel 1 is dy
+        grads = F.conv2d(padded, self.sobel_xy)
+        
+        # 5. Split back into render and prior
+        ren_grads, pri_grads = grads.chunk(2, dim=0)
+        
+        # 6. Compute L1 difference across both dx and dy simultaneously
+        diff_sum = torch.abs(ren_grads - pri_grads).sum(dim=1, keepdim=True)
+
+        # 7. Apply eroded mask as a float multiplication (NO BOOLEAN INDEXING)
+        final_loss = (diff_sum * eroded_mask_f).sum() / (valid_count + 1e-8)
+        
+        return final_loss
+    
+    def forward(self, render_depth, prior_disp, mask):
+        return self.compute_loss(render_depth, prior_disp, mask)

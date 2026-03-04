@@ -8,11 +8,10 @@ from gsplat import rasterization, DefaultStrategy
 from torchmetrics.image import StructuralSimilarityIndexMeasure, PeakSignalNoiseRatio, LearnedPerceptualImagePatchSimilarity, MultiScaleStructuralSimilarityIndexMeasure
 import os
 from pathlib import Path
-import argparse
 import time
 import numpy as np
 import logging
-from typing import Tuple, Optional
+from typing import Tuple, Union
 
 try:
     import nerfview
@@ -30,14 +29,19 @@ from rich.live import Live
 from rich.layout import Layout
 from rich import box
 
-from dataset import ColmapDataset, extract_tensor_patches
+from dataset import ColmapDataset
 from model import GaussianModel, inverse_sigmoid
 from gs_types import GSOptimizers, GS_LR_Schedulers
-from utils import create_viewer_render_fn, format_phase_description, add_cameras_to_viewer
+from utils import format_phase_description
+from viewer_sync import ViewerParamSync
 import losses
 from logger import GaussianSplattingLogger
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from concurrent.futures import ThreadPoolExecutor
+from train_args import TrainConfig, parse_args
+
+# Modules
+from fused_ssim import fused_ssim
 
 ACTIVE_PROGRESS = None
 
@@ -93,7 +97,7 @@ def setup_logger(verbosity: int, output_dir: Path) -> logging.Logger:
     return logger
 
 
-def train_pipeline(config):
+def train_pipeline(config: TrainConfig):
     """
     Train a 3D Gaussian Splatting model.
     
@@ -183,13 +187,41 @@ def train_pipeline(config):
     checkpoint_dir.mkdir(exist_ok=True)
 
     # Setup
+    semantics_path = (
+        Path(semantics_cfg.semantics_path)
+        if semantics_cfg.semantics_path is not None and not isinstance(semantics_cfg.semantics_path, Path)
+        else semantics_cfg.semantics_path
+    )
+    raw_semantics_resolution = semantics_cfg.semantic_image_resolution
+    if isinstance(raw_semantics_resolution, list):
+        if len(raw_semantics_resolution) != 2:
+            raise ValueError(
+                "semantic_image_resolution must contain exactly two values [height, width] when provided as a list."
+            )
+        semantics_resolution: Union[Tuple[int, int], int, None] = (
+            int(raw_semantics_resolution[0]),
+            int(raw_semantics_resolution[1]),
+        )
+    elif isinstance(raw_semantics_resolution, tuple):
+        if len(raw_semantics_resolution) != 2:
+            raise ValueError(
+                "semantic_image_resolution must contain exactly two values (height, width) when provided as a tuple."
+            )
+        semantics_resolution = (
+            int(raw_semantics_resolution[0]),
+            int(raw_semantics_resolution[1]),
+        )
+    else:
+        semantics_resolution = raw_semantics_resolution
+
     dataset = ColmapDataset(required_cfg.colmap_path,
                             required_cfg.images_path, 
                             device=device,
                             train_semantics=semantics_cfg.train_semantics,
                             semantics_dim=semantics_cfg.semantics_dim,
-                            semantics_path=semantics_cfg.semantics_path,
-                            semantics_resolution=semantics_cfg.semantic_image_resolution
+                            semantics_path=semantics_path,
+                            semantics_resolution=semantics_resolution,
+                            scene_extent_margin=5.0,  # Add margin to scene extent to prevent aggressive pruning of boundary Gaussians
                             )
     
     # Check if resuming from checkpoint - if so, load it once and reuse
@@ -267,34 +299,40 @@ def train_pipeline(config):
 
     # Initialize gsplat's DefaultStrategy for densification and pruning
     strategy = DefaultStrategy(
-        prune_opa=0.005,
-        grow_grad2d=densification_cfg.grad_threshold,
+        # prune_opa=0.005,  
         
-        # Threshold for "Clone vs Split" decision
-        # 0.01 is standard. 0.05 was too high (protected blobs).
-        grow_scale3d=0.01,
+        # # Keep gradient threshold standard, but use the dynamic scheduler we built 
+        # # to choke it off later in training.
+        # grow_grad2d=0.0001,  
         
-        # Threshold for "Screen Space Split"
-        # 0.03 = 3% of screen. Small enough for detail, big enough to prevent explosion.
-        grow_scale2d=0.03,
+        # # --- THE CLONING FIX ---
+        # # Drop this aggressively. Force the model to SPLIT (push apart) 
+        # # rather than CLONE (stack in the same spot).
+        # grow_scale3d=0.001, 
         
-        # Threshold for "Big 3D Pruning" (The Blob Killer)
-        # 0.01 = 1% of scene. Good for killing sky blobs.
-        # 0.001 was too harsh (killed walls).
-        prune_scale3d=0.01,
+        # # --- THE DETAIL RECOVERY ---
+        # # Drop back to 0.01 (1% of screen). Let the model build fine, sharp details.
+        # grow_scale2d=0.01,
         
-        # Threshold for "Big 2D Pruning"
-        # 0.10 = 10% of screen. If it covers 10% of the view, kill it.
+        # # --- THE BLOB KILLER ---
+        # # Keep this strict to kill anything that gets massive.
+        # prune_scale3d=0.01,
+        
+        # prune_scale2d=0.20,
+
+        prune_opa=0.005,  
+        grow_grad2d=0.0002, 
+        grow_scale3d=0.01, 
+        grow_scale2d=0.05, 
+        prune_scale3d=0.05,
         prune_scale2d=0.10,
         
-        # Enable the 2D checks
-        refine_scale2d_stop_iter=densification_cfg.densify_until_iter,
+        # Lock in the intervals. Do not densify at iteration 0.
+        refine_start_iter=500,
+        refine_stop_iter=15000,
+        reset_every=3000,
+        refine_every=100,
         
-        # Standard mappings
-        refine_start_iter=densification_cfg.densify_from_iter,
-        refine_stop_iter=densification_cfg.densify_until_iter,
-        reset_every=densification_cfg.opacity_reset_interval,
-        refine_every=densification_cfg.densify_interval,
         pause_refine_after_reset=0,
         absgrad=False,
         revised_opacity=False,
@@ -389,46 +427,53 @@ def train_pipeline(config):
     # Initialize viewer if requested
     viewer = None
     server = None
+    viewer_param_sync = None
     if viewer_cfg.viewer:
         if not VIEWER_AVAILABLE:
             logger.warning("[yellow]⚠ Warning:[/yellow] nerfview not available. Install with: pip install nerfview")
             logger.info("[yellow]Continuing training without viewer...[/yellow]")
         else:
-            # Create render function for viewer
-            render_fn = create_viewer_render_fn(model, device, model.sh_degree)
+            viewer_param_sync = ViewerParamSync(
+                model=model,
+                device=device,
+                disable_sh_rendering=sh_cfg.disable_sh_rendering,
+                refresh_interval=viewer_cfg.viewer_refresh_interval,
+            )
             
             # Initialize viewer
             server = viser.ViserServer(port=viewer_cfg.viewer_port, verbose=False)
             viewer = nerfview.Viewer(
                 server=server,
-                render_fn=render_fn,
+                render_fn=viewer_param_sync.render_fn,
                 mode="training",
             )
             if VERBOSITY >= 1:
                 logger.info(f"[green]📺 Viewer started:[/green] http://localhost:{viewer_cfg.viewer_port}")
 
     # SSIM Loss (Standard Library)
-    # ssim = StructuralSimilarityIndexMeasure(data_range=(0, 1.0))
-    ssim = MultiScaleStructuralSimilarityIndexMeasure(
-        # data_range=(0, 1.0),
-        # betas: weights per scale (scale 1=finest/original → scale 5=coarsest)
-        # Default (0.0448, 0.2856, 0.3001, 0.2363, 0.1333) underweights fine details.
-        # Increased betas[0] & betas[1] to emphasize fine-scale features (text, logos).
-        betas=(0.35, 0.30, 0.20, 0.10, 0.05),
-        sigma=1.0,       # Sharper gaussian kernel → better fine-detail sensitivity
-        normalize='relu',
-    ).to(device)
-    patch_ssim = MultiScaleStructuralSimilarityIndexMeasure(
-        # data_range=(0, 1.0),
-        betas=(0.35, 0.30, 0.20, 0.10, 0.05),
-        sigma=1.0,
-        normalize='relu',
-    ).to(device)
-
+    ssim = StructuralSimilarityIndexMeasure(
+        # data_range=(0, 1.0)
+        ).to(device)
+    # ssim = MultiScaleStructuralSimilarityIndexMeasure(
+    #     # data_range=(0, 1.0),
+    #     # betas: weights per scale (scale 1=finest/original → scale 5=coarsest)
+    #     # Default (0.0448, 0.2856, 0.3001, 0.2363, 0.1333) underweights fine details.
+    #     # Increased betas[0] & betas[1] to emphasize fine-scale features (text, logos).
+    #     # betas=(0.35, 0.30, 0.20, 0.10, 0.05), 
+    #     betas=(0.0448, 0.2856, 0.3001, 0.2363, 0.1333),
+    #     sigma=1.0,       # Sharper gaussian kernel → better fine-detail sensitivity
+    #     normalize='relu',
+    # ).to(device)
     lpips = LearnedPerceptualImagePatchSimilarity(net_type='squeeze', normalize=True).to(device)
 
     psnr = PeakSignalNoiseRatio(data_range=(0, 1.0)).to(device)
-    patch_psnr = PeakSignalNoiseRatio(data_range=(0, 1.0)).to(device)
+
+    # depth_smoothness_loss = losses.DynamicEdgeAwareDepthSmoothnessLoss(
+    #     start_alpha=depth_cfg.depth_smoothness_start_alpha,
+    #     end_alpha=depth_cfg.depth_smoothness_end_alpha,
+    #     max_steps= training_cfg.iterations if depth_cfg.depth_smoothness_max_steps is None else depth_cfg.depth_smoothness_max_steps,  # Avoid scheduling if weight is 0
+    # ).to(device)
+    depth_smoothness_loss = losses.FastPriorGradientMatchingLoss().to(device)
     
     # Optimizer
     # Create optimizers using model's factory method
@@ -443,11 +488,14 @@ def train_pipeline(config):
     )
     
     # Enable learning rate schedulers for improved convergence
-    # schedulers = GS_LR_Schedulers.create_schedulers(
-    #     optimizers,
-    #     step_size=iterations,  # T_max: full cosine period
-    #     gamma=0.1,             # Not used in CosineAnnealingLR but kept for interface
-    # )
+    schedulers = GS_LR_Schedulers.create_schedulers(
+        optimizers,
+        enabled_lrs=GS_LR_Schedulers(
+            means=True,
+        ),
+        step_size=training_cfg.iterations,  # T_max: full cosine period
+        gamma=0.1,             # Not used in CosineAnnealingLR but kept for interface
+    )
     
     if VERBOSITY >= 2:
         logger.debug("[cyan]📈 Optimizers & Schedulers:[/cyan] Adam + CosineAnnealingLR initialized")
@@ -488,7 +536,7 @@ def train_pipeline(config):
         )
         progress.start()
         ACTIVE_PROGRESS = progress
-        task = progress.add_task("[cyan]Training...", total=ITERATIONS, completed=start_iteration)
+        task = progress.add_task("[cyan]Training...", total=training_cfg.iterations, completed=start_iteration)
     
     # Training metrics for display
     current_loss = 0.0
@@ -500,11 +548,9 @@ def train_pipeline(config):
     current_opacity_reg = 0.0
     current_opacity_entropy_reg = 0.0
     current_depth_loss = 0.0
-    current_depth_corr_abs = 0.0
+    current_depth_corr = 0.0
     current_sam_loss = 0.0
     current_semantic_loss = 0.0
-    current_patch_l1 = 0.0
-    current_patch_ssim = 0.0
     iteration_start_time = time.time()
     
     # Create DataLoader for efficient data loading
@@ -527,7 +573,7 @@ def train_pipeline(config):
     # Create iterator that cycles through the dataloader indefinitely
     dataloader_iter = iter(dataloader)
     
-    for step in range(start_iteration, ITERATIONS):
+    for step in range(start_iteration, training_cfg.iterations):
         # Handle viewer pause state
         if viewer is not None:
             while viewer.state == "paused":
@@ -539,11 +585,11 @@ def train_pipeline(config):
         
         # 1. Get Batch - using DataLoader for efficient loading
         try:
-            cam, gt_image, depth_tensor, (semantic_tensor, semantic_image), patch_tensor = next(dataloader_iter) # Depth tensor may be None & if returned, is the raw value without normalization (handled in loss function)
+            cam, gt_image, depth_tensor, (semantic_tensor, semantic_image) = next(dataloader_iter) # Depth tensor may be None & if returned, is the raw value without normalization (handled in loss function)
         except StopIteration:
             # Reset iterator when epoch ends (seamless cycling)
             dataloader_iter = iter(dataloader)
-            cam, gt_image, depth_tensor, (semantic_tensor, semantic_image), patch_tensor = next(dataloader_iter)
+            cam, gt_image, depth_tensor, (semantic_tensor, semantic_image) = next(dataloader_iter)
 
         torch.cuda.synchronize()
         
@@ -591,7 +637,7 @@ def train_pipeline(config):
         )
 
         
-        # Keep batch dimension for patch/batch-compatible losses
+        # Keep batch dimension for batch-compatible losses
         render = render_output[..., 0:3]  # [B, H, W, 3]
         alpha = render_alpha  # [B, H, W, 1] or [B, H, W]
         
@@ -605,7 +651,15 @@ def train_pipeline(config):
             alpha_2d = alpha[..., 0]
         else:
             alpha_2d = alpha
-        render_depth_map = render_depth_raw / (alpha_2d + 1e-6)
+        render_depth_map = render_depth_raw / (alpha_2d + 1e-6) # [B, H, W] - this is the expected depth map that we can compare against depth supervision if enabled
+
+        # Create mask for valid pixels (sufficient opacity + finite values)
+        depth_mask = (
+            (alpha_2d > 0.5)
+            & torch.isfinite(render_depth_map)
+            & (render_depth_map > 0)
+        )
+        depth_mask_bchw = depth_mask.unsqueeze(1)  # [B, 1, H, W] for loss functions that expect channel dim
         
 
         # Get means2d and radii for densification tracking
@@ -636,54 +690,24 @@ def train_pipeline(config):
         gt_perm = gt_image.permute(0, 3, 1, 2)
 
         l1_loss = (render - gt_image).abs().mean()
-        ssim_loss = 1.0 - ssim(render_perm, gt_perm)
+        # ssim_loss = 1.0 - ssim(render_perm, gt_perm)
+        ssim_loss = 1.0 - fused_ssim(
+            render_perm, gt_perm
+        )
 
         # lpips_loss = lpips(render_perm, gt_perm)
         lpips_loss = torch.tensor(0.0, device=device)
         psnr_value = psnr(render_perm, gt_perm)
 
-        # Patch loss supervision (computed from full-res render using dataset patch extraction)
-        patch_l1_loss = torch.tensor(0.0, device=device)
-        patch_ssim_loss = torch.tensor(0.0, device=device)
-        if patch_tensor is not None:
-            if not patch_tensor.is_cuda:
-                patch_tensor = patch_tensor.to(device, non_blocking=True)
+        loss = 0.8 * l1_loss + 0.2 * ssim_loss
 
-            if patch_tensor.dim() == 4:
-                gt_patches = patch_tensor.unsqueeze(0)  # [1, N, H, W, C]
-            elif patch_tensor.dim() == 5:
-                gt_patches = patch_tensor
-            else:
-                raise RuntimeError(f"Unexpected patch tensor shape: {tuple(patch_tensor.shape)}")
+        if depth_cfg.enable_depth_smoothness_loss:
+            # gt_image_bchw = gt_image.permute(0, 3, 1, 2)  # [B, C, H, W]
+            gt_depth_bchw = depth_tensor.unsqueeze(0).unsqueeze(1).to(device) if depth_tensor is not None else None  # [B, 1, H, W]
+            render_depth_map_bchw = render_depth_map.unsqueeze(0)  # [B, 1, H, W]
+            smoothness_loss = depth_smoothness_loss(render_depth_map_bchw, gt_depth_bchw, mask=depth_mask_bchw)
+            loss = loss + depth_cfg.depth_smoothness_loss_weight * smoothness_loss
 
-            patch_h, patch_w = int(gt_patches.shape[-3]), int(gt_patches.shape[-2])
-            patch_stride = dataset.patch_stride if dataset.patch_stride is not None else (patch_h, patch_w)
-
-            render_bchw = render.permute(0, 3, 1, 2)  # [B, C, H, W]
-            pred_patches = extract_tensor_patches(
-                render_bchw,
-                window_size=(patch_h, patch_w),
-                stride=patch_stride,
-                padding=dataset.patch_padding,
-                allow_auto_padding=dataset.patch_allow_auto_padding,
-            ).permute(0, 1, 3, 4, 2).contiguous()  # [B, N, H, W, C]
-            
-            if pred_patches.shape[1] != gt_patches.shape[1]:
-                logger.warning(
-                    f"[yellow]⚠ Warning:[/yellow] Mismatch in number of patches: "
-                    f"pred {pred_patches.shape[1]} vs gt {gt_patches.shape[1]}. "
-                    f"Truncating to smaller count for loss calculation."
-                )
-                raise RuntimeError(
-                    f"Mismatch in number of patches: pred {pred_patches.shape[1]} vs gt {gt_patches.shape[1]}"
-                )
-
-            patch_l1_loss = torch.abs(pred_patches - gt_patches).mean()
-
-            pred_patch_nchw = pred_patches.reshape(-1, patch_h, patch_w, pred_patches.shape[-1]).permute(0, 3, 1, 2)
-            gt_patch_nchw = gt_patches.reshape(-1, patch_h, patch_w, gt_patches.shape[-1]).permute(0, 3, 1, 2)
-            patch_ssim_loss = 1.0 - patch_ssim(pred_patch_nchw, gt_patch_nchw)
-        
         # Depth loss (conditional, scale-invariant for monocular depth priors)
         inv_rendered_depth, inv_prior_depth = None, None
         if depth_cfg.enable_depth_loss and depth_tensor is not None and step >= depth_cfg.depth_loss_start_iter:
@@ -703,13 +727,6 @@ def train_pipeline(config):
             elif depth_tensor.dim() == 4 and depth_tensor.shape[-1] == 1:
                 depth_tensor = depth_tensor[..., 0]
 
-            # Create mask for valid pixels (sufficient opacity + finite values)
-            depth_mask = (
-                (alpha_2d > 0.5)
-                & torch.isfinite(render_depth_map)
-                & torch.isfinite(depth_tensor)
-                & (render_depth_map > 0)
-            )
 
             try:
                 d_loss, depth_corr = losses.pearson_correlation_depth_loss(
@@ -722,22 +739,17 @@ def train_pipeline(config):
                 #     depth_tensor.detach(),
                 #     depth_mask
                 # )
-                # current_depth_corr_abs = 0.0
-                current_depth_corr_abs = depth_corr.abs().item() if not torch.isnan(depth_corr) else 0.0
+                current_depth_corr = depth_corr.mean().item() if torch.isfinite(depth_corr).all() else 0.0
                 inv_rendered_depth = render_depth_map.detach()
                 inv_prior_depth = depth_tensor.detach()
             except RuntimeError as e:
                 d_loss = torch.tensor(0.0, device=device)
-                current_depth_corr_abs = 0.0
+                current_depth_corr = 0.0
                 logger.debug(f"[yellow]⚠ Depth loss skipped:[/yellow] {str(e)}")
         else:
             d_loss = torch.tensor(0.0, device=device)
-            current_depth_corr_abs = 0.0
+            current_depth_corr = 0.0
         
-        # Combine full-image and patch losses
-        full_image_loss = 0.4 * l1_loss + 0.6 * ssim_loss
-        patch_image_loss = 0.4 * patch_l1_loss + 0.6 * patch_ssim_loss
-        loss = 0.5 * full_image_loss + 0.5 * patch_image_loss
         if depth_cfg.enable_depth_loss and depth_tensor is not None and step >= depth_cfg.depth_loss_start_iter:
             loss = loss + depth_cfg.depth_loss_weight * d_loss
 
@@ -752,7 +764,7 @@ def train_pipeline(config):
         if floater_cfg.enable_scale_reg:
             scale_reg_loss = losses.scale_regularization(
                 model.scales, 
-                weight=SCALE_LAMBDA, 
+                weight=floater_cfg.scale_reg_weight, 
                 scene_extent=float(scene_extent)
             )
             loss = loss + scale_reg_loss
@@ -762,7 +774,7 @@ def train_pipeline(config):
         if floater_cfg.enable_opacity_reg:
             opacity_reg_loss = losses.opacity_regularization(
                 model.opacities, 
-                weight=OPACITY_LAMBDA
+                weight=floater_cfg.opacity_reg_weight
             )
             loss = loss + opacity_reg_loss
         else:
@@ -771,13 +783,13 @@ def train_pipeline(config):
         if floater_cfg.enable_opacity_entropy_reg:
             opacity_entropy_reg_loss = losses.opacity_entropy_regularization(
                 model.opacities,
-                weight=OPACITY_ENTROPY_LAMBDA
+                weight=floater_cfg.opacity_entropy_reg_weight
             )
             loss = loss + opacity_entropy_reg_loss
         else:
             opacity_entropy_reg_loss = torch.tensor(0.0, device=device)
 
-        if semantics_cfg.semantic_start_iter < densification_cfg.densify_until_iter:
+        if semantics_cfg.train_semantics and semantics_cfg.semantic_start_iter < densification_cfg.densify_until_iter:
             raise ValueError(
                 f"Semantic supervision start iteration ({semantics_cfg.semantic_start_iter}) must be greater than or equal to densification stop iteration ({densification_cfg.densify_until_iter}) to ensure stable training before applying semantic loss."
             )
@@ -852,20 +864,19 @@ def train_pipeline(config):
 
 
         # Update metrics only periodically for logging to avoid excessive CPU-GPU synchronization
-        if step % training_cfg.log_interval == 0 or step == ITERATIONS - 1:
+        if step % training_cfg.log_interval == 0 or step == training_cfg.iterations - 1:
             current_loss = loss.item()
             current_l1 = l1_loss.item()
             current_ssim = ssim_loss.item()
             current_lpips = lpips_loss.item()
             current_psnr = psnr_value.item()
+            current_depth_smoothness_loss = smoothness_loss.item() if depth_cfg.enable_depth_smoothness_loss else torch.tensor(0.0).item()
             current_scale_reg = scale_reg_loss.item()
             current_opacity_reg = opacity_reg_loss.item()
             current_opacity_entropy_reg = opacity_entropy_reg_loss.item()
             current_depth_loss = d_loss.item()
             current_sam_loss = sam_loss.item()
             current_semantic_loss = semantic_loss.item()
-            current_patch_l1 = patch_l1_loss.item()
-            current_patch_ssim = patch_ssim_loss.item()
             
             # Log metrics to TensorBoard
             if tensorboard_cfg.tensorboard:
@@ -878,12 +889,12 @@ def train_pipeline(config):
                     'scale_reg_loss': current_scale_reg,
                     'opacity_reg_loss': current_opacity_reg,
                     'opacity_entropy_reg_loss': current_opacity_entropy_reg,
-                    'patch_l1_loss': current_patch_l1,
-                    'patch_ssim_loss': current_patch_ssim,
                 }
+                if depth_cfg.enable_depth_smoothness_loss:
+                    losses_dict['depth_smoothness_loss'] = current_depth_smoothness_loss
                 if depth_cfg.enable_depth_loss and step >= depth_cfg.depth_loss_start_iter:
                     losses_dict['depth_loss'] = current_depth_loss
-                    losses_dict['depth_corr_abs'] = current_depth_corr_abs
+                    losses_dict['depth_corr'] = current_depth_corr
                 if depth_cfg.sam_loss_weight > 0.0:
                     losses_dict['sam_loss'] = current_sam_loss
                 if semantics_cfg.train_semantics and semantics_cfg.semantic_loss_weight > 0.0 and step >= semantics_cfg.semantic_start_iter:
@@ -922,9 +933,9 @@ def train_pipeline(config):
                 rendered=render[0].detach(),
                 ground_truth=gt_image[0].detach(),
                 alpha=alpha[0].detach() if alpha.dim() >= 3 else alpha.detach(),
+                rendered_depth_map=render_depth_map[0].detach(),
                 inv_rendered_depth=inv_rendered_depth[0] if inv_rendered_depth is not None else None,
-                inv_prior_depth=inv_prior_depth[0] if inv_prior_depth is not None else None,
-                image_patches=patch_tensor.detach() if patch_tensor is not None else None,
+                inv_prior_depth=depth_tensor.squeeze(0).detach() if depth_tensor is not None else None,
                 step=step
             )
             # tb_logger.log_images(
@@ -949,11 +960,9 @@ def train_pipeline(config):
             current_depth_loss = d_loss.item()
             current_sam_loss = sam_loss.item()
             current_semantic_loss = semantic_loss.item()
-            current_patch_l1 = patch_l1_loss.item()
-            current_patch_ssim = patch_ssim_loss.item()
 
             logger.warning(f"[yellow]⚠ Loss is NaN or too large at step {step}[/yellow]: {loss.item()}")
-            logger.warning(f"[yellow]   Current Metrics:[/yellow] loss={current_loss:.4f}, l1={current_l1:.4f}, ssim_loss={current_ssim:.4f}, patch_l1={current_patch_l1:.4f}, patch_ssim_loss={current_patch_ssim:.4f}, lpips={current_lpips:.4f}, psnr={current_psnr:.2f}, scale_reg={current_scale_reg:.6f}, opacity_reg={current_opacity_reg:.6f}, opacity_entropy_reg={current_opacity_entropy_reg:.6f}, depth_loss={current_depth_loss:.4f}, sam_loss={current_sam_loss:.4f}, semantic_loss={current_semantic_loss:.4f}")
+            logger.warning(f"[yellow]   Current Metrics:[/yellow] loss={current_loss:.4f}, l1={current_l1:.4f}, ssim_loss={current_ssim:.4f}, lpips={current_lpips:.4f}, psnr={current_psnr:.2f}, scale_reg={current_scale_reg:.6f}, opacity_reg={current_opacity_reg:.6f}, opacity_entropy_reg={current_opacity_entropy_reg:.6f}, depth_loss={current_depth_loss:.4f}, sam_loss={current_sam_loss:.4f}, semantic_loss={current_semantic_loss:.4f}")
             if VERBOSITY >= 1: progress.stop()
             raise RuntimeError(f"Loss is NaN or too large at step {step}")
         loss.backward()
@@ -989,7 +998,7 @@ def train_pipeline(config):
         gaussians_after = len(model._means)
         
         # Clear CUDA cache occasionally after densification
-        if step % (DENSIFY_INTERVAL * 5) == 0:
+        if step % (densification_cfg.densify_interval * 1) == 0:
             torch.cuda.empty_cache()
 
         # Handle manual densification events for logging and opacity resets
@@ -1004,11 +1013,11 @@ def train_pipeline(config):
                     raise RuntimeError(f"All Gaussians removed at iteration {step}")
             
             # Periodically reset opacity to prevent floaters
-            if step > 0 and step % densification_cfg.opacity_reset_interval == 0:
-                model._opacities.data = torch.clamp(
-                    model._opacities.data,
-                    max=inverse_sigmoid(torch.tensor(densification_cfg.opacity_reset_value, device=device))
-                )
+            # if step > 0 and step % densification_cfg.opacity_reset_interval == 0:
+            #     model._opacities.data = torch.clamp(
+            #         model._opacities.data,
+            #         max=inverse_sigmoid(torch.tensor(densification_cfg.opacity_reset_value, device=device))
+            #     )
 
         # Log histograms periodically
         if tensorboard_cfg.tensorboard and step > 0 and step % tensorboard_cfg.tb_histogram_interval == 0:
@@ -1022,8 +1031,9 @@ def train_pipeline(config):
             opt.zero_grad(set_to_none=True)
         
         # Step learning rate schedulers
-        # for sched in schedulers.__dict__.values():
-        #     sched.step()
+        for sched in schedulers.__dict__.values():
+            if sched is not None:
+                sched.step()
         
         # Log learning rates
         if tensorboard_cfg.tensorboard and step % training_cfg.log_interval == 0:
@@ -1031,6 +1041,8 @@ def train_pipeline(config):
         
         # Update viewer
         if viewer is not None:
+            if viewer_param_sync is not None:
+                viewer_param_sync.refresh_if_needed(step)
             viewer.lock.release()
             step_time = time.perf_counter() - step_start_time
             num_train_rays_per_step = cam['width'] * cam['height']
@@ -1083,7 +1095,7 @@ def train_pipeline(config):
     # Save final model
     final_path = output_path / 'model_final.pt'
     torch.save({
-        'iteration': ITERATIONS,
+        'iteration': training_cfg.iterations,
         'model_state_dict': model.state_dict(),
         'scene_extent': scene_extent,
         'num_gaussians': len(model._means),
@@ -1115,385 +1127,6 @@ def train_pipeline(config):
         logger.info("[blue]ℹ Viewer is still running.[/blue] Press Ctrl+C to exit.")
     
     return model, viewer
-
-class ArgGroup:
-    def __init__(self, parser: argparse.ArgumentParser, name: str, key: str):
-        self.group = parser.add_argument_group(name)
-        self.key = key
-
-    def add(self):
-        raise NotImplementedError
-
-    def extract(self, args):
-        grouped = argparse.Namespace()
-        for action in self.group._group_actions:
-            if action.dest == 'help':
-                continue
-            setattr(grouped, action.dest, getattr(args, action.dest))
-        return grouped
-
-
-class RequiredArgs(ArgGroup):
-    def add(self):
-        self.group.add_argument(
-            '--colmap-path',
-            type=str,
-            required=True,
-            help='Path to COLMAP sparse reconstruction directory (e.g., sparse/0)'
-        )
-        self.group.add_argument(
-            '--images-path',
-            type=str,
-            required=True,
-            help='Path to training images directory'
-        )
-
-
-class OutputArgs(ArgGroup):
-    def add(self):
-        self.group.add_argument(
-            '--output-dir',
-            type=str,
-            default='./output',
-            help='Output directory for checkpoints and results'
-        )
-
-
-class TrainingArgs(ArgGroup):
-    def add(self):
-        self.group.add_argument(
-            '--iterations',
-            type=int,
-            default=7000,
-            help='Total number of training iterations'
-        )
-        self.group.add_argument(
-            '--save-interval',
-            type=int,
-            default=1000,
-            help='Save checkpoint every N iterations'
-        )
-        self.group.add_argument(
-            '--log-interval',
-            type=int,
-            default=1,
-            help='Log progress every N iterations'
-        )
-
-
-class DensificationArgs(ArgGroup):
-    def add(self):
-        self.group.add_argument(
-            '--densify-from-iter',
-            type=int,
-            default=500,
-            help='Start densification at this iteration'
-        )
-        self.group.add_argument(
-            '--densify-until-iter',
-            type=int,
-            default=15000,
-            help='Stop densification at this iteration'
-        )
-        self.group.add_argument(
-            '--densify-interval',
-            type=int,
-            default=100,
-            help='Densify every N iterations'
-        )
-        self.group.add_argument(
-            '--grad-threshold',
-            type=float,
-            default=0.0002,
-            help='Gradient threshold for densification'
-        )
-        self.group.add_argument(
-            '--max-screen-size',
-            type=int,
-            default=5000,
-            help='Maximum screen size in pixels for pruning (increase for large scenes, e.g., 100-200)'
-        )
-        self.group.add_argument(
-            '--opacity-reset-interval',
-            type=int,
-            default=3000,
-            help='Reset opacity every N iterations'
-        )
-        self.group.add_argument(
-            '--opacity-reset-value',
-            type=float,
-            default=0.01,
-            help='Opacity value to reset to (0.01-0.1, lower = more aggressive floater removal)'
-        )
-
-
-class FloaterPreventionArgs(ArgGroup):
-    def add(self):
-        self.group.add_argument(
-            '--enable-scale-reg',
-            action='store_true',
-            help='Enable scale regularization loss to penalize large Gaussians'
-        )
-        self.group.add_argument(
-            '--scale-reg-weight',
-            type=float,
-            default=0.01,
-            help='Weight for scale regularization loss (0.01-0.1)'
-        )
-        self.group.add_argument(
-            '--enable-opacity-reg',
-            action='store_true',
-            help='Enable opacity regularization loss to encourage sparsity and prevent floaters'
-        )
-        self.group.add_argument(
-            "--opacity-reg-weight",
-            type=float,
-            default=0.0005,
-            help="Weight for opacity regularization loss (0.0001-0.001)"
-        )
-        self.group.add_argument(
-            '--enable-opacity-entropy-reg',
-            action='store_true',
-            help='Enable entropy regularization on opacity to push alpha toward 0/1 and reduce ghost Gaussians'
-        )
-        self.group.add_argument(
-            '--opacity-entropy-reg-weight',
-            type=float,
-            default=0.0001,
-            help='Weight for opacity entropy regularization loss (typical: 1e-5 to 1e-3)'
-        )
-
-
-class SHArgs(ArgGroup):
-    def add(self):
-        self.group.add_argument(
-            '--sh-degree',
-            type=int,
-            default=3,
-            choices=[0, 1, 2, 3],
-            help='Degree of spherical harmonics (0=DC only, 1-3=higher order). Default: 3'
-        )
-        self.group.add_argument(
-            '--disable-sh-rendering',
-            action='store_true',
-            help='Disable spherical harmonics during rendering (use DC component only for faster training)'
-        )
-
-
-class SemanticsArgs(ArgGroup):
-    def add(self):
-        self.group.add_argument(
-            '--train-semantics',
-            default=False,
-            action='store_true',
-            help='Whether to use training semantics for densification (default: False)'
-        )
-        self.group.add_argument(
-            '--semantics-path',
-            type=str,
-            default=None,
-            help='Path to training semantics file (e.g., output/semantics/semantics.pt)'
-        )
-        self.group.add_argument(
-            '--semantics-dim',
-            type=int,
-            default=3,
-            help='Dimensionality of semantics features (default: 3)'
-        )
-        self.group.add_argument(
-            '--semantic-image-resolution',
-            type=list,
-            default=[1080, 1620],
-            help='Resolution to render semantic maps for training semantics (default: [1080, 512])'
-        )
-        self.group.add_argument(
-            '--semantic-start-iter',
-            type=int,
-            default=20000,
-            help='Start applying training semantics after this many iterations'
-        )
-        self.group.add_argument(
-            '--semantic-loss-weight',
-            type=float,
-            default=1.0,
-            help='Weight for semantic supervision loss (0.0 disables semantic loss)'
-        )
-
-
-class DepthArgs(ArgGroup):
-    def add(self):
-        self.group.add_argument(
-            '--enable-depth-loss',
-            action='store_true',
-            help='Enable depth supervision from Depth Anything V2 depth maps'
-        )
-        self.group.add_argument(
-            '--depth-loss-weight',
-            type=float,
-            default=0.1,
-            help='Weight for depth loss (0.05-0.2 recommended)'
-        )
-        self.group.add_argument(
-            '--depth-loss-start-iter',
-            type=int,
-            default=1000,
-            help='Start applying depth loss after this many iterations'
-        )
-        self.group.add_argument(
-            '--sam-loss-weight',
-            type=float,
-            default=0.0,
-            help='Weight for sharpness-aware minimization loss in gradient space (0.0 disables)'
-        )
-
-
-class LearningRateArgs(ArgGroup):
-    def add(self):
-        self.group.add_argument(
-            '--lr-means',
-            type=float,
-            default=0.00016,
-            help='Base learning rate for Gaussian positions (multiplied by 5.0)'
-        )
-        self.group.add_argument(
-            '--lr-scales',
-            type=float,
-            default=0.005,
-            help='Learning rate for Gaussian scales'
-        )
-        self.group.add_argument(
-            '--lr-quats',
-            type=float,
-            default=0.001,
-            help='Learning rate for Gaussian rotations'
-        )
-        self.group.add_argument(
-            '--lr-opacities',
-            type=float,
-            default=0.05,
-            help='Learning rate for Gaussian opacities'
-        )
-        self.group.add_argument(
-            '--lr-sh',
-            type=float,
-            default=0.0025,
-            help='Learning rate for spherical harmonics'
-        )
-        self.group.add_argument(
-            '--lr-semantics',
-            type=float,
-            default=None,
-            help='Learning rate for semantic Gaussian features (defaults to --lr-sh)'
-        )
-
-
-class ExportArgs(ArgGroup):
-    def add(self):
-        self.group.add_argument(
-            '--export-ply',
-            action='store_true',
-            help='Export final model to PLY format'
-        )
-
-
-class RuntimeArgs(ArgGroup):
-    def add(self):
-        self.group.add_argument(
-            '--verbosity',
-            type=int,
-            default=1,
-            choices=[0, 1, 2, 3],
-            help='Verbosity level: 0=QUIET, 1=NORMAL, 2=VERBOSE, 3=DEBUG'
-        )
-
-
-class CheckpointArgs(ArgGroup):
-    def add(self):
-        self.group.add_argument(
-            '--resume-from',
-            type=str,
-            default=None,
-            help='Path to checkpoint file to resume training from (e.g., output/checkpoints/checkpoint_1000.pt)'
-        )
-
-
-class ViewerArgs(ArgGroup):
-    def add(self):
-        self.group.add_argument(
-            '--viewer',
-            action='store_true',
-            help='Enable interactive 3D viewer during training'
-        )
-        self.group.add_argument(
-            '--viewer-port',
-            type=int,
-            default=8080,
-            help='Port for the viewer server'
-        )
-
-
-class TensorBoardArgs(ArgGroup):
-    def add(self):
-        self.group.add_argument(
-            '--tensorboard',
-            action='store_true',
-            default=True,
-            help='Enable TensorBoard logging (default: enabled)'
-        )
-        self.group.add_argument(
-            '--no-tensorboard',
-            action='store_false',
-            dest='tensorboard',
-            help='Disable TensorBoard logging'
-        )
-        self.group.add_argument(
-            '--tb-image-interval',
-            type=int,
-            default=500,
-            help='Log images to TensorBoard every N iterations'
-        )
-        self.group.add_argument(
-            '--tb-histogram-interval',
-            type=int,
-            default=1000,
-            help='Log histograms to TensorBoard every N iterations'
-        )
-
-
-def parse_args():
-    """Parse command line arguments and return grouped config namespaces."""
-    parser = argparse.ArgumentParser(
-        description='Train a 3D Gaussian Splatting model from COLMAP reconstruction',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-
-    groups = [
-        RequiredArgs(parser, 'Required Arguments', 'required'),
-        OutputArgs(parser, 'Output Options', 'output'),
-        TrainingArgs(parser, 'Training Parameters', 'training'),
-        DensificationArgs(parser, 'Densification Parameters', 'densification'),
-        FloaterPreventionArgs(parser, 'Floater Prevention Options', 'floater_prevention'),
-        SHArgs(parser, 'Spherical Harmonics Options', 'sh'),
-        SemanticsArgs(parser, 'Training Semantics', 'semantics'),
-        DepthArgs(parser, 'Depth Supervision Options', 'depth'),
-        LearningRateArgs(parser, 'Learning Rates', 'learning_rates'),
-        ExportArgs(parser, 'Export Options', 'export'),
-        RuntimeArgs(parser, 'Verbosity Options', 'runtime'),
-        CheckpointArgs(parser, 'Checkpoint Options', 'checkpoint'),
-        ViewerArgs(parser, 'Viewer Options', 'viewer'),
-        TensorBoardArgs(parser, 'TensorBoard Options', 'tensorboard'),
-    ]
-    for group in groups:
-        group.add()
-
-    flat_args = parser.parse_args()
-    grouped_config = argparse.Namespace()
-    grouped_config.raw = flat_args
-    for group in groups:
-        setattr(grouped_config, group.key, group.extract(flat_args))
-
-    return grouped_config
-
 
 if __name__ == "__main__":
     config = parse_args()

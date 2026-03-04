@@ -215,6 +215,7 @@ class GaussianModel(nn.Module):
     
     def save_ply(self, path):
         """Save Gaussians to PLY format for visualization."""
+        
         try:
             import numpy as np
             from plyfile import PlyData, PlyElement

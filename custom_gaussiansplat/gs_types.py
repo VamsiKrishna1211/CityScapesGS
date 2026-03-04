@@ -42,12 +42,13 @@ class GSOptimizers:
 
 @dataclass
 class GS_LR_Schedulers:
-    means: torch.optim.lr_scheduler._LRScheduler
-    scales: torch.optim.lr_scheduler._LRScheduler
-    quats: torch.optim.lr_scheduler._LRScheduler
-    opacities: torch.optim.lr_scheduler._LRScheduler
-    features_dc: torch.optim.lr_scheduler._LRScheduler
-    features_rest: torch.optim.lr_scheduler._LRScheduler
+    means: torch.optim.lr_scheduler._LRScheduler | bool = True
+    scales: torch.optim.lr_scheduler._LRScheduler | bool = False
+    quats: torch.optim.lr_scheduler._LRScheduler | bool = False
+    opacities: torch.optim.lr_scheduler._LRScheduler | bool = False
+    features_dc: torch.optim.lr_scheduler._LRScheduler | bool = False
+    features_rest: torch.optim.lr_scheduler._LRScheduler | bool = False
+    features_semantics: torch.optim.lr_scheduler._LRScheduler | bool = False
 
     def __getitem__(self, key):
         return getattr(self, key)
@@ -71,9 +72,14 @@ class GS_LR_Schedulers:
     #     setattr(schedulers, name, scheduler)
 
     @classmethod
-    def create_schedulers(cls, optimizers: GSOptimizers, step_size: int, gamma: float):
-        schedulers_dict = {}
-        for name, optimizer in optimizers.__dict__.items():
+    def create_schedulers(cls, optimizers: GSOptimizers, enabled_lrs, step_size: int, gamma: float):
+        schedulers_dict: dict[str, Any] = {}
+
+        for name, enabled in enabled_lrs.__dict__.items():
+            if not enabled:
+                schedulers_dict[name] = None
+                continue
+            optimizer = getattr(optimizers, name)
             if optimizer is None:
                 continue
             initial_lr = optimizer.param_groups[0]['lr']

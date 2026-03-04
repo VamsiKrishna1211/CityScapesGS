@@ -81,66 +81,6 @@ def create_metrics_table(iteration, loss_val, l1_val, ssim_val, lpips_val, psnr_
     return table
 
 
-def create_viewer_render_fn(model, device, sh_degree):
-    """
-    Create a render function for the nerfview viewer.
-    
-    Args:
-        model: GaussianModel instance
-        device: torch device
-        sh_degree: Spherical harmonics degree
-    
-    Returns:
-        Callable render function for viewer
-    """
-    from gsplat import rasterization
-    
-    def render_fn(camera_state, render_tab_state):
-        """Callable function for the viewer."""
-        with torch.no_grad():
-            # Get resolution based on preview mode
-            if render_tab_state.preview_render:
-                W = render_tab_state.render_width
-                H = render_tab_state.render_height
-            else:
-                W = render_tab_state.viewer_width
-                H = render_tab_state.viewer_height
-            
-            c2w = camera_state.c2w
-            K = camera_state.get_K((W, H))
-            
-            # Convert camera parameters
-            c2w = torch.from_numpy(c2w).float().to(device)
-            K = torch.from_numpy(K).float().to(device)
-            
-            # Setup camera matrices for gsplat
-            viewmat = torch.linalg.inv(c2w)
-            
-            # Render
-            try:
-                render, alpha, _ = rasterization(
-                    means=model.means,
-                    quats=model.quats,
-                    scales=model.scales,
-                    opacities=model.opacities.squeeze(-1),
-                    colors=model.sh,
-                    viewmats=viewmat[None, ...],
-                    Ks=K[None, ...],
-                    width=W,
-                    height=H,
-                    sh_degree=sh_degree,
-                )
-                # Clamp colors to [0, 1] range
-                render_rgb = torch.clamp(render[0, ..., 0:3], 0, 1)
-                render_np = (render_rgb.detach().cpu().numpy() * 255).astype(np.uint8)
-                return render_np
-            except Exception as e:
-                # Return a placeholder if rendering fails
-                return np.zeros((H, W, 3), dtype=np.uint8)
-    
-    return render_fn
-
-
 def format_phase_description(step, phase, current_loss, current_l1, current_ssim, current_lpips, current_psnr, current_scale_loss, num_gaussians):
     """
     Format a compact phase description for progress bar.
