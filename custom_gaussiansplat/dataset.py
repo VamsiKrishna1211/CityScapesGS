@@ -249,12 +249,13 @@ class ColmapDataset(Dataset):
             depth_tensor = self._preloaded_depths[idx]
         else:
             depth_tensor = self._load_depth(img_path, cam_data)
+        depth_tensor = depth_tensor.to(self.device) if depth_tensor is not None else None  # Move to device if loaded on demand
 
         semantics_output = (None, None)
         if self.train_semantics:
             semantics_output = self._load_semantics(img_path, img_tensor.detach().cpu())
             # semantics_output = (None, None)  # Placeholder for semantics loading (can be implemented similarly to depth loading with validation)
-        return cam_data, img_tensor.to(self.device), depth_tensor.to(self.device), semantics_output
+        return cam_data, img_tensor.to(self.device), depth_tensor, semantics_output
 
     @torch.no_grad()
     def _load_semantics(self, img_path: Path, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
