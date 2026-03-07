@@ -280,10 +280,10 @@ TRAINING_GROUP = ArgGroupDef(
         ArgSpec(flags=("--save-interval",), dest="save_interval", arg_type=int, default=1000, help="Save checkpoint every N iterations"),
         ArgSpec(flags=("--log-interval",), dest="log_interval", arg_type=int, default=1, help="Log progress every N iterations"),
         ArgSpec(flags=("--num-workers",), dest="num_workers", arg_type=int, default=0, help="Number of worker threads for data loading"),
-        ArgSpec(flags=("--preload",), dest="preload", action="store_true", help="Preload all images into RAM before training (can speed up training but requires more memory)")
+        ArgSpec(flags=("--preload",), dest="preload", action="store_true", help="Preload all images into RAM before training (can speed up training but requires more memory)"),
         ArgSpec(flags=("--enable-lpips-loss",), dest="enable_lpips_loss", action="store_true", help="Enable LPIPS loss for perceptual similarity (requires additional dependencies and GPU memory)"),
-        ArgSpec(flags=("--lpips-loss-weight",), dest="lpips_loss_weight", arg_type=float, default=0.2, help="Weight for LPIPS loss (0.01-0.4 recommended if enabled), default: 0.2"
-        ArgSpec(flags=("--lpips-model",), dest="lpips_model", arg_type=str, default="vgg", choices=("vgg", "alex", "squeeze"), help="Model to use for LPIPS loss (default: vgg)")
+        ArgSpec(flags=("--lpips-loss-weight",), dest="lpips_loss_weight", arg_type=float, default=0.2, help="Weight for LPIPS loss (0.01-0.4 recommended if enabled), default: 0.2"),
+        ArgSpec(flags=("--lpips-model",), dest="lpips_model", arg_type=str, default="vgg", choices=("vgg", "alex", "squeeze"), help="Model to use for LPIPS loss (default: vgg)"),
     ),
 )
 

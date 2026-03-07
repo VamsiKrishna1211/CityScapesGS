@@ -533,6 +533,8 @@ def train_pipeline(config: TrainConfig):
             logger.error(f"[bold red]❌ Failed to initialize LPIPS loss:[/bold red] {e}")
             logger.info("[yellow]Continuing training without LPIPS loss...[/yellow]")
             lpips = None
+    else:
+        lpips = None
     # lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True).to(device)
 
     psnr = PeakSignalNoiseRatio(data_range=(0, 1.0)).to(device)
@@ -792,7 +794,7 @@ def train_pipeline(config: TrainConfig):
         # LPIPS LOSS with random patch
         h, w = render_perm.shape[2:]
         if lpips is not None:
-            if h >= 1024 and w >= 1024
+            if h >= 1024 and w >= 1024:
                 patch_size = 1024
                 top = torch.randint(0, h - patch_size, (1,))
                 left = torch.randint(0, w - patch_size, (1,))
@@ -804,6 +806,8 @@ def train_pipeline(config: TrainConfig):
                 gt_patch = gt_perm
 
             lpips_loss = lpips(render_patch, gt_patch)
+        else:
+            lpips_loss = torch.tensor(0.0, device=device)
         # render_lpips = F.interpolate(render_perm, size=512, mode='bilinear', align_corners=False)
         # gt_lpips = F.interpolate(gt_perm, size=512, mode='bilinear', align_corners=False)
         # lpips_loss = lpips(render_lpips, gt_lpips)
@@ -812,7 +816,7 @@ def train_pipeline(config: TrainConfig):
 
         loss = 0.8 * l1_loss + 0.2 * ssim_loss
         if lpips_loss is not None and lpips_loss > 0.0:
-            loss = loss + train_cfg.lpips_loss_weight * lpips_loss  # Add LPIPS with a smaller weight to avoid overpowering the main losses
+            loss = loss + training_cfg.lpips_loss_weight * lpips_loss  # Add LPIPS with a smaller weight to avoid overpowering the main losses
 
         # if depth_cfg.enable_depth_smoothness_loss and depth_tensor is not None:
         #     # gt_image_bchw = gt_image.permute(0, 3, 1, 2)  # [B, C, H, W]
