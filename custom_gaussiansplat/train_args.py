@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, Generic, Optional, Tuple, Type, TypeVar,
 class RequiredConfig:
     colmap_path: str
     images_path: str
+    scale: int
 
 
 @dataclass
@@ -21,6 +22,7 @@ class TrainingConfig:
     save_interval: int
     log_interval: int
     num_workers: int
+    preload: bool
 
 
 @dataclass
@@ -29,6 +31,12 @@ class DensificationConfig:
     densify_until_iter: int
     densify_interval: int
     grad_threshold: float
+    prune_opa: float
+    grow_grad2d: float
+    grow_scale3d: float
+    grow_scale2d: float
+    prune_scale3d: float
+    prune_scale2d: float
     max_screen_size: int
     opacity_reset_interval: int
     opacity_reset_value: float
@@ -66,6 +74,11 @@ class DepthConfig:
     depth_loss_weight: float
     depth_loss_start_iter: int
     sam_loss_weight: float
+    affine_invariant_depth_loss_weight: float
+    pearson_correlation_loss_weight: float
+    silog_loss_weight: float
+    ordinal_depth_loss_weight: float
+    affine_aligned_gradient_matching_loss_weight: float
     enable_depth_smoothness_loss: bool
     depth_smoothness_start_alpha: float
     depth_smoothness_end_alpha: float
@@ -230,6 +243,13 @@ REQUIRED_GROUP = ArgGroupDef(
             required=True,
             help="Path to training images directory",
         ),
+        ArgSpec(
+            flags=("-s", "--scale"),
+            dest="scale",
+            arg_type=int,
+            default=1,
+            help="Image downscale factor to use (1=images, 2=images_2, 4=images_4, etc.)",
+        ),
     ),
 )
 
@@ -257,6 +277,7 @@ TRAINING_GROUP = ArgGroupDef(
         ArgSpec(flags=("--save-interval",), dest="save_interval", arg_type=int, default=1000, help="Save checkpoint every N iterations"),
         ArgSpec(flags=("--log-interval",), dest="log_interval", arg_type=int, default=1, help="Log progress every N iterations"),
         ArgSpec(flags=("--num-workers",), dest="num_workers", arg_type=int, default=0, help="Number of worker threads for data loading"),
+        ArgSpec(flags=("--preload",), dest="preload", action="store_true", help="Preload all images into RAM before training (can speed up training but requires more memory)")
     ),
 )
 
@@ -269,6 +290,12 @@ DENSIFICATION_GROUP = ArgGroupDef(
         ArgSpec(flags=("--densify-until-iter",), dest="densify_until_iter", arg_type=int, default=15000, help="Stop densification at this iteration"),
         ArgSpec(flags=("--densify-interval",), dest="densify_interval", arg_type=int, default=100, help="Densify every N iterations"),
         ArgSpec(flags=("--grad-threshold",), dest="grad_threshold", arg_type=float, default=0.0002, help="Gradient threshold for densification"),
+        ArgSpec(flags=("--prune-opa",), dest="prune_opa", arg_type=float, default=0.005, help="Opacity threshold for pruning low-opacity Gaussians"),
+        ArgSpec(flags=("--grow-grad2d",), dest="grow_grad2d", arg_type=float, default=0.0001, help="2D gradient threshold for densification growth"),
+        ArgSpec(flags=("--grow-scale3d",), dest="grow_scale3d", arg_type=float, default=0.05, help="3D scale threshold controlling split vs clone behavior"),
+        ArgSpec(flags=("--grow-scale2d",), dest="grow_scale2d", arg_type=float, default=0.01, help="2D screen-space scale threshold for growth"),
+        ArgSpec(flags=("--prune-scale3d",), dest="prune_scale3d", arg_type=float, default=0.02, help="3D scale threshold for pruning oversized Gaussians"),
+        ArgSpec(flags=("--prune-scale2d",), dest="prune_scale2d", arg_type=float, default=0.20, help="2D screen-space scale threshold for pruning"),
         ArgSpec(flags=("--max-screen-size",), dest="max_screen_size", arg_type=int, default=5000, help="Maximum screen size in pixels for pruning (increase for large scenes, e.g., 100-200)"),
         ArgSpec(flags=("--opacity-reset-interval",), dest="opacity_reset_interval", arg_type=int, default=3000, help="Reset opacity every N iterations"),
         ArgSpec(flags=("--opacity-reset-value",), dest="opacity_reset_value", arg_type=float, default=0.01, help="Opacity value to reset to (0.01-0.1, lower = more aggressive floater removal)"),
@@ -323,6 +350,11 @@ DEPTH_GROUP = ArgGroupDef(
         ArgSpec(flags=("--depth-loss-weight",), dest="depth_loss_weight", arg_type=float, default=0.1, help="Weight for depth loss (0.05-0.2 recommended)"),
         ArgSpec(flags=("--depth-loss-start-iter",), dest="depth_loss_start_iter", arg_type=int, default=1000, help="Start applying depth loss after this many iterations"),
         ArgSpec(flags=("--sam-loss-weight",), dest="sam_loss_weight", arg_type=float, default=0.0, help="Weight for sharpness-aware minimization loss in gradient space (0.0 disables)"),
+        ArgSpec(flags=("--affine-invariant-depth-loss-weight",), dest="affine_invariant_depth_loss_weight", arg_type=float, default=0.0, help="Weight for AffineInvariantDepthLoss (0.0 disables)"),
+        ArgSpec(flags=("--pearson-correlation-loss-weight",), dest="pearson_correlation_loss_weight", arg_type=float, default=0.0, help="Weight for PearsonCorrelationLoss module (0.0 disables)"),
+        ArgSpec(flags=("--silog-loss-weight",), dest="silog_loss_weight", arg_type=float, default=0.0, help="Weight for SILogLoss (0.0 disables)"),
+        ArgSpec(flags=("--ordinal-depth-loss-weight",), dest="ordinal_depth_loss_weight", arg_type=float, default=0.0, help="Weight for OrdinalDepthLoss (0.0 disables)"),
+        ArgSpec(flags=("--affine-aligned-gradient-matching-loss-weight",), dest="affine_aligned_gradient_matching_loss_weight", arg_type=float, default=0.0, help="Weight for AffineAlignedGradientMatchingLoss (0.0 disables)"),
         ArgSpec(flags=("--enable-depth-smoothness-loss",), dest="enable_depth_smoothness_loss", action="store_true", help="Enable edge-aware depth smoothness loss to regularize depth maps and reduce noise"),
         ArgSpec(flags=("--depth-smoothness-start-alpha",), dest="depth_smoothness_start_alpha", arg_type=float, default=0.5, help="Starting alpha value for edge-aware depth smoothness loss (lower = more edge-sensitive)"),
         ArgSpec(flags=("--depth-smoothness-end-alpha",), dest="depth_smoothness_end_alpha", arg_type=float, default=2.5, help="Ending alpha value for edge-aware depth smoothness loss (higher = less edge-sensitive)"),

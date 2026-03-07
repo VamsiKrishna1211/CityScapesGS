@@ -61,3 +61,9 @@
 [submodule "third_party/mesh-splatting"]
 	path = third_party/mesh-splatting
 	url = https://github.com/meshsplatting/mesh-splatting.git
+[submodule "third_party/feature-splatting"]
+	path = third_party/feature-splatting
+	url = https://github.com/vuer-ai/feature-splatting.git
+[submodule "third_party/gaussian-splatting"]
+	path = third_party/gaussian-splatting
+	url = https://github.com/graphdeco-inria/gaussian-splatting.git

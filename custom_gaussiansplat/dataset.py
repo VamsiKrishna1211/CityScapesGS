@@ -10,8 +10,19 @@ from scipy.spatial.transform import Rotation
 from pathlib import Path
 from typing import Optional, Union
 import cv2
+from rich.console import Console
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    BarColumn,
+    TaskProgressColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+    TextColumn,
+)
 # Module-level logger
 logger = logging.getLogger("cityscape_gs.dataset")
+console = Console()
 
 class ColmapDataset(Dataset):
     def __init__(self, colmap_path, 
@@ -21,7 +32,8 @@ class ColmapDataset(Dataset):
                  train_semantics=False, semantics_dim=3,
                  semantics_path: Optional[Path] = None,
                  semantics_resolution: Optional[Union[tuple[int, int], int]] = None,
-                 scene_extent_margin: float = 2.0
+                 scene_extent_margin: float = 2.0,
+                 image_scale: int = 2,
                  ):
         """
         Dataset that loads COLMAP reconstructions and corresponding images on demand.
@@ -35,13 +47,23 @@ class ColmapDataset(Dataset):
             - semantics_dim: Dimensionality of semantic features (e.g., 3 for RGB-based semantics, 128 for CLIP-based features).
             - semantics_path: Optional path to semantic features directory (should contain .npy files named after images).
             - semantics_resolution: Optional resolution to which semantic features should be resized (if they are image-based). If None assumes semantic features are already in the correct format and dimension.
+            - image_scale: Downscale factor used for training images. If image_dir points to `images`, this resolves to `images_<image_scale>` for scale > 1.
         """
         # Handle both string and torch.device
 
         self.device = device
         self.use_dataloader = use_dataloader  # Don't move to CUDA in workers
         self._preloaded_images = None  # Cache for pre-loaded images
+        self._preloaded_depths = None  # Cache for pre-loaded depth maps (can contain None entries)
         self.train_semantics = train_semantics
+
+        if image_scale < 1:
+            raise ValueError(f"image_scale must be >= 1, got {image_scale}")
+        self.image_scale = int(image_scale)
+        image_dir_path = self._resolve_image_dir(Path(image_dir), self.image_scale)
+        logger.info(f"[cyan]Using image scale:[/cyan] {self.image_scale} (directory: {image_dir_path})")
+        self.depth_dir = self._resolve_depth_dir(image_dir_path, self.image_scale)
+        logger.info(f"[cyan]Using depth scale:[/cyan] {self.image_scale} (directory: {self.depth_dir})")
         
         # 1. Load Reconstruction
         # pycolmap handles the binary/text parsing automatically
@@ -92,7 +114,7 @@ class ColmapDataset(Dataset):
             cam = recon.cameras[img.camera_id]
             
             # Skip if image file doesn't exist
-            img_path = os.path.join(image_dir, img.name)
+            img_path = str(image_dir_path / img.name)
             if not os.path.exists(img_path): continue
 
             # Extrinsics: World-to-Camera
@@ -123,10 +145,15 @@ class ColmapDataset(Dataset):
                 cx = cam.params[2] if len(cam.params) > 2 else cam.width / 2
                 cy = cam.params[3] if len(cam.params) > 3 else cam.height / 2
             
+            scale_factor = 1.0 / float(self.image_scale)
             self.cameras.append({
                 'R': R, 'T': T,
-                'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy,
-                'width': cam.width, 'height': cam.height,
+                'fx': float(fx) * scale_factor,
+                'fy': float(fy) * scale_factor,
+                'cx': float(cx) * scale_factor,
+                'cy': float(cy) * scale_factor,
+                'width': max(1, int(round(float(cam.width) * scale_factor))),
+                'height': max(1, int(round(float(cam.height) * scale_factor))),
                 'image_path': img_path
             })
 
@@ -140,6 +167,49 @@ class ColmapDataset(Dataset):
                     semantics_resolution = (semantics_resolution, semantics_resolution)
                 self.semantics_resolution = semantics_resolution
                 logger.info(f"[cyan]Semantic features enabled:[/cyan] loading from {semantics_path}, dim={semantics_dim}, resolution={semantics_resolution}")
+
+    @staticmethod
+    def _resolve_image_dir(image_dir: Path, image_scale: int) -> Path:
+        """Resolve the image directory for the requested scale using COLMAP-style folder names."""
+        image_dir = image_dir.expanduser().resolve()
+        if image_scale == 1:
+            if not image_dir.exists():
+                raise FileNotFoundError(f"Image directory does not exist: {image_dir}")
+            return image_dir
+
+        base_name = image_dir.name
+        target_dir = image_dir
+
+        if base_name == "images":
+            target_dir = image_dir.parent / f"images_{image_scale}"
+        elif base_name.startswith("images_"):
+            target_dir = image_dir.parent / f"images_{image_scale}"
+
+        if not target_dir.exists():
+            if base_name == "images" or base_name.startswith("images_"):
+                raise FileNotFoundError(
+                    f"Requested image scale {image_scale}, but directory not found: {target_dir}. "
+                    "Expected COLMAP-style scaled folders (e.g., images_2, images_4)."
+                )
+            raise FileNotFoundError(f"Image directory does not exist: {target_dir}")
+
+        return target_dir
+
+    @staticmethod
+    def _resolve_depth_dir(image_dir: Path, image_scale: int) -> Path:
+        """Resolve depth directory using the same scale convention as images."""
+        scene_root = image_dir.parent
+        depth_dir = scene_root / "depths_npy"
+        if image_scale > 1:
+            depth_dir = scene_root / f"depths_npy_{image_scale}"
+
+        if not depth_dir.exists():
+            raise FileNotFoundError(
+                f"Requested depth scale {image_scale}, but directory not found: {depth_dir}. "
+                "Expected depth folders following image scale convention (e.g., depths_npy, depths_npy_2, depths_npy_4)."
+            )
+
+        return depth_dir
 
 
     def __len__(self):
@@ -174,14 +244,17 @@ class ColmapDataset(Dataset):
             img = imageio.imread(img_path)
             img_tensor = torch.from_numpy(img).float() / 255.0 # [0, 1] range [H, W, C]
         
-        # Load and optimize depth map on demand
-        depth_tensor = self._load_depth(img_path, cam_data)
+        # Use pre-loaded depth if available, otherwise load on demand.
+        if self._preloaded_depths is not None:
+            depth_tensor = self._preloaded_depths[idx]
+        else:
+            depth_tensor = self._load_depth(img_path, cam_data)
 
         semantics_output = (None, None)
         if self.train_semantics:
             semantics_output = self._load_semantics(img_path, img_tensor.detach().cpu())
             # semantics_output = (None, None)  # Placeholder for semantics loading (can be implemented similarly to depth loading with validation)
-        return cam_data, img_tensor, depth_tensor, semantics_output
+        return cam_data, img_tensor.to(self.device), depth_tensor.to(self.device), semantics_output
 
     @torch.no_grad()
     def _load_semantics(self, img_path: Path, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -202,7 +275,7 @@ class ColmapDataset(Dataset):
 
     def _load_depth(self, img_path: Path, cam_data: dict) -> Optional[torch.Tensor]:
         """Load and normalize depth map with validation."""
-        depth_path = img_path.parent.parent / "depths_npy" / f"{img_path.stem}.npy"
+        depth_path = self.depth_dir / f"{img_path.stem}.npy"
         if not depth_path.exists():
             return None
             
@@ -234,18 +307,49 @@ class ColmapDataset(Dataset):
             logger.debug(f"Depth load failed for {img_path.name}: {e}")
             return None
         
-    def preload_all_images(self):
-        """Pre-load all images into RAM for faster training.
-        
-        Keeps images on CPU to save VRAM. They will be moved to GPU during training.
+    def preload_all_data(self):
+        """Pre-load all images and depth maps into RAM for faster training.
+
+        Keeps tensors on CPU to avoid VRAM exhaustion. Missing/invalid depth maps are stored as None.
         """
         self._preloaded_images = []
-        for cam_data in self.cameras:
-            img = imageio.imread(cam_data['image_path'])
-            # Keep on CPU to avoid VRAM exhaustion
-            img_tensor = torch.from_numpy(img).float() / 255.0
-            self._preloaded_images.append(img_tensor)
-        logger.info(f"[green]✓ Preloaded {len(self.cameras)} images to CPU RAM[/green]")
+        self._preloaded_depths = []
+        depth_available = 0
+
+        total_items = len(self.cameras)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            expand=False,
+        ) as progress:
+            task = progress.add_task("[cyan]Preloading images + depth...", total=total_items)
+
+            for cam_data in self.cameras:
+                img_path = Path(cam_data['image_path'])
+                img = imageio.imread(img_path)
+                # Keep on CPU to avoid VRAM exhaustion
+                img_tensor = torch.from_numpy(img).float() / 255.0
+                self._preloaded_images.append(img_tensor.to(self.device if not self.use_dataloader else torch.device('cpu')))  # Keep on CPU if using DataLoader to avoid VRAM issues
+
+                depth_tensor = self._load_depth(img_path, cam_data)
+                self._preloaded_depths.append(depth_tensor.to(self.device if not self.use_dataloader else torch.device('cpu')) if depth_tensor is not None else None)  # Keep on CPU if using DataLoader
+                if depth_tensor is not None:
+                    depth_available += 1
+
+                progress.update(
+                    task,
+                    advance=1,
+                    description=f"[cyan]Preloading images + depth...[/cyan] [dim](depth: {depth_available}/{total_items})[/dim]",
+                )
+
+        logger.info(
+            f"[green]✓ Preloaded {len(self.cameras)} images and {depth_available}/{len(self.cameras)} depth maps to CPU RAM[/green]"
+        )
 
     def collate_fn(self, batch):
         """

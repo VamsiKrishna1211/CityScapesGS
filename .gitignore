@@ -209,7 +209,7 @@ __marimo__/
 
 data/
 scripts/colmap_build
-third_party/
+# third_party/
 .mypy_cache/
 __pycache__/
 *.pyc

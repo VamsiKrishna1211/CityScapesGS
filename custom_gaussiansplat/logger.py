@@ -118,14 +118,19 @@ class GaussianSplattingLogger:
                    l1_loss: float, 
                    ssim_loss: float, 
                    lpips_loss: float,
-                   depth_smoothness_loss: float = None,
-                   scale_reg_loss: float = None,
-                   opacity_reg_loss: float = None,
-                   opacity_entropy_reg_loss: float = None,
-                   depth_loss: float = None,
-                   depth_corr: float = None,
-                   sam_loss: float = None,
-                   semantic_loss: float = None,
+                   depth_smoothness_loss: Optional[float] = None,
+                   scale_reg_loss: Optional[float] = None,
+                   opacity_reg_loss: Optional[float] = None,
+                   opacity_entropy_reg_loss: Optional[float] = None,
+                   depth_loss: Optional[float] = None,
+                   depth_corr: Optional[float] = None,
+                   affine_invariant_depth_loss: Optional[float] = None,
+                   pearson_correlation_loss: Optional[float] = None,
+                   silog_loss: Optional[float] = None,
+                   ordinal_depth_loss: Optional[float] = None,
+                   affine_aligned_gradient_matching_loss: Optional[float] = None,
+                   sam_loss: Optional[float] = None,
+                   semantic_loss: Optional[float] = None,
                    step: int = 0):
         """
         Log all loss components.
@@ -141,6 +146,11 @@ class GaussianSplattingLogger:
             opacity_entropy_reg_loss: Optional opacity entropy regularization loss
             depth_loss: Optional depth supervision loss
             depth_corr: Optional signed Pearson depth correlation in [-1, 1]
+            affine_invariant_depth_loss: Optional affine-invariant depth loss
+            pearson_correlation_loss: Optional Pearson-correlation depth loss module value
+            silog_loss: Optional SI-Log depth loss
+            ordinal_depth_loss: Optional ordinal depth ranking loss
+            affine_aligned_gradient_matching_loss: Optional affine-aligned gradient matching loss
             sam_loss: Optional sharpness-aware minimization loss
             semantic_loss: Optional semantic reconstruction loss
             step: Current training step
@@ -165,6 +175,16 @@ class GaussianSplattingLogger:
             self.writer.add_scalar('Loss/Depth', depth_loss, step)
         if depth_corr is not None:
             self.writer.add_scalar('Depth/PearsonCorr', depth_corr, step)
+        if affine_invariant_depth_loss is not None and affine_invariant_depth_loss > 0:
+            self.writer.add_scalar('Loss/AffineInvariantDepth', affine_invariant_depth_loss, step)
+        if pearson_correlation_loss is not None and pearson_correlation_loss > 0:
+            self.writer.add_scalar('Loss/PearsonCorrelationDepth', pearson_correlation_loss, step)
+        if silog_loss is not None and silog_loss > 0:
+            self.writer.add_scalar('Loss/SILog', silog_loss, step)
+        if ordinal_depth_loss is not None and ordinal_depth_loss > 0:
+            self.writer.add_scalar('Loss/OrdinalDepth', ordinal_depth_loss, step)
+        if affine_aligned_gradient_matching_loss is not None and affine_aligned_gradient_matching_loss > 0:
+            self.writer.add_scalar('Loss/AffineAlignedGradientMatching', affine_aligned_gradient_matching_loss, step)
         if sam_loss is not None and sam_loss > 0:
             self.writer.add_scalar('Loss/SAM', sam_loss, step)
         if semantic_loss is not None and semantic_loss > 0:

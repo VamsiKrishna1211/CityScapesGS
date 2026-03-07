@@ -43,7 +43,37 @@ from train_args import TrainConfig, parse_args
 # Modules
 from fused_ssim import fused_ssim
 
+torch.backends.cudnn.enabled = True  # Enable cuDNN auto-tuner for better performance on fixed-size inputs
+torch.backends.cudnn.allow_tf32 = True  # Allow TF32 for cuDNN (can speed up on Ampere GPUs)
+torch.backends.cudnn.benchmark = True  # Enable cuDNN benchmark mode for optimal performance
+torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 for matrix multiplications (can speed up on Ampere GPUs)
+
 ACTIVE_PROGRESS = None
+
+
+def _log_interval_metrics_async(
+    tb_logger: GaussianSplattingLogger,
+    losses_snapshot: dict,
+    psnr_snapshot: float,
+    ssim_snapshot: float,
+    lpips_snapshot: float,
+    num_gaussians_snapshot: int,
+    max_radii_snapshot,
+    step_snapshot: int,
+):
+    """Log per-interval TensorBoard metrics in a background thread using immutable snapshots."""
+    tb_logger.log_losses(**losses_snapshot, step=step_snapshot)
+    tb_logger.log_quality_metrics(
+        psnr=psnr_snapshot,
+        ssim_loss=ssim_snapshot,
+        lpips=lpips_snapshot,
+        step=step_snapshot,
+    )
+    tb_logger.log_model_stats(
+        num_gaussians=num_gaussians_snapshot,
+        max_radii=max_radii_snapshot,
+        step=step_snapshot,
+    )
 
 
 def setup_logger(verbosity: int, output_dir: Path) -> logging.Logger:
@@ -217,12 +247,17 @@ def train_pipeline(config: TrainConfig):
     dataset = ColmapDataset(required_cfg.colmap_path,
                             required_cfg.images_path, 
                             device=device,
+                            image_scale=required_cfg.scale,
                             train_semantics=semantics_cfg.train_semantics,
                             semantics_dim=semantics_cfg.semantics_dim,
                             semantics_path=semantics_path,
                             semantics_resolution=semantics_resolution,
-                            scene_extent_margin=5.0,  # Add margin to scene extent to prevent aggressive pruning of boundary Gaussians
+                            scene_extent_margin=1.5,  # Add margin to scene extent to prevent aggressive pruning of boundary Gaussians
                             )
+    # Enable preload path so image/depth disk I/O does not happen inside the training loop.
+    if training_cfg.preload:
+        logger.info("[yellow]Preloading enabled:[/yellow] loading all images into RAM before training...")
+        dataset.preload_all_data()
     
     # Check if resuming from checkpoint - if so, load it once and reuse
     checkpoint = None
@@ -280,7 +315,7 @@ def train_pipeline(config: TrainConfig):
 
     # Offload heavy logging tasks to a background thread to keep GPU busy
     # max_workers=1 ensures sequential logging and prevents excessive memory usage
-    executor = ThreadPoolExecutor(max_workers=1)
+    executor = ThreadPoolExecutor(max_workers=16)
 
     if tensorboard_cfg.tensorboard and VERBOSITY >= 1:
         if tb_resume_run_name is not None:
@@ -320,18 +355,18 @@ def train_pipeline(config: TrainConfig):
         
         # prune_scale2d=0.20,
 
-        prune_opa=0.005,  
-        grow_grad2d=0.0002, 
-        grow_scale3d=0.01, 
-        grow_scale2d=0.05, 
-        prune_scale3d=0.05,
-        prune_scale2d=0.10,
+        prune_opa=densification_cfg.prune_opa, # default 0.005 - drop anything that contributes very little to the render (opacity < 0.5% per Gaussian)
+        grow_grad2d=densification_cfg.grow_grad2d, # default 0.0001 - add new Gaussians in areas with high 2D image gradients (indicates missed details)
+        grow_scale3d=densification_cfg.grow_scale3d, # default 0.02 - add new Gaussians if existing ones are too small in world space (indicates underfitting/clumping)
+        grow_scale2d=densification_cfg.grow_scale2d, # default 0.01 - add new Gaussians if existing ones are too small on screen (indicates missed fine details)
+        prune_scale3d=densification_cfg.prune_scale3d, # default 0.02 - remove Gaussians that become too large in world space (indicates floaters/clumps)
+        prune_scale2d=densification_cfg.prune_scale2d, # default 0.20 - remove Gaussians that become too large on screen (indicates floaters/blobs)
         
         # Lock in the intervals. Do not densify at iteration 0.
-        refine_start_iter=500,
-        refine_stop_iter=15000,
-        reset_every=3000,
-        refine_every=100,
+        refine_start_iter=densification_cfg.densify_from_iter,
+        refine_stop_iter=densification_cfg.densify_until_iter,
+        refine_every=densification_cfg.densify_interval,
+        reset_every=densification_cfg.opacity_reset_interval,
         
         pause_refine_after_reset=0,
         absgrad=False,
@@ -400,27 +435,62 @@ def train_pipeline(config: TrainConfig):
     if tensorboard_cfg.tensorboard:
         hparams = {
             'iterations': training_cfg.iterations,
+            'save_interval': training_cfg.save_interval,
+            'log_interval': training_cfg.log_interval,
+            'num_workers': training_cfg.num_workers,
             'lr_means': lr_cfg.lr_means,
             'lr_scales': lr_cfg.lr_scales,
             'lr_quats': lr_cfg.lr_quats,
             'lr_opacities': lr_cfg.lr_opacities,
             'lr_sh': lr_cfg.lr_sh,
+            'lr_semantics': lr_cfg.lr_semantics if lr_cfg.lr_semantics is not None else lr_cfg.lr_sh,
             'densify_from_iter': densification_cfg.densify_from_iter,
             'densify_until_iter': densification_cfg.densify_until_iter,
             'densify_interval': densification_cfg.densify_interval,
             'grad_threshold': densification_cfg.grad_threshold,
+            'prune_opa': densification_cfg.prune_opa,
+            'grow_grad2d': densification_cfg.grow_grad2d,
+            'grow_scale3d': densification_cfg.grow_scale3d,
+            'grow_scale2d': densification_cfg.grow_scale2d,
+            'prune_scale3d': densification_cfg.prune_scale3d,
+            'prune_scale2d': densification_cfg.prune_scale2d,
             'max_screen_size': max_screen_size,
             'opacity_reset_interval': densification_cfg.opacity_reset_interval,
             'opacity_reset_value': densification_cfg.opacity_reset_value,
             'sh_degree': sh_cfg.sh_degree,
             'use_sh_rendering': not sh_cfg.disable_sh_rendering,
+            'enable_depth_loss': depth_cfg.enable_depth_loss,
+            'depth_loss_weight': depth_cfg.depth_loss_weight,
+            'depth_loss_start_iter': depth_cfg.depth_loss_start_iter,
+            'sam_loss_weight': depth_cfg.sam_loss_weight,
+            'affine_invariant_depth_loss_weight': depth_cfg.affine_invariant_depth_loss_weight,
+            'pearson_correlation_loss_weight': depth_cfg.pearson_correlation_loss_weight,
+            'silog_loss_weight': depth_cfg.silog_loss_weight,
+            'ordinal_depth_loss_weight': depth_cfg.ordinal_depth_loss_weight,
+            'affine_aligned_gradient_matching_loss_weight': depth_cfg.affine_aligned_gradient_matching_loss_weight,
+            'enable_depth_smoothness_loss': depth_cfg.enable_depth_smoothness_loss,
+            'depth_smoothness_start_alpha': depth_cfg.depth_smoothness_start_alpha,
+            'depth_smoothness_end_alpha': depth_cfg.depth_smoothness_end_alpha,
+            'depth_smoothness_max_steps': depth_cfg.depth_smoothness_max_steps if depth_cfg.depth_smoothness_max_steps is not None else training_cfg.iterations,
+            'depth_smoothness_loss_weight': depth_cfg.depth_smoothness_loss_weight,
             'scene_extent': scene_extent,
             'enable_scale_reg': floater_cfg.enable_scale_reg,
             'scale_reg_weight': floater_cfg.scale_reg_weight if floater_cfg.enable_scale_reg else 0.0,
-            'sam_loss_weight': depth_cfg.sam_loss_weight,
+            'enable_opacity_reg': floater_cfg.enable_opacity_reg,
+            'opacity_reg_weight': floater_cfg.opacity_reg_weight if floater_cfg.enable_opacity_reg else 0.0,
+            'enable_opacity_entropy_reg': floater_cfg.enable_opacity_entropy_reg,
+            'opacity_entropy_reg_weight': floater_cfg.opacity_entropy_reg_weight if floater_cfg.enable_opacity_entropy_reg else 0.0,
             'train_semantics': semantics_cfg.train_semantics,
+            'semantics_dim': semantics_cfg.semantics_dim,
             'semantic_start_iter': semantics_cfg.semantic_start_iter,
             'semantic_loss_weight': semantics_cfg.semantic_loss_weight,
+            'viewer': viewer_cfg.viewer,
+            'viewer_port': viewer_cfg.viewer_port,
+            'viewer_refresh_interval': viewer_cfg.viewer_refresh_interval,
+            'tensorboard_enabled': tensorboard_cfg.tensorboard,
+            'tb_image_interval': tensorboard_cfg.tb_image_interval,
+            'tb_histogram_interval': tensorboard_cfg.tb_histogram_interval,
+            'resume_from_checkpoint': checkpoint_cfg.resume_from is not None,
         }
         tb_logger.log_hyperparameters(hparams)
     
@@ -451,9 +521,10 @@ def train_pipeline(config: TrainConfig):
                 logger.info(f"[green]📺 Viewer started:[/green] http://localhost:{viewer_cfg.viewer_port}")
 
     # SSIM Loss (Standard Library)
-    ssim = StructuralSimilarityIndexMeasure(
-        # data_range=(0, 1.0)
-        ).to(device)
+    # ssim = StructuralSimilarityIndexMeasure(
+    #     # data_range=(0, 1.0)
+    #     ).to(device)
+    # ssim = fused_ssim
     # ssim = MultiScaleStructuralSimilarityIndexMeasure(
     #     # data_range=(0, 1.0),
     #     # betas: weights per scale (scale 1=finest/original → scale 5=coarsest)
@@ -464,7 +535,7 @@ def train_pipeline(config: TrainConfig):
     #     sigma=1.0,       # Sharper gaussian kernel → better fine-detail sensitivity
     #     normalize='relu',
     # ).to(device)
-    lpips = LearnedPerceptualImagePatchSimilarity(net_type='squeeze', normalize=True).to(device)
+    # lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True).to(device)
 
     psnr = PeakSignalNoiseRatio(data_range=(0, 1.0)).to(device)
 
@@ -474,6 +545,11 @@ def train_pipeline(config: TrainConfig):
     #     max_steps= training_cfg.iterations if depth_cfg.depth_smoothness_max_steps is None else depth_cfg.depth_smoothness_max_steps,  # Avoid scheduling if weight is 0
     # ).to(device)
     depth_smoothness_loss = losses.FastPriorGradientMatchingLoss().to(device)
+    affine_invariant_depth_loss = losses.FastAffineInvariantDepthLoss().to(device)
+    pearson_correlation_loss = losses.PearsonCorrelationLoss().to(device)
+    silog_depth_loss = losses.SILogLoss().to(device)
+    ordinal_depth_loss = losses.OrdinalDepthLoss().to(device)
+    affine_aligned_gradient_matching_loss = losses.AffineAlignedGradientMatchingLoss().to(device)
     
     # Optimizer
     # Create optimizers using model's factory method
@@ -550,6 +626,11 @@ def train_pipeline(config: TrainConfig):
     current_depth_loss = 0.0
     current_depth_corr = 0.0
     current_sam_loss = 0.0
+    current_affine_invariant_depth_loss = 0.0
+    current_pearson_correlation_loss = 0.0
+    current_silog_loss = 0.0
+    current_ordinal_depth_loss = 0.0
+    current_affine_aligned_gradient_matching_loss = 0.0
     current_semantic_loss = 0.0
     iteration_start_time = time.time()
     
@@ -557,7 +638,16 @@ def train_pipeline(config: TrainConfig):
     # Using pin_memory for faster GPU transfer, num_workers=4 for parallel loading
     # batch_size=1 to handle varying image sizes and maintain numerical stability
     import multiprocessing
-    num_workers = min(0, multiprocessing.cpu_count())
+    max_workers = multiprocessing.cpu_count()
+    num_workers = max(0, min(training_cfg.num_workers, max_workers))
+
+    if num_workers > 0:
+        if VERBOSITY >= 1:
+            logger.info(
+                "[yellow]Preloading enabled:[/yellow] forcing DataLoader num_workers to 0 "
+                "to avoid duplicating preloaded RAM across worker processes."
+            )
+        num_workers = 0
     
     dataloader = DataLoader(
         dataset,
@@ -599,6 +689,9 @@ def train_pipeline(config: TrainConfig):
             gt_image = gt_image.to(device)
         if gt_image.dim() == 3:
             gt_image = gt_image.unsqueeze(0)
+
+        if depth_tensor is not None and not depth_tensor.is_cuda:
+            depth_tensor = depth_tensor.to(device)
         
 
         # 2. Setup Camera Matrices
@@ -659,7 +752,10 @@ def train_pipeline(config: TrainConfig):
             & torch.isfinite(render_depth_map)
             & (render_depth_map > 0)
         )
-        depth_mask_bchw = depth_mask.unsqueeze(1)  # [B, 1, H, W] for loss functions that expect channel dim
+        depth_mask_bchw = depth_mask.unsqueeze(0)  # [B, 1, H, W] for loss functions that expect channel dim
+
+        render_depth_map_bchw = render_depth_map.unsqueeze(0) # [B, 1, H, W] for loss functions that expect channel dim
+        depth_tensor_bchw = depth_tensor.unsqueeze(0).unsqueeze(1).to(device) if depth_tensor is not None else None # [B, 1, H, W] for loss functions that expect channel dim
         
 
         # Get means2d and radii for densification tracking
@@ -695,21 +791,66 @@ def train_pipeline(config: TrainConfig):
             render_perm, gt_perm
         )
 
-        # lpips_loss = lpips(render_perm, gt_perm)
+        # LPIPS LOSS with random patch
+        # h, w = render_perm.shape[2:]
+        # patch_size = 224
+        # top = torch.randint(0, h - patch_size, (1,))
+        # left = torch.randint(0, w - patch_size, (1,))
+
+        # render_patch = render_perm[:, :, top:top+patch_size, left:left+patch_size].clamp(0.0, 1.0) # Using clamp because bilinear interpolation can produce slight out-of-range values which cause LPIPS to return NaN error
+        # gt_patch = gt_perm[:, :, top:top+patch_size, left:left+patch_size].clamp(0.0, 1.0) # Using clamp because bilinear interpolation can produce slight out-of-range values which cause LPIPS to return NaN or throw error
+        
+
+        # lpips_loss = lpips(render_patch, gt_patch)
+        # render_lpips = F.interpolate(render_perm, size=512, mode='bilinear', align_corners=False)
+        # gt_lpips = F.interpolate(gt_perm, size=512, mode='bilinear', align_corners=False)
+        # lpips_loss = lpips(render_lpips, gt_lpips)
         lpips_loss = torch.tensor(0.0, device=device)
         psnr_value = psnr(render_perm, gt_perm)
 
         loss = 0.8 * l1_loss + 0.2 * ssim_loss
+        if lpips_loss is not None and lpips_loss > 0.0:
+            loss = loss + 0.2 * lpips_loss  # Add LPIPS with a smaller weight to avoid overpowering the main losses
 
-        if depth_cfg.enable_depth_smoothness_loss:
-            # gt_image_bchw = gt_image.permute(0, 3, 1, 2)  # [B, C, H, W]
-            gt_depth_bchw = depth_tensor.unsqueeze(0).unsqueeze(1).to(device) if depth_tensor is not None else None  # [B, 1, H, W]
-            render_depth_map_bchw = render_depth_map.unsqueeze(0)  # [B, 1, H, W]
-            smoothness_loss = depth_smoothness_loss(render_depth_map_bchw, gt_depth_bchw, mask=depth_mask_bchw)
-            loss = loss + depth_cfg.depth_smoothness_loss_weight * smoothness_loss
+        # if depth_cfg.enable_depth_smoothness_loss and depth_tensor is not None:
+        #     # gt_image_bchw = gt_image.permute(0, 3, 1, 2)  # [B, C, H, W]
+        #     gt_depth_bchw = depth_tensor.unsqueeze(0).unsqueeze(1).to(device) if depth_tensor is not None else None  # [B, 1, H, W]
+        #     render_depth_map_bchw = render_depth_map.unsqueeze(0)  # [B, 1, H, W]
+        #     smoothness_loss = depth_smoothness_loss(render_depth_map_bchw, gt_depth_bchw, mask=depth_mask_bchw)
+        #     loss = loss + depth_cfg.depth_smoothness_loss_weight * smoothness_loss
+        # else:
+        #     smoothness_loss = torch.tensor(0.0, device=device)
 
         # Depth loss (conditional, scale-invariant for monocular depth priors)
         inv_rendered_depth, inv_prior_depth = None, None
+        affine_invariant_d_loss = torch.tensor(0.0, device=device)
+        pearson_module_d_loss = torch.tensor(0.0, device=device)
+        silog_d_loss = torch.tensor(0.0, device=device)
+        ordinal_d_loss = torch.tensor(0.0, device=device)
+        affine_aligned_grad_d_loss = torch.tensor(0.0, device=device)
+
+        if depth_tensor is not None:
+            if depth_cfg.affine_invariant_depth_loss_weight > 0.0:
+                affine_invariant_d_loss = affine_invariant_depth_loss(render_depth_map_bchw, depth_tensor_bchw, depth_mask_bchw)
+                loss = loss + depth_cfg.affine_invariant_depth_loss_weight * affine_invariant_d_loss
+
+            if depth_cfg.pearson_correlation_loss_weight > 0.0:
+                pearson_module_d_loss = pearson_correlation_loss(render_depth_map_bchw, depth_tensor_bchw, depth_mask_bchw)
+                loss = loss + depth_cfg.pearson_correlation_loss_weight * pearson_module_d_loss
+
+            if depth_cfg.silog_loss_weight > 0.0:
+                silog_d_loss = silog_depth_loss(render_depth_map_bchw, depth_tensor_bchw, depth_mask_bchw)
+                loss = loss + depth_cfg.silog_loss_weight * silog_d_loss
+
+            if depth_cfg.ordinal_depth_loss_weight > 0.0:
+                ordinal_d_loss = ordinal_depth_loss(render_depth_map_bchw, depth_tensor_bchw, depth_mask_bchw)
+                loss = loss + depth_cfg.ordinal_depth_loss_weight * ordinal_d_loss
+
+            if depth_cfg.affine_aligned_gradient_matching_loss_weight > 0.0:
+                affine_aligned_grad_d_loss = affine_aligned_gradient_matching_loss(render_depth_map_bchw, depth_tensor_bchw, depth_mask_bchw)
+                loss = loss + depth_cfg.affine_aligned_gradient_matching_loss_weight * affine_aligned_grad_d_loss
+                    
+
         if depth_cfg.enable_depth_loss and depth_tensor is not None and step >= depth_cfg.depth_loss_start_iter:
 
             # Move depth to GPU if available
@@ -729,11 +870,11 @@ def train_pipeline(config: TrainConfig):
 
 
             try:
-                d_loss, depth_corr = losses.pearson_correlation_depth_loss(
-                    render_depth_map, 
-                    depth_tensor.detach(),
-                    depth_mask
-                )
+                # d_loss, depth_corr = losses.pearson_correlation_depth_loss(
+                #     render_depth_map, 
+                #     depth_tensor.detach(),
+                #     depth_mask
+                # )
                 # d_loss = losses.silog_depth_loss(
                 #     render_depth_map, 
                 #     depth_tensor.detach(),
@@ -742,6 +883,7 @@ def train_pipeline(config: TrainConfig):
                 current_depth_corr = depth_corr.mean().item() if torch.isfinite(depth_corr).all() else 0.0
                 inv_rendered_depth = render_depth_map.detach()
                 inv_prior_depth = depth_tensor.detach()
+
             except RuntimeError as e:
                 d_loss = torch.tensor(0.0, device=device)
                 current_depth_corr = 0.0
@@ -749,9 +891,6 @@ def train_pipeline(config: TrainConfig):
         else:
             d_loss = torch.tensor(0.0, device=device)
             current_depth_corr = 0.0
-        
-        if depth_cfg.enable_depth_loss and depth_tensor is not None and step >= depth_cfg.depth_loss_start_iter:
-            loss = loss + depth_cfg.depth_loss_weight * d_loss
 
         # Sharpness-aware minimization loss (gradient-domain detail preservation)
         if depth_cfg.sam_loss_weight > 0.0:
@@ -875,6 +1014,11 @@ def train_pipeline(config: TrainConfig):
             current_opacity_reg = opacity_reg_loss.item()
             current_opacity_entropy_reg = opacity_entropy_reg_loss.item()
             current_depth_loss = d_loss.item()
+            current_affine_invariant_depth_loss = affine_invariant_d_loss.item()
+            current_pearson_correlation_loss = pearson_module_d_loss.item()
+            current_silog_loss = silog_d_loss.item()
+            current_ordinal_depth_loss = ordinal_d_loss.item()
+            current_affine_aligned_gradient_matching_loss = affine_aligned_grad_d_loss.item()
             current_sam_loss = sam_loss.item()
             current_semantic_loss = semantic_loss.item()
             
@@ -895,22 +1039,37 @@ def train_pipeline(config: TrainConfig):
                 if depth_cfg.enable_depth_loss and step >= depth_cfg.depth_loss_start_iter:
                     losses_dict['depth_loss'] = current_depth_loss
                     losses_dict['depth_corr'] = current_depth_corr
+                if depth_cfg.affine_invariant_depth_loss_weight > 0.0:
+                    losses_dict['affine_invariant_depth_loss'] = current_affine_invariant_depth_loss
+                if depth_cfg.pearson_correlation_loss_weight > 0.0:
+                    losses_dict['pearson_correlation_loss'] = current_pearson_correlation_loss
+                if depth_cfg.silog_loss_weight > 0.0:
+                    losses_dict['silog_loss'] = current_silog_loss
+                if depth_cfg.ordinal_depth_loss_weight > 0.0:
+                    losses_dict['ordinal_depth_loss'] = current_ordinal_depth_loss
+                if depth_cfg.affine_aligned_gradient_matching_loss_weight > 0.0:
+                    losses_dict['affine_aligned_gradient_matching_loss'] = current_affine_aligned_gradient_matching_loss
                 if depth_cfg.sam_loss_weight > 0.0:
                     losses_dict['sam_loss'] = current_sam_loss
                 if semantics_cfg.train_semantics and semantics_cfg.semantic_loss_weight > 0.0 and step >= semantics_cfg.semantic_start_iter:
                     losses_dict['semantic_loss'] = current_semantic_loss
-                
-                tb_logger.log_losses(**losses_dict, step=step)
-                tb_logger.log_quality_metrics(
-                    psnr=current_psnr,
-                    ssim_loss=current_ssim,
-                    lpips=current_lpips,
-                    step=step
-                )
-                tb_logger.log_model_stats(
-                    num_gaussians=len(model._means),
-                    max_radii=render_meta['radii'],
-                    step=step
+
+                # Snapshot logging inputs so loop-variable updates cannot race with async logging.
+                losses_snapshot = dict(losses_dict)
+                max_radii_snapshot = render_meta.get('radii', None)
+                if isinstance(max_radii_snapshot, torch.Tensor):
+                    max_radii_snapshot = max_radii_snapshot.detach().clone()
+
+                executor.submit(
+                    _log_interval_metrics_async,
+                    tb_logger=tb_logger,
+                    losses_snapshot=losses_snapshot,
+                    psnr_snapshot=float(current_psnr),
+                    ssim_snapshot=float(current_ssim),
+                    lpips_snapshot=float(current_lpips),
+                    num_gaussians_snapshot=int(len(model._means)),
+                    max_radii_snapshot=max_radii_snapshot,
+                    step_snapshot=int(step),
                 )
                 
                 # Log system metrics (CPU, RAM, GPU usage, power, etc.)
@@ -958,11 +1117,16 @@ def train_pipeline(config: TrainConfig):
             current_opacity_reg = opacity_reg_loss.item()
             current_opacity_entropy_reg = opacity_entropy_reg_loss.item()
             current_depth_loss = d_loss.item()
+            current_affine_invariant_depth_loss = affine_invariant_d_loss.item()
+            current_pearson_correlation_loss = pearson_module_d_loss.item()
+            current_silog_loss = silog_d_loss.item()
+            current_ordinal_depth_loss = ordinal_d_loss.item()
+            current_affine_aligned_gradient_matching_loss = affine_aligned_grad_d_loss.item()
             current_sam_loss = sam_loss.item()
             current_semantic_loss = semantic_loss.item()
 
             logger.warning(f"[yellow]⚠ Loss is NaN or too large at step {step}[/yellow]: {loss.item()}")
-            logger.warning(f"[yellow]   Current Metrics:[/yellow] loss={current_loss:.4f}, l1={current_l1:.4f}, ssim_loss={current_ssim:.4f}, lpips={current_lpips:.4f}, psnr={current_psnr:.2f}, scale_reg={current_scale_reg:.6f}, opacity_reg={current_opacity_reg:.6f}, opacity_entropy_reg={current_opacity_entropy_reg:.6f}, depth_loss={current_depth_loss:.4f}, sam_loss={current_sam_loss:.4f}, semantic_loss={current_semantic_loss:.4f}")
+            logger.warning(f"[yellow]   Current Metrics:[/yellow] loss={current_loss:.4f}, l1={current_l1:.4f}, ssim_loss={current_ssim:.4f}, lpips={current_lpips:.4f}, psnr={current_psnr:.2f}, scale_reg={current_scale_reg:.6f}, opacity_reg={current_opacity_reg:.6f}, opacity_entropy_reg={current_opacity_entropy_reg:.6f}, depth_loss={current_depth_loss:.4f}, affine_invariant_depth_loss={current_affine_invariant_depth_loss:.4f}, pearson_correlation_loss={current_pearson_correlation_loss:.4f}, silog_loss={current_silog_loss:.4f}, ordinal_depth_loss={current_ordinal_depth_loss:.4f}, affine_aligned_gradient_matching_loss={current_affine_aligned_gradient_matching_loss:.4f}, sam_loss={current_sam_loss:.4f}, semantic_loss={current_semantic_loss:.4f}")
             if VERBOSITY >= 1: progress.stop()
             raise RuntimeError(f"Loss is NaN or too large at step {step}")
         loss.backward()
@@ -1169,6 +1333,21 @@ if __name__ == "__main__":
         if depth_cfg.enable_depth_loss:
             depth_config = f"Enabled (weight={depth_cfg.depth_loss_weight}, start_iter={depth_cfg.depth_loss_start_iter})"
             config_table.add_row("Depth Supervision", depth_config)
+            extra_depth_losses = []
+            if depth_cfg.affine_invariant_depth_loss_weight > 0.0:
+                extra_depth_losses.append(f"AffineInvariant(λ={depth_cfg.affine_invariant_depth_loss_weight})")
+            if depth_cfg.pearson_correlation_loss_weight > 0.0:
+                extra_depth_losses.append(f"PearsonClass(λ={depth_cfg.pearson_correlation_loss_weight})")
+            if depth_cfg.silog_loss_weight > 0.0:
+                extra_depth_losses.append(f"SILog(λ={depth_cfg.silog_loss_weight})")
+            if depth_cfg.ordinal_depth_loss_weight > 0.0:
+                extra_depth_losses.append(f"Ordinal(λ={depth_cfg.ordinal_depth_loss_weight})")
+            if depth_cfg.affine_aligned_gradient_matching_loss_weight > 0.0:
+                extra_depth_losses.append(f"AffineAlignedGrad(λ={depth_cfg.affine_aligned_gradient_matching_loss_weight})")
+            if depth_cfg.enable_depth_smoothness_loss and depth_cfg.depth_smoothness_loss_weight > 0.0:
+                extra_depth_losses.append(f"FastPriorGrad(λ={depth_cfg.depth_smoothness_loss_weight})")
+            if extra_depth_losses:
+                config_table.add_row("Depth Aux Losses", ", ".join(extra_depth_losses))
         if depth_cfg.sam_loss_weight > 0:
             config_table.add_row("SAM Loss", f"Enabled (weight={depth_cfg.sam_loss_weight})")
         if semantics_cfg.train_semantics:

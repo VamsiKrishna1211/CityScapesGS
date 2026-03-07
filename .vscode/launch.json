@@ -1,0 +1,55 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train Custom GaussianSplat - ArtSci",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/custom_gaussiansplat/train.py",
+            "console": "integratedTerminal",
+            "env": {
+                "BASE_PATH": "/home/exouser/CityScapesGS/data/Mip-NeRF-360/bicycle"
+            },
+            "args": [
+                "--colmap-path", "/home/exouser/CityScapesGS/data/Mip-NeRF-360/bicycle/sparse/0",
+                "--images-path", "/home/exouser/CityScapesGS/data/Mip-NeRF-360/bicycle/images",
+                "--output-dir", "/home/exouser/CityScapesGS/data/Mip-NeRF-360/bicycle/cust_gs_outputs",
+                "--log-interval", "10",
+                "--densify-from-iter", "0",
+                "--densify-interval", "500",
+                "--densify-until-iter", "15000",
+                "--tb-image-interval", "100",
+                "--viewer",
+                "--iterations", "30000",
+                "--sh-degree", "3",
+                "--lr-means", "0.00002",
+                "--lr-quats", "0.00002",
+                "--lr-scales", "0.001",
+                "--lr-sh", "0.002",
+                "--grad-threshold", "0.0002",
+                "--enable-scale-reg",
+                "--scale-reg-weight", "0.01",
+                "--enable-opacity-reg",
+                "--opacity-reg-weight", "0.0005",
+                "--verbosity", "3",
+                "--grow-grad2d", "0.0001",
+                "--grow-scale3d", "0.02",
+                "--grow-scale2d", "0.01",
+                "--prune-scale3d", "0.02",
+                "--prune-scale2d", "0.2",
+                "--affine-invariant-depth-loss-weight", "0.1"
+
+    //             --grow-grad2d 0.0001 --grow-scale3d 0.02 --grow-scale2d 0.01 --prune-scale3d 0.02 --prune-scale2d 0.2 \
+    // --affine-invariant-depth-loss-weight 0.1
+                // "--train-semantics",
+                // "--semantics-dim", "4",
+                // "--semantic-start-iter=0",
+                // "--semantics-path", "/home/exouser/CityScapesGS/data/Mip-NeRF-360/bicycle/language_features_dim3"
+            ],
+            "justMyCode": false
+        }
+    ]
+}
