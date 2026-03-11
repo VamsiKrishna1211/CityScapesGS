@@ -141,10 +141,10 @@ python custom_gaussiansplat/train.py \
     --log-interval 10 \
     --densify-from-iter 500 \
     --densify-interval 100 \
-    --densify-until-iter 15000 \
+    --densify-until-iter 30000 \
     --tb-image-interval 100 \
     --viewer \
-    --iterations 30000 \
+    --iterations 50000 \
     --sh-degree 3 \
     --lr-means 0.0002 \
     --lr-quats 0.0002 \

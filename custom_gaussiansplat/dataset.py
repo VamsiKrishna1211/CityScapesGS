@@ -5,11 +5,9 @@ import os
 import logging
 import imageio.v2 as imageio
 from torch.utils.data import Dataset
-from torchvision.transforms import functional as TF
 from scipy.spatial.transform import Rotation
 from pathlib import Path
-from typing import Optional, Union
-import cv2
+from typing import Optional
 from rich.console import Console
 from rich.progress import (
     Progress,
@@ -29,9 +27,6 @@ class ColmapDataset(Dataset):
                  image_dir, device: torch.device=torch.device('cuda'), 
                  use_dataloader=True, 
                  point_cloud_extent_ratio: Optional[float] = None,
-                 train_semantics=False, semantics_dim=3,
-                 semantics_path: Optional[Path] = None,
-                 semantics_resolution: Optional[Union[tuple[int, int], int]] = None,
                  scene_extent_margin: float = 2.0,
                  image_scale: int = 2,
                  ):
@@ -43,10 +38,6 @@ class ColmapDataset(Dataset):
             - device: torch.device to load tensors onto (default: 'cuda')
             - use_dataloader: If True, __getitem__ will load images on demand. If False, images will be pre-loaded into RAM (useful for small datasets).
             - point_cloud_extent_ratio: If set, prunes the initial point cloud to only include points within this fraction of the scene extent (useful for large outdoor scenes to focus on central areas).
-            - train_semantics: If True, also loads semantic features for each image (if available) and includes them in the dataset items.
-            - semantics_dim: Dimensionality of semantic features (e.g., 3 for RGB-based semantics, 128 for CLIP-based features).
-            - semantics_path: Optional path to semantic features directory (should contain .npy files named after images).
-            - semantics_resolution: Optional resolution to which semantic features should be resized (if they are image-based). If None assumes semantic features are already in the correct format and dimension.
             - image_scale: Downscale factor used for training images. If image_dir points to `images`, this resolves to `images_<image_scale>` for scale > 1.
         """
         # Handle both string and torch.device
@@ -55,7 +46,6 @@ class ColmapDataset(Dataset):
         self.use_dataloader = use_dataloader  # Don't move to CUDA in workers
         self._preloaded_images = None  # Cache for pre-loaded images
         self._preloaded_depths = None  # Cache for pre-loaded depth maps (can contain None entries)
-        self.train_semantics = train_semantics
 
         if image_scale < 1:
             raise ValueError(f"image_scale must be >= 1, got {image_scale}")
@@ -157,17 +147,6 @@ class ColmapDataset(Dataset):
                 'image_path': img_path
             })
 
-        if train_semantics:
-            if semantics_path is None:
-                raise ValueError("train_semantics is True but semantics_path is not provided. Please provide a path to the semantic features directory.")
-            else:
-                self.semantics_path = Path(semantics_path)
-                self.semantics_dim = semantics_dim
-                if isinstance(semantics_resolution, int) and semantics_resolution > 0:
-                    semantics_resolution = (semantics_resolution, semantics_resolution)
-                self.semantics_resolution = semantics_resolution
-                logger.info(f"[cyan]Semantic features enabled:[/cyan] loading from {semantics_path}, dim={semantics_dim}, resolution={semantics_resolution}")
-
     @staticmethod
     def _resolve_image_dir(image_dir: Path, image_scale: int) -> Path:
         """Resolve the image directory for the requested scale using COLMAP-style folder names."""
@@ -251,28 +230,7 @@ class ColmapDataset(Dataset):
             depth_tensor = self._load_depth(img_path, cam_data)
         depth_tensor = depth_tensor.to(self.device) if depth_tensor is not None else None  # Move to device if loaded on demand
 
-        semantics_output = (None, None)
-        if self.train_semantics:
-            semantics_output = self._load_semantics(img_path, img_tensor.detach().cpu())
-            # semantics_output = (None, None)  # Placeholder for semantics loading (can be implemented similarly to depth loading with validation)
-        return cam_data, img_tensor.to(self.device), depth_tensor, semantics_output
-
-    @torch.no_grad()
-    def _load_semantics(self, img_path: Path, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Load semantic features for the given image if available."""
-        logger.debug(f"Attempting to load semantic features for {img_path.name} from {self.semantics_path}")
-        semantics_file = self.semantics_path / f"{img_path.stem}_s.npy"
-        if not semantics_file.exists():
-            raise FileNotFoundError(f"Semantic features file not found for {img_path.name} at expected location: {semantics_file}")
-        
-        try:
-            semantics = torch.tensor(np.load(semantics_file))
-            semantics_image = np.asarray(image.cpu())  # Convert to numpy for resizing
-            semantics_image = cv2.resize(semantics_image, semantics.shape[1:], interpolation=cv2.INTER_CUBIC)
-            # semantics_image = TF.resize(image, semantics.shape[1:], interpolation=TF.InterpolationMode.BICUBIC)  # Resize to match semantics if needed
-            return semantics.float(), torch.tensor(semantics_image)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load semantic features for {img_path.name} from {semantics_file}: {e}")
+        return cam_data, img_tensor.to(self.device), depth_tensor
 
     def _load_depth(self, img_path: Path, cam_data: dict) -> Optional[torch.Tensor]:
         """Load and normalize depth map with validation."""

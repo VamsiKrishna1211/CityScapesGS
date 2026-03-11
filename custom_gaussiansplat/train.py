@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+# os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
 import torch
 import torch.nn.functional as F
@@ -190,7 +190,6 @@ def train_pipeline(config: TrainConfig):
     densification_cfg = config.densification
     floater_cfg = config.floater_prevention
     sh_cfg = config.sh
-    semantics_cfg = config.semantics
     depth_cfg = config.depth
     lr_cfg = config.learning_rates
     runtime_cfg = config.runtime
@@ -216,42 +215,10 @@ def train_pipeline(config: TrainConfig):
     checkpoint_dir = output_path / 'checkpoints'
     checkpoint_dir.mkdir(exist_ok=True)
 
-    # Setup
-    semantics_path = (
-        Path(semantics_cfg.semantics_path)
-        if semantics_cfg.semantics_path is not None and not isinstance(semantics_cfg.semantics_path, Path)
-        else semantics_cfg.semantics_path
-    )
-    raw_semantics_resolution = semantics_cfg.semantic_image_resolution
-    if isinstance(raw_semantics_resolution, list):
-        if len(raw_semantics_resolution) != 2:
-            raise ValueError(
-                "semantic_image_resolution must contain exactly two values [height, width] when provided as a list."
-            )
-        semantics_resolution: Union[Tuple[int, int], int, None] = (
-            int(raw_semantics_resolution[0]),
-            int(raw_semantics_resolution[1]),
-        )
-    elif isinstance(raw_semantics_resolution, tuple):
-        if len(raw_semantics_resolution) != 2:
-            raise ValueError(
-                "semantic_image_resolution must contain exactly two values (height, width) when provided as a tuple."
-            )
-        semantics_resolution = (
-            int(raw_semantics_resolution[0]),
-            int(raw_semantics_resolution[1]),
-        )
-    else:
-        semantics_resolution = raw_semantics_resolution
-
     dataset = ColmapDataset(required_cfg.colmap_path,
                             required_cfg.images_path, 
                             device=device,
                             image_scale=required_cfg.scale,
-                            train_semantics=semantics_cfg.train_semantics,
-                            semantics_dim=semantics_cfg.semantics_dim,
-                            semantics_path=semantics_path,
-                            semantics_resolution=semantics_resolution,
                             scene_extent_margin=1.5,  # Add margin to scene extent to prevent aggressive pruning of boundary Gaussians
                             )
     # Enable preload path so image/depth disk I/O does not happen inside the training loop.
@@ -276,8 +243,6 @@ def train_pipeline(config: TrainConfig):
             checkpoint_path=checkpoint_path,
             device=str(device),
             sh_degree=sh_cfg.sh_degree,
-            train_semantics=semantics_cfg.train_semantics,
-            semantics_dim=semantics_cfg.semantics_dim,
             console=console,
             strict=False,
         )
@@ -300,8 +265,6 @@ def train_pipeline(config: TrainConfig):
             dataset.init_points, 
             dataset.init_colors,
             sh_degree=sh_cfg.sh_degree,
-            train_semantics=semantics_cfg.train_semantics,
-            semantics_dim=semantics_cfg.semantics_dim,
             console=console
         ).to(device)
 
@@ -443,7 +406,6 @@ def train_pipeline(config: TrainConfig):
             'lr_quats': lr_cfg.lr_quats,
             'lr_opacities': lr_cfg.lr_opacities,
             'lr_sh': lr_cfg.lr_sh,
-            'lr_semantics': lr_cfg.lr_semantics if lr_cfg.lr_semantics is not None else lr_cfg.lr_sh,
             'densify_from_iter': densification_cfg.densify_from_iter,
             'densify_until_iter': densification_cfg.densify_until_iter,
             'densify_interval': densification_cfg.densify_interval,
@@ -480,10 +442,6 @@ def train_pipeline(config: TrainConfig):
             'opacity_reg_weight': floater_cfg.opacity_reg_weight if floater_cfg.enable_opacity_reg else 0.0,
             'enable_opacity_entropy_reg': floater_cfg.enable_opacity_entropy_reg,
             'opacity_entropy_reg_weight': floater_cfg.opacity_entropy_reg_weight if floater_cfg.enable_opacity_entropy_reg else 0.0,
-            'train_semantics': semantics_cfg.train_semantics,
-            'semantics_dim': semantics_cfg.semantics_dim,
-            'semantic_start_iter': semantics_cfg.semantic_start_iter,
-            'semantic_loss_weight': semantics_cfg.semantic_loss_weight,
             'viewer': viewer_cfg.viewer,
             'viewer_port': viewer_cfg.viewer_port,
             'viewer_refresh_interval': viewer_cfg.viewer_refresh_interval,
@@ -559,7 +517,6 @@ def train_pipeline(config: TrainConfig):
         lr_quats=lr_cfg.lr_quats,
         lr_opacities=lr_cfg.lr_opacities,
         lr_sh=lr_cfg.lr_sh,
-        lr_semantics=lr_cfg.lr_semantics,
         means_lr_multiplier=5.0,
     )
     
@@ -631,7 +588,7 @@ def train_pipeline(config: TrainConfig):
     current_silog_loss = 0.0
     current_ordinal_depth_loss = 0.0
     current_affine_aligned_gradient_matching_loss = 0.0
-    current_semantic_loss = 0.0
+    smoothness_loss = torch.tensor(0.0, device=device)
     iteration_start_time = time.time()
     
     # Create DataLoader for efficient data loading
@@ -675,11 +632,11 @@ def train_pipeline(config: TrainConfig):
         
         # 1. Get Batch - using DataLoader for efficient loading
         try:
-            cam, gt_image, depth_tensor, (semantic_tensor, semantic_image) = next(dataloader_iter) # Depth tensor may be None & if returned, is the raw value without normalization (handled in loss function)
+            cam, gt_image, depth_tensor = next(dataloader_iter) # Depth tensor may be None & if returned, is the raw value without normalization (handled in loss function)
         except StopIteration:
             # Reset iterator when epoch ends (seamless cycling)
             dataloader_iter = iter(dataloader)
-            cam, gt_image, depth_tensor, (semantic_tensor, semantic_image) = next(dataloader_iter)
+            cam, gt_image, depth_tensor = next(dataloader_iter)
 
         torch.cuda.synchronize()
         
@@ -801,7 +758,7 @@ def train_pipeline(config: TrainConfig):
 
                 render_patch = render_perm[:, :, top:top+patch_size, left:left+patch_size].clamp(0.0, 1.0) # Using clamp because bilinear interpolation can produce slight out-of-range values which cause LPIPS to return NaN error
                 gt_patch = gt_perm[:, :, top:top+patch_size, left:left+patch_size].clamp(0.0, 1.0) # Using clamp because bilinear interpolation can produce slight out-of-range values which cause LPIPS to return NaN or throw error
-            else: #use the original images if smaller than 1024, but clamp to [0,1] to prevent LPIPS NaN errors
+            else: #use the original images if smaller than 1024
                 render_patch = render_perm
                 gt_patch = gt_perm
 
@@ -829,6 +786,7 @@ def train_pipeline(config: TrainConfig):
 
         # Depth loss (conditional, scale-invariant for monocular depth priors)
         inv_rendered_depth, inv_prior_depth = None, None
+        depth_corr = torch.tensor(0.0, device=device)
         affine_invariant_d_loss = torch.tensor(0.0, device=device)
         pearson_module_d_loss = torch.tensor(0.0, device=device)
         silog_d_loss = torch.tensor(0.0, device=device)
@@ -925,7 +883,7 @@ def train_pipeline(config: TrainConfig):
         else:
             opacity_reg_loss = torch.tensor(0.0, device=device)
 
-        if floater_cfg.enable_opacity_entropy_reg:
+        if floater_cfg.enable_opacity_entropy_reg and step >= floater_cfg.opacity_entropy_reg_start_iter and step <= floater_cfg.opacity_entropy_reg_end_iter:
             opacity_entropy_reg_loss = losses.opacity_entropy_regularization(
                 model.opacities,
                 weight=floater_cfg.opacity_entropy_reg_weight
@@ -933,79 +891,6 @@ def train_pipeline(config: TrainConfig):
             loss = loss + opacity_entropy_reg_loss
         else:
             opacity_entropy_reg_loss = torch.tensor(0.0, device=device)
-
-        if semantics_cfg.train_semantics and semantics_cfg.semantic_start_iter < densification_cfg.densify_until_iter:
-            raise ValueError(
-                f"Semantic supervision start iteration ({semantics_cfg.semantic_start_iter}) must be greater than or equal to densification stop iteration ({densification_cfg.densify_until_iter}) to ensure stable training before applying semantic loss."
-            )
-
-        # Semantic supervision (optional)
-        if (
-            semantics_cfg.train_semantics
-            and semantics_cfg.semantic_loss_weight > 0.0
-            and semantic_tensor is not None
-            and model.semantics is not None
-            and step >= semantics_cfg.semantic_start_iter
-        ):
-            semantic_out, _, _ = rasterization(
-                means=model.means.detach(),
-                quats=model.quats.detach(),
-                scales=model.scales.detach(),
-                opacities=model.opacities.squeeze(-1).detach(),
-                colors=model.semantics,
-                viewmats=viewmat,
-                Ks=K[None, ...],
-                width=cam['width'],
-                height=cam['height'],
-                sh_degree=None,
-                render_mode="RGB",
-            )
-
-            semantic_pred = semantic_out[0].float()  # [H, W, C]
-            semantic_target = semantic_tensor.to(device=device, dtype=torch.float32)
-
-            if semantic_target.dim() == 4 and semantic_target.shape[0] == 1:
-                semantic_target = semantic_target.squeeze(0)
-
-            if semantic_target.dim() == 2:
-                semantic_target = semantic_target.unsqueeze(-1)
-
-            if semantic_target.dim() == 3 and semantic_target.shape[0] == semantic_pred.shape[-1] and semantic_target.shape[-1] != semantic_pred.shape[-1]:
-                semantic_target = semantic_target.permute(1, 2, 0)
-
-            if semantic_target.dim() != 3:
-                raise RuntimeError(
-                    f"Unexpected semantic target shape: {tuple(semantic_target.shape)}. Expected [H,W,C] or [C,H,W]."
-                )
-
-            if semantic_target.shape[-1] != semantic_pred.shape[-1]:
-                raise RuntimeError(
-                    f"Semantic channel mismatch: target C={semantic_target.shape[-1]} vs render C={semantic_pred.shape[-1]}"
-                )
-
-            if semantic_target.shape[:2] != semantic_pred.shape[:2]:
-                # target_nchw = semantic_target.permute(2, 0, 1).unsqueeze(0)
-                # target_nchw = F.interpolate(
-                #     target_nchw,
-                #     size=(semantic_pred.shape[0], semantic_pred.shape[1]),
-                #     mode="bilinear",
-                #     align_corners=False,
-                # )
-                # semantic_target = target_nchw.squeeze(0).permute(1, 2, 0)
-                pred_nchw = semantic_pred.permute(2, 0, 1).unsqueeze(0)
-                pred_nchw = F.interpolate(
-                    pred_nchw,
-                    size=(semantic_target.shape[0], semantic_target.shape[1]),
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                semantic_pred = pred_nchw.squeeze(0).permute(1, 2, 0)
-            semantic_pred = (semantic_pred - semantic_pred.min()) / (semantic_pred.max() - semantic_pred.min() + 1e-6)
-            semantic_target = (semantic_target - semantic_target.min()) / (semantic_target.max() - semantic_target.min() + 1e-6)
-            semantic_loss = F.mse_loss(semantic_pred, semantic_target)
-            loss = loss + semantics_cfg.semantic_loss_weight * semantic_loss
-        else:
-            semantic_loss = torch.tensor(0.0, device=device)
 
 
         # Update metrics only periodically for logging to avoid excessive CPU-GPU synchronization
@@ -1026,7 +911,6 @@ def train_pipeline(config: TrainConfig):
             current_ordinal_depth_loss = ordinal_d_loss.item()
             current_affine_aligned_gradient_matching_loss = affine_aligned_grad_d_loss.item()
             current_sam_loss = sam_loss.item()
-            current_semantic_loss = semantic_loss.item()
             
             # Log metrics to TensorBoard
             if tensorboard_cfg.tensorboard:
@@ -1057,8 +941,6 @@ def train_pipeline(config: TrainConfig):
                     losses_dict['affine_aligned_gradient_matching_loss'] = current_affine_aligned_gradient_matching_loss
                 if depth_cfg.sam_loss_weight > 0.0:
                     losses_dict['sam_loss'] = current_sam_loss
-                if semantics_cfg.train_semantics and semantics_cfg.semantic_loss_weight > 0.0 and step >= semantics_cfg.semantic_start_iter:
-                    losses_dict['semantic_loss'] = current_semantic_loss
 
                 # Snapshot logging inputs so loop-variable updates cannot race with async logging.
                 losses_snapshot = dict(losses_dict)
@@ -1129,10 +1011,9 @@ def train_pipeline(config: TrainConfig):
             current_ordinal_depth_loss = ordinal_d_loss.item()
             current_affine_aligned_gradient_matching_loss = affine_aligned_grad_d_loss.item()
             current_sam_loss = sam_loss.item()
-            current_semantic_loss = semantic_loss.item()
 
             logger.warning(f"[yellow]⚠ Loss is NaN or too large at step {step}[/yellow]: {loss.item()}")
-            logger.warning(f"[yellow]   Current Metrics:[/yellow] loss={current_loss:.4f}, l1={current_l1:.4f}, ssim_loss={current_ssim:.4f}, lpips={current_lpips:.4f}, psnr={current_psnr:.2f}, scale_reg={current_scale_reg:.6f}, opacity_reg={current_opacity_reg:.6f}, opacity_entropy_reg={current_opacity_entropy_reg:.6f}, depth_loss={current_depth_loss:.4f}, affine_invariant_depth_loss={current_affine_invariant_depth_loss:.4f}, pearson_correlation_loss={current_pearson_correlation_loss:.4f}, silog_loss={current_silog_loss:.4f}, ordinal_depth_loss={current_ordinal_depth_loss:.4f}, affine_aligned_gradient_matching_loss={current_affine_aligned_gradient_matching_loss:.4f}, sam_loss={current_sam_loss:.4f}, semantic_loss={current_semantic_loss:.4f}")
+            logger.warning(f"[yellow]   Current Metrics:[/yellow] loss={current_loss:.4f}, l1={current_l1:.4f}, ssim_loss={current_ssim:.4f}, lpips={current_lpips:.4f}, psnr={current_psnr:.2f}, scale_reg={current_scale_reg:.6f}, opacity_reg={current_opacity_reg:.6f}, opacity_entropy_reg={current_opacity_entropy_reg:.6f}, depth_loss={current_depth_loss:.4f}, affine_invariant_depth_loss={current_affine_invariant_depth_loss:.4f}, pearson_correlation_loss={current_pearson_correlation_loss:.4f}, silog_loss={current_silog_loss:.4f}, ordinal_depth_loss={current_ordinal_depth_loss:.4f}, affine_aligned_gradient_matching_loss={current_affine_aligned_gradient_matching_loss:.4f}, sam_loss={current_sam_loss:.4f}")
             if VERBOSITY >= 1: progress.stop()
             raise RuntimeError(f"Loss is NaN or too large at step {step}")
         loss.backward()
@@ -1233,7 +1114,7 @@ def train_pipeline(config: TrainConfig):
             }, checkpoint_path)
             if VERBOSITY >= 1:
                 logger.info(f"[green]💾 Checkpoint saved:[/green] [dim]{checkpoint_path.name}[/dim]")
-    
+
     # Complete viewer training mode
     if viewer is not None:
         viewer.complete()
@@ -1306,7 +1187,6 @@ if __name__ == "__main__":
     densification_cfg = config.densification
     floater_cfg = config.floater_prevention
     sh_cfg = config.sh
-    semantics_cfg = config.semantics
     depth_cfg = config.depth
     export_cfg = config.export
     runtime_cfg = config.runtime
@@ -1356,12 +1236,6 @@ if __name__ == "__main__":
                 config_table.add_row("Depth Aux Losses", ", ".join(extra_depth_losses))
         if depth_cfg.sam_loss_weight > 0:
             config_table.add_row("SAM Loss", f"Enabled (weight={depth_cfg.sam_loss_weight})")
-        if semantics_cfg.train_semantics:
-            semantics_config = (
-                f"Enabled (dim={semantics_cfg.semantics_dim}, weight={semantics_cfg.semantic_loss_weight}, "
-                f"start_iter={semantics_cfg.semantic_start_iter})"
-            )
-            config_table.add_row("Semantic Supervision", semantics_config)
         
         # Show enabled floater prevention techniques
         floater_techniques = []

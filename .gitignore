@@ -208,6 +208,8 @@ __marimo__/
 
 
 data/
+# ignoring the symlinked data
+data
 scripts/colmap_build
 # third_party/
 .mypy_cache/

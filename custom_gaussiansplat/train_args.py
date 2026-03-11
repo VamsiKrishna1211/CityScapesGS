@@ -53,6 +53,8 @@ class FloaterPreventionConfig:
     opacity_reg_weight: float
     enable_opacity_entropy_reg: bool
     opacity_entropy_reg_weight: float
+    opacity_entropy_reg_start_iter: int
+    opacity_entropy_reg_end_iter: int
 
 
 @dataclass
@@ -66,9 +68,12 @@ class SemanticsConfig:
     train_semantics: bool
     semantics_path: Optional[Path]
     semantics_dim: int
-    semantic_image_resolution: Union[Tuple[int, int], int, None]
-    semantic_start_iter: int
+    semantic_image_resolution: Optional[Tuple[int, int]]
     semantic_loss_weight: float
+    semantic_finetune_iters: int
+    semantic_provider: str
+    semantic_model_path: Optional[Path]
+    semantic_cache_enabled: bool
 
 
 @dataclass
@@ -214,6 +219,9 @@ def _normalize_semantics_values(values: Dict[str, Any]) -> Dict[str, Any]:
     path_value = values.get("semantics_path")
     values["semantics_path"] = Path(path_value) if path_value is not None else None
 
+    model_path_value = values.get("semantic_model_path")
+    values["semantic_model_path"] = Path(model_path_value) if model_path_value is not None else None
+
     raw_resolution = values.get("semantic_image_resolution")
     if isinstance(raw_resolution, list):
         if len(raw_resolution) != 2:
@@ -223,6 +231,23 @@ def _normalize_semantics_values(values: Dict[str, Any]) -> Dict[str, Any]:
         if len(raw_resolution) != 2:
             raise ValueError("--semantic-image-resolution must contain exactly two values: height width")
         values["semantic_image_resolution"] = (int(raw_resolution[0]), int(raw_resolution[1]))
+
+    if values.get("semantics_dim", 0) <= 0:
+        raise ValueError("--semantics-dim must be a positive integer")
+
+    if values.get("semantic_finetune_iters", 0) <= 0:
+        raise ValueError("--semantic-finetune-iters must be a positive integer")
+
+    if values.get("train_semantics", False):
+        provider = values.get("semantic_provider")
+        if provider == "npy" and values.get("semantics_path") is None:
+            raise ValueError("--semantics-path is required when --semantic-provider=npy and --train-semantics is enabled")
+        if provider == "runtime":
+            model_path = values.get("semantic_model_path")
+            if model_path is None:
+                raise ValueError("--semantic-model-path is required when --semantic-provider=runtime and --train-semantics is enabled")
+            if not model_path.exists():
+                raise ValueError(f"semantic model path does not exist: {model_path}")
 
     return values
 
@@ -319,6 +344,8 @@ FLOATER_PREVENTION_GROUP = ArgGroupDef(
         ArgSpec(flags=("--opacity-reg-weight",), dest="opacity_reg_weight", arg_type=float, default=0.0005, help="Weight for opacity regularization loss (0.0001-0.001)"),
         ArgSpec(flags=("--enable-opacity-entropy-reg",), dest="enable_opacity_entropy_reg", action="store_true", help="Enable entropy regularization on opacity to push alpha toward 0/1 and reduce ghost Gaussians"),
         ArgSpec(flags=("--opacity-entropy-reg-weight",), dest="opacity_entropy_reg_weight", arg_type=float, default=0.0001, help="Weight for opacity entropy regularization loss (typical: 1e-5 to 1e-3)"),
+        ArgSpec(flags=("--opacity-entropy-reg-start-iter",), dest="opacity_entropy_reg_start_iter", arg_type=int, default=5000, help="Iteration to start opacity entropy regularization (default: 15000)"),
+        ArgSpec(flags=("--opacity-entropy-reg-end-iter",), dest="opacity_entropy_reg_end_iter", arg_type=int, default=30000, help="Iteration to end opacity entropy regularization (default: 30000)"),
     ),
 )
 
@@ -338,12 +365,16 @@ SEMANTICS_GROUP = ArgGroupDef(
     config_cls=SemanticsConfig,
     transform=_normalize_semantics_values,
     specs=(
-        ArgSpec(flags=("--train-semantics",), dest="train_semantics", action="store_true", default=False, help="Whether to use training semantics for densification (default: False)"),
-        ArgSpec(flags=("--semantics-path",), dest="semantics_path", arg_type=str, default=None, help="Path to training semantics file (e.g., output/semantics/semantics.pt)"),
-        ArgSpec(flags=("--semantics-dim",), dest="semantics_dim", arg_type=int, default=3, help="Dimensionality of semantics features (default: 3)"),
-        ArgSpec(flags=("--semantic-image-resolution",), dest="semantic_image_resolution", arg_type=int, nargs=2, default=(1080, 1620), help="Resolution to render semantic maps for training semantics: height width"),
-        ArgSpec(flags=("--semantic-start-iter",), dest="semantic_start_iter", arg_type=int, default=20000, help="Start applying training semantics after this many iterations"),
-        ArgSpec(flags=("--semantic-loss-weight",), dest="semantic_loss_weight", arg_type=float, default=1.0, help="Weight for semantic supervision loss (0.0 disables semantic loss)"),
+        ArgSpec(flags=("--train-semantics",), dest="train_semantics", action="store_true", default=False, help="Enable post-training semantic fine-tuning stage"),
+        ArgSpec(flags=("--semantics-path",), dest="semantics_path", arg_type=str, default=None, help="Path to semantic targets directory for npy provider"),
+        ArgSpec(flags=("--semantics-dim",), dest="semantics_dim", arg_type=int, default=3, help="Dimensionality of semantic Gaussian features"),
+        ArgSpec(flags=("--semantic-image-resolution",), dest="semantic_image_resolution", arg_type=int, nargs=2, default=(1080, 1620), help="Semantic supervision reference resolution: height width"),
+        ArgSpec(flags=("--semantic-loss-weight",), dest="semantic_loss_weight", arg_type=float, default=1.0, help="Weight for semantic supervision loss during semantic fine-tuning"),
+        ArgSpec(flags=("--semantic-finetune-iters",), dest="semantic_finetune_iters", arg_type=int, default=2000, help="Number of post-training semantic fine-tuning iterations"),
+        ArgSpec(flags=("--semantic-provider",), dest="semantic_provider", arg_type=str, default="npy", choices=("npy", "runtime"), help="Semantic supervision provider backend"),
+        ArgSpec(flags=("--semantic-model-path",), dest="semantic_model_path", arg_type=str, default=None, help="Path to TorchScript or PyTorch model for runtime semantic inference"),
+        ArgSpec(flags=("--semantic-cache-enabled",), dest="semantic_cache_enabled", action="store_true", default=False, help="Enable in-memory semantic target caching for runtime provider"),
+        ArgSpec(flags=("--no-semantic-cache",), dest="semantic_cache_enabled", action="store_false", help="Disable in-memory semantic target caching"),
     ),
 )
 

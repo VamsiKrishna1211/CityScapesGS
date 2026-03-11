@@ -38,6 +38,42 @@ def _to_inverse_depth(depth: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """Convert metric depth to inverse depth/disparity safely."""
     return 1.0 / torch.clamp(depth, min=eps)
 
+# Entropy loss for Opacities
+class EntropyLoss(nn.Module):
+    def __init__(self, lambda_min: float = 1e-6, lambda_max: float = 0.5, max_steps: int = 50000):
+        super().__init__()
+        self.lambda_min = lambda_min
+        self.lambda_max = lambda_max
+        self.max_steps = max_steps
+        self.current_step = 0   
+    def schedule_lambda(self) -> float:
+        """Schedule the lambda multiplier for the loss magnitude."""
+        self.current_step += 1
+        return self.lambda_min + (self.lambda_max - self.lambda_min) * (self.current_step / self.max_steps)
+
+    def forward(self, opacities: torch.Tensor) -> torch.Tensor:
+        """
+        Forces Gaussians to become either fully transparent (to be pruned) 
+        or fully opaque (to form solid surfaces).
+        
+        Variables:
+            raw_opacities: Tensor [N, 1] of unactivated, learnable opacity parameters.
+            weight: The lambda multiplier for the loss magnitude.
+        """
+        weight = self.schedule_lambda()
+        # 1. Apply sigmoid to get the physical base opacity [0, 1]
+        # This is exactly what the rasterizer does internally.
+        base_opacities = torch.sigmoid(raw_opacities)
+        
+        # 2. Calculate the parabolic penalty O * (1 - O)
+        # This curve peaks at 0.5 and hits 0 at bounds 0.0 and 1.0.
+        entropy = base_opacities * (1.0 - base_opacities)
+        
+        # 3. Use .mean() to ensure the penalty doesn't scale linearly with the 
+        # number of Gaussians, preventing it from overpowering the L1 image loss.
+        loss = weight * entropy.mean()
+        return loss
+
 
 # Dinov2 Based LPIPS style loss 
 class DINOv2PerceptualLoss(nn.Module):
@@ -285,45 +321,28 @@ def opacity_regularization(opacities, weight=0.0001):
     return weight * opacities.mean()
 
 
-def opacity_entropy_regularization(opacities, weight=0.0001, eps=1e-8):
+def opacity_entropy_regularization(raw_opacities: torch.Tensor, weight: float = 0.0001) -> torch.Tensor:
     """
-    Entropy regularization on opacity to push alpha toward binary values (0 or 1).
-
-    This discourages many tiny semi-transparent "ghost" Gaussians and favors
-    solid, geometry-consistent representations.
-
+    Applies Shannon entropy regularization to force opacities to 0 or 1.
+    
     Args:
-        opacities: Tensor of shape [N, 1] or [N] containing opacity values in [0, 1]
-        weight: Regularization weight
-        eps: Numerical stability epsilon for log
-
-    Returns:
-        Scalar entropy regularization loss
+        raw_opacities: Tensor [N] or [N, 1] of raw, unactivated logits.
+                       DO NOT pass activated probabilities.
+        weight: The scalar multiplier for the loss.
     """
-    alpha = opacities
-
-    if alpha.numel() == 0:
-        return torch.zeros((), device=alpha.device, dtype=alpha.dtype)
-
-    finite_mask = torch.isfinite(alpha)
-    if not finite_mask.any():
-        return torch.zeros((), device=alpha.device, dtype=alpha.dtype)
-
-    alpha = alpha[finite_mask]
-
-    # If logits were accidentally passed instead of probabilities, map to [0, 1].
-    if ((alpha < 0.0) | (alpha > 1.0)).any():
-        alpha = torch.sigmoid(alpha)
-
-    # Numerically stable binary entropy:
-    # xlogy handles 0 * log(0) safely as 0 without requiring clamp.
+    # 1. Strictly apply sigmoid. We assume the input is ALWAYS logits.
+    alpha = torch.sigmoid(raw_opacities)
+    
+    # 2. Numerically stable binary entropy using xlogy
     entropy = -(
-        torch.special.xlogy(alpha, alpha)
-        + torch.special.xlogy(1.0 - alpha, 1.0 - alpha)
+        torch.special.xlogy(alpha, alpha) + 
+        torch.special.xlogy(1.0 - alpha, 1.0 - alpha)
     )
-
-    entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
-    return weight * entropy.mean()
+    
+    # 3. Mean reduction to decouple loss magnitude from point count
+    loss = weight * entropy.mean()
+    
+    return loss
 
 
 def depth_regularization(depths, near_plane=0.1, weight=0.01):
