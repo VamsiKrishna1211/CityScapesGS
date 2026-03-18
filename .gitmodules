@@ -67,3 +67,6 @@
 [submodule "third_party/gaussian-splatting"]
 	path = third_party/gaussian-splatting
 	url = https://github.com/graphdeco-inria/gaussian-splatting.git
+[submodule "third_party/LangSplatV2"]
+	path = third_party/LangSplatV2
+	url = https://github.com/ZhaoYujie2002/LangSplatV2.git

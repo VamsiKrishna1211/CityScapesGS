@@ -124,6 +124,7 @@ class ViewerConfig:
     viewer: bool
     viewer_port: int
     viewer_refresh_interval: int = 100  # How often to refresh viewer with latest model params (in iterations)
+    rerun_viewer: bool = False
 
 
 @dataclass
@@ -449,6 +450,7 @@ VIEWER_GROUP = ArgGroupDef(
         ArgSpec(flags=("--viewer",), dest="viewer", action="store_true", help="Enable interactive 3D viewer during training"),
         ArgSpec(flags=("--viewer-port",), dest="viewer_port", arg_type=int, default=8080, help="Port for the viewer server"),
         ArgSpec(flags=("--viewer-refresh-interval",), dest="viewer_refresh_interval", arg_type=int, default=100, help="How often to refresh viewer with latest model params (in iterations)"),
+        ArgSpec(flags=("--rerun-viewer",), dest="rerun_viewer", action="store_true", help="Enable Rerun viewer during training"),
     ),
 )
 

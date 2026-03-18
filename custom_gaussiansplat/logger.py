@@ -165,7 +165,7 @@ class GaussianSplattingLogger:
             self.writer.add_scalar('Loss/LPIPS', lpips_loss, step)
         if depth_smoothness_loss is not None and depth_smoothness_loss > 0:
             self.writer.add_scalar('Loss/DepthSmoothness', depth_smoothness_loss, step)
-        if scale_reg_loss > 0:
+        if scale_reg_loss is not None and scale_reg_loss > 0:
             self.writer.add_scalar('Loss/ScaleRegularization', scale_reg_loss, step)
         if opacity_reg_loss is not None and opacity_reg_loss > 0:
             self.writer.add_scalar('Loss/OpacityRegularization', opacity_reg_loss, step)
