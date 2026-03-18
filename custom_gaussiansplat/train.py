@@ -1,17 +1,22 @@
+import logging
 import os
-# os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+import time
+from pathlib import Path
+from typing import Tuple, Union
 
+import numpy as np
+
+# os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 import torch
 import torch.nn.functional as F
+from gsplat import DefaultStrategy, rasterization
 from torch.utils.data import DataLoader
-from gsplat import rasterization, DefaultStrategy
-from torchmetrics.image import StructuralSimilarityIndexMeasure, PeakSignalNoiseRatio, LearnedPerceptualImagePatchSimilarity, MultiScaleStructuralSimilarityIndexMeasure
-import os
-from pathlib import Path
-import time
-import numpy as np
-import logging
-from typing import Tuple, Union
+from torchmetrics.image import (
+    LearnedPerceptualImagePatchSimilarity,
+    MultiScaleStructuralSimilarityIndexMeasure,
+    PeakSignalNoiseRatio,
+    StructuralSimilarityIndexMeasure,
+)
 
 try:
     import nerfview
@@ -20,28 +25,36 @@ try:
 except ImportError:
     VIEWER_AVAILABLE = False
 
-from rich.console import Console
-from rich.logging import RichHandler
-from rich.progress import Progress, SpinnerColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn, TextColumn
-from rich.table import Table
-from rich.panel import Panel
-from rich.live import Live
-from rich.layout import Layout
-from rich import box
-
-from dataset import ColmapDataset
-from model import GaussianModel, inverse_sigmoid
-from gs_types import GSOptimizers, GS_LR_Schedulers
-from utils import format_phase_description
-from viewer_sync import ViewerParamSync
-import losses
-from logger import GaussianSplattingLogger
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from concurrent.futures import ThreadPoolExecutor
-from train_args import TrainConfig, parse_args
+
+import losses
+from dataset import create_dataset
 
 # Modules
 from fused_ssim import fused_ssim
+from gs_types import GS_LR_Schedulers, GSOptimizers
+from logger import GaussianSplattingLogger
+from model import GaussianModel, inverse_sigmoid
+from rich import box
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.logging import RichHandler
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.table import Table
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from train_args import TrainConfig, parse_args
+from utils import format_phase_description
+from viewer_sync import ViewerParamSync
 
 torch.backends.cudnn.enabled = True  # Enable cuDNN auto-tuner for better performance on fixed-size inputs
 torch.backends.cudnn.allow_tf32 = True  # Allow TF32 for cuDNN (can speed up on Ampere GPUs)
@@ -215,12 +228,65 @@ def train_pipeline(config: TrainConfig):
     checkpoint_dir = output_path / 'checkpoints'
     checkpoint_dir.mkdir(exist_ok=True)
 
-    dataset = ColmapDataset(required_cfg.colmap_path,
-                            required_cfg.images_path, 
-                            device=device,
-                            image_scale=required_cfg.scale,
-                            scene_extent_margin=1.5,  # Add margin to scene extent to prevent aggressive pruning of boundary Gaussians
-                            )
+    # Setup
+    semantics_path = (
+        Path(semantics_cfg.semantics_path)
+        if semantics_cfg.semantics_path is not None and not isinstance(semantics_cfg.semantics_path, Path)
+        else semantics_cfg.semantics_path
+    )
+    raw_semantics_resolution = semantics_cfg.semantic_image_resolution
+    if isinstance(raw_semantics_resolution, list):
+        if len(raw_semantics_resolution) != 2:
+            raise ValueError(
+                "semantic_image_resolution must contain exactly two values [height, width] when provided as a list."
+            )
+        semantics_resolution: Union[Tuple[int, int], int, None] = (
+            int(raw_semantics_resolution[0]),
+            int(raw_semantics_resolution[1]),
+        )
+    elif isinstance(raw_semantics_resolution, tuple):
+        if len(raw_semantics_resolution) != 2:
+            raise ValueError(
+                "semantic_image_resolution must contain exactly two values (height, width) when provided as a tuple."
+            )
+        semantics_resolution = (
+            int(raw_semantics_resolution[0]),
+            int(raw_semantics_resolution[1]),
+        )
+    else:
+        semantics_resolution = raw_semantics_resolution
+
+    if required_cfg.dataset_type == "colmap":
+        dataset = create_dataset(
+            dataset_type="colmap",
+            colmap_path=required_cfg.colmap_path,
+            image_dir=required_cfg.images_path,
+            device=device,
+            image_scale=required_cfg.scale,
+            train_semantics=semantics_cfg.train_semantics,
+            semantics_dim=semantics_cfg.semantics_dim,
+            semantics_path=semantics_path,
+            semantics_resolution=semantics_resolution,
+            scene_extent_margin=1.5,  # Add margin to scene extent to prevent aggressive pruning of boundary Gaussians
+            require_depth=depth_cfg.enable_depth_loss,
+        )
+    elif required_cfg.dataset_type == "instant-ngp":
+        dataset = create_dataset(
+            dataset_type="instant-ngp",
+            transforms_path=required_cfg.transforms_path,
+            image_dir=required_cfg.images_path,
+            point_cloud_path=required_cfg.point_cloud_path,
+            device=device,
+            image_scale=required_cfg.scale,
+            train_semantics=semantics_cfg.train_semantics,
+            semantics_dim=semantics_cfg.semantics_dim,
+            semantics_path=semantics_path,
+            semantics_resolution=semantics_resolution,
+            scene_extent_margin=1.5,
+            require_depth=depth_cfg.enable_depth_loss,
+        )
+    else:
+        raise ValueError(f"Unsupported dataset_type: {required_cfg.dataset_type}")
     # Enable preload path so image/depth disk I/O does not happen inside the training loop.
     if training_cfg.preload:
         logger.info("[yellow]Preloading enabled:[/yellow] loading all images into RAM before training...")
@@ -1203,8 +1269,15 @@ if __name__ == "__main__":
         config_table.add_column("Parameter", style="cyan", width=20)
         config_table.add_column("Value", style="yellow")
         
-        config_table.add_row("COLMAP Path", required_cfg.colmap_path)
-        config_table.add_row("Images Path", required_cfg.images_path)
+        config_table.add_row("Dataset Type", required_cfg.dataset_type)
+        if required_cfg.dataset_type == "colmap":
+            config_table.add_row("COLMAP Path", str(required_cfg.colmap_path))
+            config_table.add_row("Images Path", str(required_cfg.images_path))
+        elif required_cfg.dataset_type == "instant-ngp":
+            config_table.add_row("Transforms Path", str(required_cfg.transforms_path))
+            config_table.add_row("Images Path", str(required_cfg.images_path) if required_cfg.images_path else "auto")
+            if required_cfg.point_cloud_path:
+                config_table.add_row("Point Cloud Path", str(required_cfg.point_cloud_path))
         config_table.add_row("Output Directory", output_cfg.output_dir)
         config_table.add_row("Iterations", f"{training_cfg.iterations:,}")
         config_table.add_row("Densify From", f"{densification_cfg.densify_from_iter:,}")

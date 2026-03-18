@@ -133,7 +133,7 @@ python custom_gaussiansplat/train.py \
     --silog-loss-weight 0.1 \
     --ordinal-depth-loss-weight 0.1 \                   
 
-# This command is good with lareg scenes, where the points are aggresively 
+# This command is good with large scenes, where the points are aggresively 
 python custom_gaussiansplat/train.py \
     --colmap-path $BASE_PATH/sparse/0 \
     --images-path $BASE_PATH/images \
@@ -151,4 +151,6 @@ python custom_gaussiansplat/train.py \
     --lr-scales 0.001 \
     --lr-sh 0.002 \
     --grad-threshold 0.0002 \
-    --verbosity 3 --grow-grad2d 0.0001 --grow-scale3d 0.001 --grow-scale2d 0.005 --prune-scale3d 0.01 --prune-scale2d 0.15 -s 8 --preload
+    --verbosity 3 --grow-grad2d 0.0001 --grow-scale3d 0.001 --grow-scale2d 0.005 --prune-scale3d 0.01 --prune-scale2d 0.15 \
+    --transforms-path "${BASE_PATH}/transforms.json" \
+    --dataset-type "instant-ngp"

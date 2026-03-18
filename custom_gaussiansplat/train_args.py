@@ -6,8 +6,11 @@ from typing import Any, Callable, Dict, Generic, Optional, Tuple, Type, TypeVar,
 
 @dataclass
 class RequiredConfig:
-    colmap_path: str
-    images_path: str
+    dataset_type: str
+    colmap_path: Optional[str]
+    transforms_path: Optional[str]
+    images_path: Optional[str]
+    point_cloud_path: Optional[str]
     scale: int
 
 
@@ -252,24 +255,60 @@ def _normalize_semantics_values(values: Dict[str, Any]) -> Dict[str, Any]:
     return values
 
 
+def _normalize_required_values(values: Dict[str, Any]) -> Dict[str, Any]:
+    dataset_type = str(values.get("dataset_type", "colmap")).strip().lower().replace("_", "-")
+    if dataset_type not in {"colmap", "instant-ngp"}:
+        raise ValueError(f"Unsupported --dataset-type '{dataset_type}'. Supported: colmap, instant-ngp")
+    values["dataset_type"] = dataset_type
+
+    # Backward compatibility: allow using --colmap-path as transforms input for instant-ngp.
+    if dataset_type == "instant-ngp" and values.get("transforms_path") is None and values.get("colmap_path") is not None:
+        values["transforms_path"] = values["colmap_path"]
+
+    return values
+
+
 REQUIRED_GROUP = ArgGroupDef(
     key="required",
     title="Required Arguments",
     config_cls=RequiredConfig,
+    transform=_normalize_required_values,
     specs=(
+        ArgSpec(
+            flags=("--dataset-type",),
+            dest="dataset_type",
+            arg_type=str,
+            default="colmap",
+            choices=("colmap", "instant-ngp"),
+            help="Dataset format to load",
+        ),
         ArgSpec(
             flags=("--colmap-path",),
             dest="colmap_path",
             arg_type=str,
-            required=True,
-            help="Path to COLMAP sparse reconstruction directory (e.g., sparse/0)",
+            required=False,
+            help="Path to COLMAP sparse reconstruction directory (required for --dataset-type colmap)",
+        ),
+        ArgSpec(
+            flags=("--transforms-path",),
+            dest="transforms_path",
+            arg_type=str,
+            required=False,
+            help="Path to Instant-NGP transform file or scene directory containing transform.json/transforms.json (required for --dataset-type instant-ngp)",
         ),
         ArgSpec(
             flags=("--images-path",),
             dest="images_path",
             arg_type=str,
-            required=True,
-            help="Path to training images directory",
+            required=False,
+            help="Path to training images directory (required for colmap, optional for instant-ngp if transforms folder has images/)",
+        ),
+        ArgSpec(
+            flags=("--point-cloud-path",),
+            dest="point_cloud_path",
+            arg_type=str,
+            default=None,
+            help="Optional point cloud for instant-ngp init (.npy/.pth/.pt). Shapes: [N,3] xyz or [N,6] xyzrgb, or .pth dict {'xyz','rgb'}.",
         ),
         ArgSpec(
             flags=("-s", "--scale"),
@@ -485,7 +524,7 @@ ARG_GROUP_DEFS: Tuple[ArgGroupDef[Any], ...] = (
 def parse_args() -> TrainConfig:
     """Parse command line arguments and return strongly typed grouped config."""
     parser = argparse.ArgumentParser(
-        description="Train a 3D Gaussian Splatting model from COLMAP reconstruction",
+        description="Train a 3D Gaussian Splatting model from COLMAP or Instant-NGP style datasets",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     for group_def in ARG_GROUP_DEFS:
@@ -493,9 +532,19 @@ def parse_args() -> TrainConfig:
 
     flat_args = parser.parse_args()
 
+    required_cfg = _build_group_config(flat_args, REQUIRED_GROUP)
+    if required_cfg.dataset_type == "colmap":
+        if not required_cfg.colmap_path:
+            parser.error("--colmap-path is required when --dataset-type=colmap")
+        if not required_cfg.images_path:
+            parser.error("--images-path is required when --dataset-type=colmap")
+    elif required_cfg.dataset_type == "instant-ngp":
+        if not required_cfg.transforms_path:
+            parser.error("--transforms-path is required when --dataset-type=instant-ngp")
+
     return TrainConfig(
         raw=flat_args,
-        required=_build_group_config(flat_args, REQUIRED_GROUP),
+        required=required_cfg,
         output=_build_group_config(flat_args, OUTPUT_GROUP),
         training=_build_group_config(flat_args, TRAINING_GROUP),
         densification=_build_group_config(flat_args, DENSIFICATION_GROUP),
