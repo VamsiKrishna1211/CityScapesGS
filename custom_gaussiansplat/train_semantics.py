@@ -98,17 +98,20 @@ class SemanticRasterizer:
             device: Target device for intermediate tensors.
 
         Returns:
-            Semantic prediction tensor of shape ``[H, W, C]``.
+            rgb_pred: Rendered RGB tensor of shape ``[H, W, 3]``.
+            semantic_pred: Semantic prediction tensor of shape ``[H, W, C]``.
         """
         viewmat = _build_viewmat(cam, device=device)
         k = _build_intrinsics(cam, device=device)
+
+        colors = torch.cat([self.model._features_dc.squeeze(1).detach(), self.model.semantics], dim=-1)
 
         semantic_out, _, _ = rasterization(
             means=self.model.means.detach(),
             quats=self.model.quats.detach(),
             scales=self.model.scales.detach(),
             opacities=self.model.opacities.squeeze(-1).detach(),
-            colors=self.model.semantics,
+            colors=colors,
             viewmats=viewmat,
             Ks=k[None, ...],
             width=cam["width"],
@@ -117,7 +120,11 @@ class SemanticRasterizer:
             render_mode="RGB",
         )
 
-        return semantic_out[0].float()  # [H, W, C]
+        rendered = semantic_out[0].float()
+        rgb_pred = rendered[..., :3]
+        semantic_pred = rendered[..., 3:]
+
+        return rgb_pred, semantic_pred
 
 
 # ---------------------------------------------------------------------------
@@ -243,8 +250,8 @@ class SemanticTrainer:
         if gt_image.dim() == 3:
             gt_image = gt_image.unsqueeze(0)
 
-        # Render semantic features
-        semantic_pred = self._rasterizer.render(cam, device=self.device)
+        # Render semantic features and RGB
+        rgb_pred, semantic_pred = self._rasterizer.render(cam, device=self.device)
 
         # Obtain ground-truth target
         semantic_target = self._provider.get_target(
@@ -512,15 +519,19 @@ def run_standalone_semantic_training(cfg: SemanticStandaloneConfig) -> None:
     logger = _setup_logger(cfg.output_dir)
 
     model, checkpoint = _load_model(cfg, device, logger)
+    logger.info("Building datasets...")
     _base_dataset, semantic_dataset = _build_datasets(cfg, device)
+    logger.info("Datasets built!")
     semantics_cfg, train_cfg, lr_cfg = _build_configs(cfg)
 
+    logger.info("Initializing tb logger...")
     tb_logger = GaussianSplattingLogger(
         log_dir=str(cfg.output_dir / "tensorboard"),
         enabled=cfg.tensorboard,
         run_name=checkpoint.get("tensorboard_run_name", None),
         purge_step=None,
     )
+    logger.info("Starting train_semantics...")
 
     metrics = train_semantics(
         model=model,

@@ -21,6 +21,7 @@ export CXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++"
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
 conda install -c nvidia -c conda-forge cuda-toolkit=12.8 -y
+conda install -c 
 export CUDA_HOME="$CONDA_PREFIX"
 conda update -c conda-forge gcc_linux-64 gxx_linux-64 -y
 

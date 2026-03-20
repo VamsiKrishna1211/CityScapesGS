@@ -100,7 +100,8 @@ class GaussianModel(nn.Module):
     def semantics(self):
         if hasattr(self, '_features_semantics'):
             return self._features_semantics
-        return None
+        else:
+            raise ValueError("Semantic features are not enabled. Please enable them by setting train_semantics=True in the config.")
     
     def add_view_count(self, alpha_contributions, threshold=0.5):
         """
@@ -213,44 +214,351 @@ class GaussianModel(nn.Module):
             features_semantics=semantics_optimizer,
         )
     
+    def construct_list_of_attributes(self):
+        """Build the list of PLY attribute names matching the original 3DGS convention."""
+        l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
+        for i in range(self._features_dc.shape[1] * self._features_dc.shape[2]):
+            l.append(f'f_dc_{i}')
+        for i in range(self._features_rest.shape[1] * self._features_rest.shape[2]):
+            l.append(f'f_rest_{i}')
+        l.append('opacity')
+        for i in range(self._scales.shape[1]):
+            l.append(f'scale_{i}')
+        for i in range(self._quats.shape[1]):
+            l.append(f'rot_{i}')
+        return l
+
     def save_ply(self, path):
-        """Save Gaussians to PLY format for visualization."""
-        
+        """Save Gaussians to PLY format compatible with the original 3DGS project.
+
+        All parameters are saved in their **raw pre-activation** form so that
+        the original 3DGS ``load_ply`` (which applies its own activations) can
+        consume them directly.
+
+        SH features are transposed before flattening to match the original
+        column-major ordering: ``[N, K, 3] -> transpose -> [N, 3, K] -> flatten``.
+        """
         try:
             import numpy as np
             from plyfile import PlyData, PlyElement
         except ImportError:
             logger.warning("[yellow]⚠ Warning:[/yellow] plyfile not installed. Install with: pip install plyfile")
             return
-        
-        # Convert to numpy
+
+        import os
+        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
+
+        # Convert to numpy — all values are RAW (pre-activation)
         xyz = self._means.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
-        f_dc = self._features_dc.detach().cpu().numpy().reshape(xyz.shape[0], -1)
-        f_rest = self._features_rest.detach().cpu().numpy().reshape(xyz.shape[0], -1)
-        opacities = self.opacities.detach().cpu().numpy()
-        scale = self.scales.detach().cpu().numpy()
-        rotation = self.quats.detach().cpu().numpy()
-        
-        # Prepare attributes
-        dtype_full = [(attribute, 'f4') for attribute in ['x', 'y', 'z', 'nx', 'ny', 'nz']]
-        dtype_full += [(attribute, 'f4') for attribute in ['f_dc_0', 'f_dc_1', 'f_dc_2']]
-        dtype_full += [(attribute, 'f4') for attribute in 
-                       [f'f_rest_{i}' for i in range(f_rest.shape[1])]]
-        dtype_full += [('opacity', 'f4')]
-        dtype_full += [(attribute, 'f4') for attribute in ['scale_0', 'scale_1', 'scale_2']]
-        dtype_full += [(attribute, 'f4') for attribute in ['rot_0', 'rot_1', 'rot_2', 'rot_3']]
-        
+        # Transpose SH features to match original 3DGS column ordering:
+        # Original stores [N, C, SH] and transposes to [N, SH, C] before flatten
+        # Our storage is [N, SH, C], so we transpose to [N, C, SH] then flatten
+        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        # Raw pre-activation values (NOT sigmoid/exp/normalize)
+        opacities = self._opacities.detach().cpu().numpy()
+        scale = self._scales.detach().cpu().numpy()
+        rotation = self._quats.detach().cpu().numpy()
+
+        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+
         attributes = np.concatenate(
             (xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
         )
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         elements[:] = list(map(tuple, attributes))
-        
+
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
         logger.info(f"[green]✓ Saved {xyz.shape[0]:,} Gaussians to[/green] {path}")
-    
+
+    def to_original_gs_state_dict(self) -> dict:
+        """Return a dict of model tensors keyed by the original 3DGS parameter names.
+
+        This maps the custom parameter names to the original ones:
+        - ``_means``      → ``_xyz``
+        - ``_scales``     → ``_scaling``
+        - ``_quats``      → ``_rotation``
+        - ``_opacities``  → ``_opacity``
+        - ``_features_dc``  (same)
+        - ``_features_rest`` (same)
+
+        All values are raw (pre-activation), exactly as the original 3DGS
+        ``capture()`` would return them.
+        """
+        return {
+            '_xyz': self._means.detach(),
+            '_features_dc': self._features_dc.detach(),
+            '_features_rest': self._features_rest.detach(),
+            '_scaling': self._scales.detach(),
+            '_rotation': self._quats.detach(),
+            '_opacity': self._opacities.detach(),
+        }
+
+    def export_to_original_gs_checkpoint(
+        self,
+        path: str,
+        iteration: int = 0,
+        spatial_lr_scale: float = 1.0,
+    ):
+        """Save the model as an original 3DGS checkpoint (``.pth``).
+
+        The file is written in the exact format that the original 3DGS
+        ``train.py`` produces::
+
+            torch.save((capture_tuple, iteration), path)
+
+        The ``capture_tuple`` mirrors ``GaussianModel.capture()`` and can be
+        consumed by the original ``GaussianModel.restore()``.
+
+        Because this model has no original-style optimizer, placeholder values
+        are used for ``max_radii2D``, ``xyz_gradient_accum``, ``denom``, and
+        ``optimizer_state_dict``.  These are only needed if you intend to
+        **resume training** in the original codebase (and you would call
+        ``training_setup`` + ``restore`` anyway, which rebuilds them).
+
+        Args:
+            path: Output file path (e.g. ``chkpnt30000.pth``).
+            iteration: Iteration number to embed in the checkpoint.
+            spatial_lr_scale: Scene-extent value used by the original LR
+                scheduler.  Defaults to 1.0 (safe default; override with
+                the actual ``scene.cameras_extent`` if you have it).
+        """
+        import os
+        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
+
+        num_pts = self._means.shape[0]
+        device = self._means.device
+
+        capture_tuple = (
+            self.sh_degree,                                    # active_sh_degree
+            self._means.detach(),                              # _xyz
+            self._features_dc.detach(),                        # _features_dc
+            self._features_rest.detach(),                      # _features_rest
+            self._scales.detach(),                             # _scaling
+            self._quats.detach(),                              # _rotation
+            self._opacities.detach(),                          # _opacity
+            torch.zeros(num_pts, device=device),               # max_radii2D (placeholder)
+            torch.zeros(num_pts, 1, device=device),            # xyz_gradient_accum (placeholder)
+            torch.zeros(num_pts, 1, device=device),            # denom (placeholder)
+            {},                                                # optimizer state_dict (empty placeholder)
+            spatial_lr_scale,                                  # spatial_lr_scale
+        )
+
+        torch.save((capture_tuple, iteration), path)
+        logger.info(
+            f"[green]✓ Exported original 3DGS checkpoint:[/green] {path} "
+            f"({num_pts:,} Gaussians, iter {iteration})"
+        )
+
+    @classmethod
+    def load_ply(
+        cls,
+        path,
+        sh_degree=3,
+        device='cuda',
+        console=None,
+    ):
+        """Load a PLY file saved by the original 3DGS project into a GaussianModel.
+
+        This handles the inverse of the original ``save_ply``:
+        - SH features are un-transposed back to ``[N, K, 3]``.
+        - Raw pre-activation values are assigned directly to internal parameters.
+
+        Args:
+            path: Path to PLY file.
+            sh_degree: Maximum SH degree. If None, inferred from the PLY file.
+            device: Target device.
+            console: Optional rich console for display.
+
+        Returns:
+            A populated GaussianModel instance.
+        """
+        import numpy as np
+        from plyfile import PlyData
+        import torch.nn as nn
+
+        plydata = PlyData.read(path)
+        el = plydata.elements[0]
+
+        # --- Positions ---
+        xyz = np.stack(
+            (np.asarray(el["x"]), np.asarray(el["y"]), np.asarray(el["z"])),
+            axis=1,
+        )  # [N, 3]
+        num_pts = xyz.shape[0]
+
+        # --- Opacity (raw logit) ---
+        opacities = np.asarray(el["opacity"])[..., np.newaxis]  # [N, 1]
+
+        # --- SH DC features ---
+        # Original stores [N, 3, 1] in the PLY (transposed from [N, 1, 3]).
+        # We read into [N, 3, 1] then transpose back to [N, 1, 3].
+        features_dc = np.zeros((num_pts, 3, 1))
+        features_dc[:, 0, 0] = np.asarray(el["f_dc_0"])
+        features_dc[:, 1, 0] = np.asarray(el["f_dc_1"])
+        features_dc[:, 2, 0] = np.asarray(el["f_dc_2"])
+
+        # --- SH rest features ---
+        extra_f_names = sorted(
+            [p.name for p in el.properties if p.name.startswith("f_rest_")],
+            key=lambda x: int(x.split("_")[-1]),
+        )
+        if sh_degree is None:
+            # Infer SH degree: total SH coeffs (including DC) = (degree+1)^2
+            total_sh = len(extra_f_names) // 3 + 1  # +1 for DC
+            sh_degree = int(total_sh**0.5) - 1
+
+        features_extra = np.zeros((num_pts, len(extra_f_names)))
+        for idx, attr_name in enumerate(extra_f_names):
+            features_extra[:, idx] = np.asarray(el[attr_name])
+        # Original saves as [N, 3, K] (after transpose). We reshape to [N, 3, K]
+        # then transpose back to [N, K, 3] which is our internal layout.
+        num_rest_coeffs = (sh_degree + 1) ** 2 - 1
+        features_extra = features_extra.reshape((num_pts, 3, num_rest_coeffs))  # [N, 3, K]
+
+        # --- Scales (raw log) ---
+        scale_names = sorted(
+            [p.name for p in el.properties if p.name.startswith("scale_")],
+            key=lambda x: int(x.split("_")[-1]),
+        )
+        scales = np.zeros((num_pts, len(scale_names)))
+        for idx, attr_name in enumerate(scale_names):
+            scales[:, idx] = np.asarray(el[attr_name])
+
+        # --- Rotations (raw quaternion) ---
+        rot_names = sorted(
+            [p.name for p in el.properties if p.name.startswith("rot")],
+            key=lambda x: int(x.split("_")[-1]),
+        )
+        rots = np.zeros((num_pts, len(rot_names)))
+        for idx, attr_name in enumerate(rot_names):
+            rots[:, idx] = np.asarray(el[attr_name])
+
+        # --- Build the model ---
+        # Use dummy init points/colors — we'll overwrite all parameters
+        dummy_points = torch.zeros((num_pts, 3), device=device)
+        dummy_colors = torch.zeros((num_pts, 3), device=device)
+        model = cls(
+            dummy_points,
+            dummy_colors,
+            sh_degree=sh_degree,
+            console=console,
+        ).to(device)
+
+        # Assign raw parameters directly
+        model._means = nn.Parameter(
+            torch.tensor(xyz, dtype=torch.float32, device=device)
+        )
+        # Transpose DC: [N, 3, 1] -> [N, 1, 3] to match our internal layout
+        model._features_dc = nn.Parameter(
+            torch.tensor(features_dc, dtype=torch.float32, device=device)
+            .transpose(1, 2)
+            .contiguous()
+        )
+        # Transpose rest: [N, 3, K] -> [N, K, 3] to match our internal layout
+        model._features_rest = nn.Parameter(
+            torch.tensor(features_extra, dtype=torch.float32, device=device)
+            .transpose(1, 2)
+            .contiguous()
+        )
+        model._opacities = nn.Parameter(
+            torch.tensor(opacities, dtype=torch.float32, device=device)
+        )
+        model._scales = nn.Parameter(
+            torch.tensor(scales, dtype=torch.float32, device=device)
+        )
+        model._quats = nn.Parameter(
+            torch.tensor(rots, dtype=torch.float32, device=device)
+        )
+        # Reset view count buffer to match new number of points
+        model.view_count = torch.zeros(num_pts, device=device)
+
+        logger.info(
+            f"[green]✓ Loaded {num_pts:,} Gaussians from PLY:[/green] {path}"
+        )
+        return model
+
+    @classmethod
+    def from_original_gs_checkpoint(
+        cls,
+        checkpoint_path,
+        device='cuda',
+        console=None,
+    ):
+        """Load an original 3DGS checkpoint (``.pth``) into a custom GaussianModel.
+
+        The original checkpoint format is::
+
+            torch.save((capture_tuple, iteration), path)
+
+        where ``capture_tuple`` is the output of ``GaussianModel.capture()``:
+        ``(active_sh_degree, _xyz, _features_dc, _features_rest, _scaling,
+        _rotation, _opacity, max_radii2D, xyz_gradient_accum, denom,
+        opt_dict, spatial_lr_scale)``.
+
+        This method maps the original parameter names to the custom ones and
+        returns a fully populated model.
+
+        Args:
+            checkpoint_path: Path to ``.pth`` file.
+            device: Target device.
+            console: Optional rich console.
+
+        Returns:
+            A tuple ``(model, iteration)`` where ``model`` is the custom
+            GaussianModel and ``iteration`` is the training iteration from
+            the checkpoint.
+        """
+        import torch.nn as nn
+
+        data = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        capture_tuple, iteration = data
+
+        (
+            active_sh_degree,
+            _xyz,
+            _features_dc,
+            _features_rest,
+            _scaling,
+            _rotation,
+            _opacity,
+            _max_radii2D,
+            _xyz_gradient_accum,
+            _denom,
+            _opt_dict,
+            _spatial_lr_scale,
+        ) = capture_tuple
+
+        sh_degree = active_sh_degree
+        num_pts = _xyz.shape[0]
+
+        # Build model with dummy data
+        dummy_points = torch.zeros((num_pts, 3), device=device)
+        dummy_colors = torch.zeros((num_pts, 3), device=device)
+        model = cls(
+            dummy_points,
+            dummy_colors,
+            sh_degree=sh_degree,
+            console=console,
+        ).to(device)
+
+        # Map original param names → custom param names
+        model._means = nn.Parameter(_xyz.to(device))
+        model._features_dc = nn.Parameter(_features_dc.to(device))
+        model._features_rest = nn.Parameter(_features_rest.to(device))
+        model._scales = nn.Parameter(_scaling.to(device))
+        model._quats = nn.Parameter(_rotation.to(device))
+        model._opacities = nn.Parameter(_opacity.to(device))
+        model.view_count = torch.zeros(num_pts, device=device)
+
+        logger.info(
+            f"[green]✓ Loaded original 3DGS checkpoint:[/green] {checkpoint_path} "
+            f"({num_pts:,} Gaussians, iter {iteration})"
+        )
+        return model, iteration
+
     @classmethod
     def from_checkpoint(
         cls,

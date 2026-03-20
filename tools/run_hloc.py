@@ -272,10 +272,23 @@ def main():
     feature_path = extract_features.main(feature_config, images, outputs)
     
     print("[3/4] Matching features...")
+    feature_path_for_reconstruction = feature_path
     if args.use_dense_matcher:
-        match_path = match_dense.main(
-            dense_matcher_config, sfm_pairs, images, outputs
+        # Recompute dense matches to avoid stale/incomplete H5 groups from prior runs.
+        dense_features_ref = feature_path if "superpoint" in args.dense_matcher_config else None
+        dense_feature_path, match_path = match_dense.main(
+            dense_matcher_config,
+            sfm_pairs,
+            images,
+            outputs,
+            features_ref=dense_features_ref,
+            overwrite=True,
         )
+        # When anchoring to SuperPoint keypoints, reconstruction must use the SuperPoint file.
+        if dense_features_ref is None:
+            feature_path_for_reconstruction = dense_feature_path
+        else:
+            feature_path_for_reconstruction = feature_path
     else:
         match_path = match_features.main(
             matcher_config, sfm_pairs, feature_config["output"], outputs
@@ -328,11 +341,14 @@ def main():
     print(f"\nImage options: {image_options}")
     print(f"Mapper options: {mapper_options}")
     
+    print(f"Features for reconstruction: {feature_path_for_reconstruction}")
+    print(f"Matches for reconstruction: {match_path}")
+
     model = reconstruction.main(
         sfm_dir, 
         images, 
         sfm_pairs,
-        feature_path, 
+        feature_path_for_reconstruction,
         match_path,
         camera_mode=args.camera_mode,
         image_options=image_options,
