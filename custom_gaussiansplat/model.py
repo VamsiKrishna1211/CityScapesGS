@@ -51,6 +51,7 @@ class GaussianModel(nn.Module):
             # distances per point. Take sqrt to get distance and clamp small values.
             dist_to_nearest = torch.sqrt(distCUDA2(init_points.contiguous()))
             torch.zeros(1, device=init_points.device)  # Warm up CUDA context to prevent first-iteration lag
+            logger.debug(f"Distance to nearest neighbor stats: min={dist_to_nearest.min().item():.6f}, max={dist_to_nearest.max().item():.6f}, mean={dist_to_nearest.mean().item():.6f}")
 
             dist_to_nearest[dist_to_nearest < 1e-5] = 1e-5  # Avoid zero distances
         

@@ -46,7 +46,6 @@ If you install manually, make sure these packages are available:
 - `pycolmap`
 - `imageio`, `opencv-python`, `numpy`, `scipy`
 - `torchmetrics`, `tensorboard`, `rich`
-- `plyfile`
 - `fused-ssim`
 - `simple-knn`
 - Optional viewers: `nerfview`, `viser`, `rerun-sdk`

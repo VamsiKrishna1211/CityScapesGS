@@ -29,7 +29,7 @@ python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://down
 python -m pip install "git+https://github.com/nerfstudio-project/gsplat.git#v1.4.0" --no-build-isolation
 python -m pip install ninja git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch --no-build-isolation
 
-python -m pip install pycolmap tensorboard torchmetrics rich matplotlib splines nerfview opencv-python psutil nvidia-ml-py3
+python -m pip install pycolmap tensorboard torchmetrics rich matplotlib splines nerfview opencv-python psutil nvidia-ml-py3 plyfile
 python -m pip install lpips
 python -m pip install git+https://github.com/rahul-goel/fused-ssim/ --no-build-isolation
 

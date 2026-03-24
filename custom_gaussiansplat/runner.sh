@@ -44,7 +44,7 @@ python custom_gaussiansplat/train.py \
   --lr-quats 0.00002 \
   --lr-scales 0.001 \
   --lr-sh 0.002 \
-  --grad-threshold 0.0002 \
+  --grow-grad2d 0.0002 \
   --enable-scale-reg --scale-reg-weight 0.01 \
   --enable-opacity-entropy-reg \
   --sam-loss-weight 0.02 \
@@ -72,7 +72,7 @@ python custom_gaussiansplat/train.py \
     --lr-quats 0.002 \
     --lr-scales 0.001 \
     --lr-sh 0.002 \
-    --grad-threshold 0.0002 \
+    --grow-grad2d 0.0002 \
     --enable-scale-reg --scale-reg-weight 0.01 \
     --enable-opacity-reg --opacity-reg-weight 0.0005 \
     --verbosity 3 --grow-grad2d 0.0002 --grow-scale3d 0.03 --grow-scale2d 0.02
@@ -94,7 +94,7 @@ python custom_gaussiansplat/train.py \
     --lr-quats 0.002 \
     --lr-scales 0.001 \
     --lr-sh 0.002 \
-    --grad-threshold 0.0002 \
+    --grow-grad2d 0.0002 \
     --enable-scale-reg --scale-reg-weight 0.01 \
     --enable-opacity-reg --opacity-reg-weight 0.0005 \
     --verbosity 3 --grow-grad2d 0.0001 --grow-scale3d 0.02 --grow-scale2d 0.01 --prune-scale3d 0.02 --prune-scale2d 0.2 \
@@ -154,3 +154,27 @@ python custom_gaussiansplat/train.py \
     --verbosity 3 --grow-grad2d 0.0001 --grow-scale3d 0.001 --grow-scale2d 0.005 --prune-scale3d 0.01 --prune-scale2d 0.15 \
     --transforms-path "${BASE_PATH}/transforms.json" \
     --dataset-type "instant-ngp"
+
+
+python custom_gaussiansplat/train.py \
+    --output-dir $BASE_PATH/cust_gs_outputs \
+    --log-interval 10 \
+    --densify-from-iter 500 \
+    --densify-interval 100 \
+    --densify-until-iter 30000 \
+    --tb-image-interval 100 \
+    --save-interval 10000 \
+    --viewer \
+    --iterations 70000 \
+    --sh-degree 3 \
+    --lr-means 0.0002 \
+    --lr-quats 0.0002 \
+    --lr-scales 0.001 \
+    --lr-sh 0.002 \
+    --grad-threshold 0.0002 \
+    --verbosity 3 --grow-grad2d 0.0001 --grow-scale3d 0.001 --grow-scale2d 0.005 --prune-scale3d 0.01 --prune-scale2d 0.15 \
+    --dataset-type "matrixcity" --preload \
+    --matrixcity-path $BASE_PATH/small_city/aerial/train/block_1 --matrixcity-path $BASE_PATH/small_city/aerial/train/block_2 \
+    --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_1_depth --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_2_depth \
+    --matrixcity-pointcloud-path $BASE_PATH/small_city_pointcloud/point_cloud/aerial/Block_A.ply \
+    --metric-depth-normal-loss --metric-depth-normal-loss-weight 0.1

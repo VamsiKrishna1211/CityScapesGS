@@ -10,6 +10,11 @@ class RequiredConfig:
     colmap_path: Optional[str]
     transforms_path: Optional[str]
     images_path: Optional[str]
+    depths_path: Optional[str]
+    matrixcity_paths: Optional[list[str]]
+    matrixcity_depth_paths: Optional[list[str]]
+    matrixcity_pointcloud_paths: Optional[list[str]]
+    matrixcity_max_init_points: int
     point_cloud_path: Optional[str]
     scale: int
 
@@ -95,6 +100,8 @@ class DepthConfig:
     depth_smoothness_end_alpha: float
     depth_smoothness_max_steps: int # If not used, then it will default to total iterations
     depth_smoothness_loss_weight: float
+    metric_depth_normal_loss: bool
+    metric_depth_normal_loss_weight: float
 
 
 @dataclass
@@ -128,6 +135,12 @@ class ViewerConfig:
     viewer_port: int
     viewer_refresh_interval: int = 100  # How often to refresh viewer with latest model params (in iterations)
     rerun_viewer: bool = False
+    viewer_backend: str = "ns-replica"  # ns-replica | nerfview
+    viewer_image_policy: str = "lazy"  # lazy | preload
+    viewer_image_cache_size: int = 256
+    viewer_max_thumbnail_size: int = 128
+    viewer_add_training_cameras: bool = True
+    viewer_camera_frustum_scale: float = 0.1
 
 
 @dataclass
@@ -258,9 +271,30 @@ def _normalize_semantics_values(values: Dict[str, Any]) -> Dict[str, Any]:
 
 def _normalize_required_values(values: Dict[str, Any]) -> Dict[str, Any]:
     dataset_type = str(values.get("dataset_type", "colmap")).strip().lower().replace("_", "-")
-    if dataset_type not in {"colmap", "instant-ngp"}:
-        raise ValueError(f"Unsupported --dataset-type '{dataset_type}'. Supported: colmap, instant-ngp")
+    if dataset_type not in {"colmap", "instant-ngp", "matrixcity"}:
+        raise ValueError(f"Unsupported --dataset-type '{dataset_type}'. Supported: colmap, instant-ngp, matrixcity")
     values["dataset_type"] = dataset_type
+
+    matrixcity_paths = values.get("matrixcity_paths")
+    matrixcity_depth_paths = values.get("matrixcity_depth_paths")
+
+    if matrixcity_paths is not None:
+        values["matrixcity_paths"] = [str(path) for path in matrixcity_paths]
+    if matrixcity_depth_paths is not None:
+        values["matrixcity_depth_paths"] = [str(path) for path in matrixcity_depth_paths]
+
+    if dataset_type == "matrixcity":
+        if not values.get("matrixcity_paths"):
+            raise ValueError(
+                "--matrixcity-path must be provided at least once when --dataset-type=matrixcity"
+            )
+        if values.get("matrixcity_depth_paths") and (
+            len(values["matrixcity_depth_paths"]) != len(values["matrixcity_paths"])
+        ):
+            raise ValueError(
+                "--matrixcity-depth-path must be provided either zero times or exactly "
+                "once per --matrixcity-path"
+            )
 
     # Backward compatibility: allow using --colmap-path as transforms input for instant-ngp.
     if dataset_type == "instant-ngp" and values.get("transforms_path") is None and values.get("colmap_path") is not None:
@@ -280,7 +314,7 @@ REQUIRED_GROUP = ArgGroupDef(
             dest="dataset_type",
             arg_type=str,
             default="colmap",
-            choices=("colmap", "instant-ngp"),
+            choices=("colmap", "instant-ngp", "matrixcity"),
             help="Dataset format to load",
         ),
         ArgSpec(
@@ -298,6 +332,13 @@ REQUIRED_GROUP = ArgGroupDef(
             help="Path to Instant-NGP transform file or scene directory containing transform.json/transforms.json (required for --dataset-type instant-ngp)",
         ),
         ArgSpec(
+            flags=("--matrixcity-path",),
+            dest="matrixcity_paths",
+            action="append",
+            required=False,
+            help="MatrixCity block root path. Repeat this flag for multiple blocks (for example: .../aerial/train/block_1 --matrixcity-path .../aerial/train/block_2).",
+        ),
+        ArgSpec(
             flags=("--images-path",),
             dest="images_path",
             arg_type=str,
@@ -305,11 +346,39 @@ REQUIRED_GROUP = ArgGroupDef(
             help="Path to training images directory (required for colmap, optional for instant-ngp if transforms folder has images/)",
         ),
         ArgSpec(
+            flags=("--depths-path",),
+            dest="depths_path",
+            arg_type=str,
+            default=None,
+            help="Optional explicit depth directory override. Supports .npy and .exr depth maps.",
+        ),
+        ArgSpec(
+            flags=("--matrixcity-depth-path",),
+            dest="matrixcity_depth_paths",
+            action="append",
+            required=False,
+            help="Optional MatrixCity depth root per block. Repeat in the same order as --matrixcity-path, or omit to auto-resolve per block.",
+        ),
+        ArgSpec(
+            flags=("--matrixcity-pointcloud-path",),
+            dest="matrixcity_pointcloud_paths",
+            action="append",
+            required=False,
+            help="Optional MatrixCity point cloud root, and the cound need not match the number of blocks. If provided, the point cloud will be used",
+        ),
+        ArgSpec(
+            flags=("--matrixcity-max-init-points",),
+            dest="matrixcity_max_init_points",
+            arg_type=int,
+            default=20000,
+            help="Maximum number of initialization points used from MatrixCity point clouds after merge (default: 300000).",
+        ),
+        ArgSpec(
             flags=("--point-cloud-path",),
             dest="point_cloud_path",
             arg_type=str,
             default=None,
-            help="Optional point cloud for instant-ngp init (.npy/.pth/.pt). Shapes: [N,3] xyz or [N,6] xyzrgb, or .pth dict {'xyz','rgb'}.",
+            help="Optional point cloud for instant-ngp init (.npy/.pth/.pt/.ply). Shapes: [N,3] xyz or [N,6] xyzrgb, .pth dict {'xyz','rgb'}, or PLY vertex x/y/z with optional RGB.",
         ),
         ArgSpec(
             flags=("-s", "--scale"),
@@ -424,7 +493,7 @@ DEPTH_GROUP = ArgGroupDef(
     config_cls=DepthConfig,
     specs=(
         ArgSpec(flags=("--enable-depth-loss",), dest="enable_depth_loss", action="store_true", help="Enable depth supervision from Depth Anything V2 depth maps"),
-        ArgSpec(flags=("--depth-loss-weight",), dest="depth_loss_weight", arg_type=float, default=0.1, help="Weight for depth loss (0.05-0.2 recommended)"),
+        ArgSpec(flags=("--depth-loss-weight",), dest="depth_loss_weight", arg_type=float, default=0.0, help="Weight for depth loss (0.05-0.2 recommended)"),
         ArgSpec(flags=("--depth-loss-start-iter",), dest="depth_loss_start_iter", arg_type=int, default=1000, help="Start applying depth loss after this many iterations"),
         ArgSpec(flags=("--sam-loss-weight",), dest="sam_loss_weight", arg_type=float, default=0.0, help="Weight for sharpness-aware minimization loss in gradient space (0.0 disables)"),
         ArgSpec(flags=("--affine-invariant-depth-loss-weight",), dest="affine_invariant_depth_loss_weight", arg_type=float, default=0.0, help="Weight for AffineInvariantDepthLoss (0.0 disables)"),
@@ -436,7 +505,9 @@ DEPTH_GROUP = ArgGroupDef(
         ArgSpec(flags=("--depth-smoothness-start-alpha",), dest="depth_smoothness_start_alpha", arg_type=float, default=0.5, help="Starting alpha value for edge-aware depth smoothness loss (lower = more edge-sensitive)"),
         ArgSpec(flags=("--depth-smoothness-end-alpha",), dest="depth_smoothness_end_alpha", arg_type=float, default=2.5, help="Ending alpha value for edge-aware depth smoothness loss (higher = less edge-sensitive)"),
         ArgSpec(flags=("--depth-smoothness-max-steps",), dest="depth_smoothness_max_steps", arg_type=int, default=None, help="Number of steps over which to schedule alpha for depth smoothness loss (defaults to total iterations if not set)"),
-        ArgSpec(flags=("--depth-smoothness-loss-weight",), dest="depth_smoothness_loss_weight", arg_type=float, default=0.1, help="Weight for depth smoothness loss (0.01-0.1 recommended)")
+        ArgSpec(flags=("--depth-smoothness-loss-weight",), dest="depth_smoothness_loss_weight", arg_type=float, default=0.0, help="Weight for depth smoothness loss (0.01-0.1 recommended)"),
+        ArgSpec(flags=("--metric-depth-normal-loss",), dest="metric_depth_normal_loss", action="store_true", help="Enable metric depth normal loss"),
+        ArgSpec(flags=("--metric-depth-normal-loss-weight",), dest="metric_depth_normal_loss_weight", arg_type=float, default=0.1, help="Weight for metric depth normal loss (0.01-0.1 recommended)"),
     ),
 )
 
@@ -490,6 +561,13 @@ VIEWER_GROUP = ArgGroupDef(
         ArgSpec(flags=("--viewer-port",), dest="viewer_port", arg_type=int, default=8080, help="Port for the viewer server"),
         ArgSpec(flags=("--viewer-refresh-interval",), dest="viewer_refresh_interval", arg_type=int, default=100, help="How often to refresh viewer with latest model params (in iterations)"),
         ArgSpec(flags=("--rerun-viewer",), dest="rerun_viewer", action="store_true", help="Enable Rerun viewer during training"),
+        ArgSpec(flags=("--viewer-backend",), dest="viewer_backend", arg_type=str, default="ns-replica", choices=("ns-replica", "nerfview"), help="Viewer backend implementation"),
+        ArgSpec(flags=("--viewer-image-policy",), dest="viewer_image_policy", arg_type=str, default="lazy", choices=("lazy", "preload"), help="How viewer camera thumbnails are loaded"),
+        ArgSpec(flags=("--viewer-image-cache-size",), dest="viewer_image_cache_size", arg_type=int, default=256, help="LRU cache size for lazy thumbnail loading"),
+        ArgSpec(flags=("--viewer-max-thumbnail-size",), dest="viewer_max_thumbnail_size", arg_type=int, default=128, help="Max dimension for camera thumbnail images"),
+        ArgSpec(flags=("--viewer-add-training-cameras",), dest="viewer_add_training_cameras", action="store_true", default=True, help="Display training cameras as frustums in viewer"),
+        ArgSpec(flags=("--no-viewer-add-training-cameras",), dest="viewer_add_training_cameras", action="store_false", help="Disable training camera frustums in viewer"),
+        ArgSpec(flags=("--viewer-camera-frustum-scale",), dest="viewer_camera_frustum_scale", arg_type=float, default=0.1, help="Scale factor for training camera frustums"),
     ),
 )
 
@@ -526,7 +604,7 @@ ARG_GROUP_DEFS: Tuple[ArgGroupDef[Any], ...] = (
 def parse_args() -> TrainConfig:
     """Parse command line arguments and return strongly typed grouped config."""
     parser = argparse.ArgumentParser(
-        description="Train a 3D Gaussian Splatting model from COLMAP or Instant-NGP style datasets",
+        description="Train a 3D Gaussian Splatting model from COLMAP, Instant-NGP, or MatrixCity style datasets",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     for group_def in ARG_GROUP_DEFS:
@@ -543,6 +621,16 @@ def parse_args() -> TrainConfig:
     elif required_cfg.dataset_type == "instant-ngp":
         if not required_cfg.transforms_path:
             parser.error("--transforms-path is required when --dataset-type=instant-ngp")
+    elif required_cfg.dataset_type == "matrixcity":
+        if not required_cfg.matrixcity_paths:
+            parser.error("--matrixcity-path is required when --dataset-type=matrixcity")
+        if required_cfg.matrixcity_depth_paths and (
+            len(required_cfg.matrixcity_depth_paths) != len(required_cfg.matrixcity_paths)
+        ):
+            parser.error(
+                "--matrixcity-depth-path must be provided either zero times or exactly "
+                "once per --matrixcity-path"
+            )
 
     return TrainConfig(
         raw=flat_args,

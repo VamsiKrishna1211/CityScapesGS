@@ -16,6 +16,58 @@ import logging
 
 logger = logging.getLogger("cityscape_gs.logger")
 
+
+def configure_app_logger(
+    verbosity: int,
+    output_dir: Path,
+    *,
+    log_filename: str = "training.log",
+    logger_name: str = "cityscape_gs.train",
+) -> logging.Logger:
+    """Configure application logging for the whole cityscape_gs namespace.
+
+    Handlers are attached to the parent namespace logger so child loggers like
+    ``cityscape_gs.dataset`` and ``cityscape_gs.model`` propagate correctly.
+    """
+    from rich.logging import RichHandler
+
+    level_map = {
+        0: logging.WARNING,
+        1: logging.INFO,
+        2: logging.DEBUG,
+        3: logging.DEBUG,
+    }
+    log_level = level_map.get(verbosity, logging.INFO)
+
+    namespace_logger = logging.getLogger("cityscape_gs")
+    namespace_logger.setLevel(logging.DEBUG)
+    namespace_logger.propagate = False
+    namespace_logger.handlers.clear()
+
+    console_handler = RichHandler(
+        rich_tracebacks=True,
+        markup=True,
+        show_time=True,
+        show_path=verbosity >= 3,
+    )
+    console_handler.setLevel(log_level)
+    namespace_logger.addHandler(console_handler)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(output_dir / log_filename, mode="w")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    namespace_logger.addHandler(file_handler)
+
+    app_logger = logging.getLogger(logger_name)
+    app_logger.setLevel(logging.DEBUG)
+    app_logger.handlers.clear()
+    app_logger.propagate = True
+    return app_logger
+
 # Optional imports for system metrics
 try:
     import psutil
@@ -226,6 +278,57 @@ class GaussianSplattingLogger:
         if max_radii is not None:
             # Ensure max_radii is float before computing mean
             self.writer.add_scalar('Model/AvgMaxRadii', max_radii.float().mean().item(), step)
+
+    def log_pointcloud_mesh(
+        self,
+        points: torch.Tensor,
+        colors: Optional[torch.Tensor] = None,
+        tag: str = 'Scene/InitialPointCloud',
+        step: int = 0,
+        max_points: int = 500000,
+    ) -> None:
+        """Log a 3D point cloud to TensorBoard via SummaryWriter.add_mesh.
+
+        Args:
+            points: Point positions as [N, 3] tensor.
+            colors: Optional RGB colors as [N, 3], values in [0, 1] or [0, 255].
+            tag: TensorBoard tag namespace.
+            step: Global step used for this mesh event.
+            max_points: Optional cap to keep event size manageable.
+        """
+        if not self.enabled:
+            return
+
+        if points is None or points.numel() == 0:
+            return
+
+        try:
+            pts = points.detach().float().cpu()
+            cols = colors.detach().float().cpu() if colors is not None else None
+
+            if pts.dim() != 2 or pts.shape[1] != 3:
+                logger.warning(f"Skipping TensorBoard point cloud log: expected [N,3], got {tuple(pts.shape)}")
+                return
+
+            n = pts.shape[0]
+            if n > max_points:
+                idx = torch.randperm(n)[:max_points]
+                pts = pts[idx]
+                if cols is not None and cols.shape[0] == n:
+                    cols = cols[idx]
+
+            if cols is not None:
+                if cols.dim() != 2 or cols.shape[1] != 3 or cols.shape[0] != pts.shape[0]:
+                    cols = None
+                else:
+                    cols = cols.clamp(0.0, 1.0)
+
+            # add_mesh expects [B, N, 3]
+            pts_batched = pts.unsqueeze(0)
+            cols_batched = cols.unsqueeze(0) if cols is not None else None
+            self.writer.add_mesh(tag, vertices=pts_batched, colors=cols_batched, global_step=step)
+        except Exception as e:
+            logger.warning(f"Failed to log point cloud mesh to TensorBoard: {e}")
     
     def log_images(self, rendered: torch.Tensor, ground_truth: torch.Tensor,
                    alpha: Optional[torch.Tensor] = None,
@@ -557,6 +660,11 @@ class GaussianSplattingLogger:
                 self._nvml_initialized = False
             except Exception:
                 pass
+
+    def flush(self):
+        """Flush pending TensorBoard events to disk."""
+        if self.enabled and self.writer:
+            self.writer.flush()
     
     def __enter__(self):
         """Context manager entry."""

@@ -1,5 +1,51 @@
 import logging
 import os
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+
+from pathlib import Path
+
+
+def _prepend_env_path(var_name: str, path_value: str) -> None:
+    current = os.environ.get(var_name, "")
+    parts = [p for p in current.split(os.pathsep) if p]
+    if path_value not in parts:
+        os.environ[var_name] = (
+            f"{path_value}{os.pathsep}{current}" if current else path_value
+        )
+
+
+def _configure_cuda_jit_env() -> None:
+    """Make CUDA headers discoverable for torch JIT extensions in conda envs."""
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if not conda_prefix:
+        return
+
+    conda_root = Path(conda_prefix)
+    if (conda_root / "bin" / "nvcc").exists():
+        os.environ.setdefault("CUDA_HOME", str(conda_root))
+
+    include_candidates = [
+        conda_root / "targets" / "x86_64-linux" / "include",
+        conda_root / "include",
+    ]
+    for include_dir in include_candidates:
+        if (include_dir / "cuda_runtime.h").exists():
+            _prepend_env_path("CPATH", str(include_dir))
+            _prepend_env_path("CPLUS_INCLUDE_PATH", str(include_dir))
+            break
+
+    lib_candidates = [
+        conda_root / "targets" / "x86_64-linux" / "lib",
+        conda_root / "lib",
+    ]
+    for lib_dir in lib_candidates:
+        if lib_dir.exists():
+            _prepend_env_path("LIBRARY_PATH", str(lib_dir))
+            _prepend_env_path("LD_LIBRARY_PATH", str(lib_dir))
+
+
+_configure_cuda_jit_env()
+
 import torch
 import torch.nn.functional as F
 from gsplat import DefaultStrategy, rasterization
@@ -37,19 +83,23 @@ from rich.table import Table
 from rich.panel import Panel
 from rich import box
 
-from dataset import ColmapDataset
+from dataset import ColmapDataset, InstantNGPDataset, MatrixCityDataset, create_dataset, CameraData
 from model import GaussianModel, inverse_sigmoid
 from gs_types import GSOptimizers, GS_LR_Schedulers
 from utils import format_phase_description
 from viewer_sync import ViewerParamSync
+from ns_viewer import NSReplicaViewer, NSReplicaViewerConfig
 import losses
-from logger import GaussianSplattingLogger
+from logger import GaussianSplattingLogger, configure_app_logger
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from concurrent.futures import ThreadPoolExecutor
-from train_args import TrainConfig, parse_args
+from train_args import (TrainConfig, parse_args, DepthConfig, DensificationConfig, 
+                        CheckpointConfig, ExportConfig, FloaterPreventionConfig, 
+                        LearningRateConfig, OutputConfig, RequiredConfig, RuntimeConfig, 
+                        SemanticsConfig, TensorBoardConfig, SHConfig)
 from fused_ssim import fused_ssim
 from gs_types import GS_LR_Schedulers, GSOptimizers
-from logger import GaussianSplattingLogger
+from logger import GaussianSplattingLogger, configure_app_logger
 from model import GaussianModel, inverse_sigmoid
 from rich import box
 from rich.console import Console
@@ -107,24 +157,67 @@ def _build_intrinsics(cam: dict, device: torch.device) -> torch.Tensor:
         dtype=torch.float32, device=device,
     )
 
+@torch.no_grad()
+def _prepare_gt_image(
+    gt_image: torch.Tensor,
+    device: torch.device,
+    target_h: Optional[int] = None,
+    target_w: Optional[int] = None,
+) -> torch.Tensor:
+    """Move gt_image to device, normalize shape, and optionally resize to target HW.
 
-def _prepare_gt_image(gt_image: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Move gt_image to device and ensure it has a batch dim [B, H, W, C]."""
+    Returns tensor in [B, H, W, C] layout.
+    """
     if not gt_image.is_cuda:
         gt_image = gt_image.to(device)
     if gt_image.dim() == 3:
         gt_image = gt_image.unsqueeze(0)
+
+    if target_h is not None and target_w is not None:
+        h, w = gt_image.shape[1], gt_image.shape[2]
+        if h != target_h or w != target_w:
+            gt_bchw = gt_image.permute(0, 3, 1, 2)
+            gt_bchw = F.interpolate(
+                gt_bchw,
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+            gt_image = gt_bchw.permute(0, 2, 3, 1)
     return gt_image
 
-
+@torch.no_grad()
 def _prepare_depth_tensor(
-    depth_tensor: Optional[torch.Tensor], device: torch.device,
+    depth_tensor: Optional[torch.Tensor],
+    device: torch.device,
+    target_h: Optional[int] = None,
+    target_w: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
-    """Move depth tensor to device and normalize dimensions."""
+    """Move depth tensor to device, normalize dims, and optionally resize to target HW.
+
+    Returns depth in [B, H, W] layout when available.
+    """
     if depth_tensor is None:
         return None
     if not depth_tensor.is_cuda:
         depth_tensor = depth_tensor.to(device)
+
+    if depth_tensor.dim() == 2:
+        depth_tensor = depth_tensor.unsqueeze(0)
+    elif depth_tensor.dim() == 4 and depth_tensor.shape[-1] == 1:
+        depth_tensor = depth_tensor[..., 0]
+
+    if target_h is not None and target_w is not None and depth_tensor.dim() == 3:
+        h, w = depth_tensor.shape[-2], depth_tensor.shape[-1]
+        if h != target_h or w != target_w:
+            depth_bchw = depth_tensor.unsqueeze(1)
+            depth_bchw = F.interpolate(
+                depth_bchw,
+                size=(target_h, target_w),
+                mode="nearest",
+            )
+            depth_tensor = depth_bchw[:, 0]
+
     return depth_tensor
 
 
@@ -138,34 +231,12 @@ def setup_logger(verbosity: int, output_dir: Path) -> logging.Logger:
     Returns:
         Configured logger instance
     """
-    level_map = {
-        0: logging.WARNING,
-        1: logging.INFO,
-        2: logging.DEBUG,
-        3: logging.DEBUG,
-    }
-    log_level = level_map.get(verbosity, logging.INFO)
-
-    logger = logging.getLogger("cityscape_gs.train")
-    logger.setLevel(log_level)
-    logger.handlers.clear()
-
-    console_handler = RichHandler(
-        rich_tracebacks=True, markup=True, show_time=True,
-        show_path=verbosity >= 3,
+    return configure_app_logger(
+        verbosity=verbosity,
+        output_dir=output_dir,
+        log_filename="training.log",
+        logger_name="cityscape_gs.train",
     )
-    console_handler.setLevel(log_level)
-    logger.addHandler(console_handler)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(output_dir / "training.log", mode="w")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
-    logger.addHandler(file_handler)
-    return logger
 
 
 # ---------------------------------------------------------------------------
@@ -208,9 +279,17 @@ class Rasterizer:
     and tensor permutations for loss computation.
     """
 
-    def __init__(self, model: GaussianModel, sh_cfg) -> None:
+    def __init__(
+        self,
+        model: GaussianModel,
+        sh_cfg,
+        packed: bool = False,
+        absgrad: bool = False,
+    ) -> None:
         self.model = model
         self.sh_cfg = sh_cfg
+        self.packed = packed
+        self.absgrad = absgrad
 
     def render(self, cam: dict, gt_image: torch.Tensor,
                device: torch.device) -> RenderOutput:
@@ -240,7 +319,10 @@ class Rasterizer:
             height=cam["height"],
             sh_degree=(self.model.sh_degree
                        if not self.sh_cfg.disable_sh_rendering else None),
+            packed=self.packed,
+            absgrad=self.absgrad,
             render_mode="RGB+ED",
+            camera_model="pinhole"
         )
 
         render = render_output[..., 0:3]             # [B, H, W, 3]
@@ -285,7 +367,7 @@ class LossComputer:
     a single ``compute()`` method.
     """
 
-    def __init__(self, training_cfg, depth_cfg, floater_cfg, device: torch.device,
+    def __init__(self, training_cfg, depth_cfg: DepthConfig, floater_cfg: FloaterPreventionConfig, device: torch.device,
                  verbosity: int = 1, logger: Optional[logging.Logger] = None) -> None:
         self.training_cfg = training_cfg
         self.depth_cfg = depth_cfg
@@ -316,6 +398,7 @@ class LossComputer:
         self.silog_depth_loss = losses.SILogLoss().to(device)
         self.ordinal_depth_loss = losses.OrdinalDepthLoss().to(device)
         self.affine_aligned_gradient_matching_loss = losses.AffineAlignedGradientMatchingLoss().to(device)
+        self.metric_depth_normal_loss = losses.MetricNormalLoss().to(device)
 
     # -- internal helpers ---------------------------------------------------
 
@@ -340,6 +423,7 @@ class LossComputer:
         self, depth_map_bchw: torch.Tensor,
         depth_tensor: Optional[torch.Tensor],
         depth_mask_bchw: torch.Tensor,
+        cam_data: Optional[CameraData] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """Compute all active depth-related losses.
 
@@ -366,13 +450,20 @@ class LossComputer:
             ("affine_aligned_gradient_matching_loss",
              dcfg.affine_aligned_gradient_matching_loss_weight,
              self.affine_aligned_gradient_matching_loss),
+            ("metric-depth-normal-loss", dcfg.metric_depth_normal_loss_weight,
+             self.metric_depth_normal_loss)
         ]
 
         for name, weight, module in depth_loss_items:
             if weight > 0.0:
-                val = module(depth_map_bchw, depth_tensor_bchw, depth_mask_bchw)
-                acc = acc + weight * val
-                m[name] = val.item()
+                try:
+                    val = module(depth_map_bchw, depth_tensor_bchw, depth_mask_bchw)
+                    acc = acc + weight * val
+                    m[name] = val.item()
+                except TypeError:
+                    val = module(depth_map_bchw, depth_tensor_bchw, depth_mask_bchw, cam_data)
+                    acc = acc + weight * val
+                    m[name] = val.item()
 
         return acc, m
 
@@ -422,6 +513,7 @@ class LossComputer:
         gt_image: torch.Tensor,
         depth_tensor: Optional[torch.Tensor],
         model: GaussianModel,
+        cam_data: CameraData,
         step: int,
     ) -> LossResult:
         """Compute all active losses for a single training step.
@@ -453,7 +545,7 @@ class LossComputer:
 
         # Depth losses
         depth_acc, depth_m = self._compute_depth_losses(
-            render_out.depth_map_bchw, depth_tensor, render_out.depth_mask_bchw,
+            render_out.depth_map_bchw, depth_tensor, render_out.depth_mask_bchw, cam_data
         )
         loss = loss + depth_acc
         metrics.update(depth_m)
@@ -645,6 +737,8 @@ class TrainingLogger:
                     step_snapshot=int(step),
                 )
                 self.tb_logger.log_system_metrics(step=step)
+                # Keep event files up-to-date even if training stops early.
+                self.tb_logger.flush()
 
         # Periodic image logging
         if (self.tensorboard_enabled
@@ -758,7 +852,7 @@ class GaussianSplatTrainer:
 
         # Will be initialized in setup methods
         self.model: Optional[GaussianModel] = None
-        self.dataset: Optional[ColmapDataset] = None
+        self.dataset: Optional[ColmapDataset | InstantNGPDataset | MatrixCityDataset] = None
         self.logger: Optional[logging.Logger] = None
         self.tb_logger: Optional[GaussianSplattingLogger] = None
         self.training_logger: Optional[TrainingLogger] = None
@@ -789,16 +883,55 @@ class GaussianSplatTrainer:
         self.checkpoint_dir.mkdir(exist_ok=True)
 
     def _setup_dataset(self) -> None:
-        self.dataset = ColmapDataset(
-            self.required_cfg.colmap_path,
-            self.required_cfg.images_path,
-            device=self.device,
-            image_scale=self.required_cfg.scale,
-            scene_extent_margin=1.5,
-        )
+        # self.dataset = ColmapDataset(
+        #     self.required_cfg.colmap_path,
+        #     self.required_cfg.images_path,
+        #     device=self.device,
+        #     image_scale=self.required_cfg.scale,
+        #     scene_extent_margin=1.5,
+        # )
+        if self.required_cfg.dataset_type == "colmap":
+            self.dataset = create_dataset(
+                dataset_type="colmap",
+                colmap_path=self.required_cfg.colmap_path,
+                image_dir=self.required_cfg.images_path,
+                depth_dir=self.required_cfg.depths_path,
+                device=self.device,
+                image_scale=self.required_cfg.scale,
+                scene_extent_margin=1.5,  # Add margin to scene extent to prevent aggressive pruning of boundary Gaussians
+                require_depth=self.depth_cfg.enable_depth_loss,
+            )
+        elif self.required_cfg.dataset_type == "instant-ngp":
+            self.dataset = create_dataset(
+                dataset_type="instant-ngp",
+                transforms_path=self.required_cfg.transforms_path,
+                image_dir=self.required_cfg.images_path,
+                depth_dir=self.required_cfg.depths_path,
+                point_cloud_path=self.required_cfg.point_cloud_path,
+                device=self.device,
+                image_scale=self.required_cfg.scale,
+                scene_extent_margin=1.5,
+                require_depth=self.depth_cfg.enable_depth_loss,
+            )
+        elif self.required_cfg.dataset_type == "matrixcity":
+            self.dataset = create_dataset(
+                dataset_type="matrixcity",
+                matrixcity_paths=self.required_cfg.matrixcity_paths,
+                matrixcity_depth_paths=self.required_cfg.matrixcity_depth_paths,
+                matrixcity_pointcloud_paths=self.required_cfg.matrixcity_pointcloud_paths,
+                matrixcity_max_init_points=self.required_cfg.matrixcity_max_init_points,
+                device=self.device,
+                image_scale=self.required_cfg.scale,
+                scene_extent_margin=1.5,
+                require_depth=self.depth_cfg.enable_depth_loss,
+            )
+        else:
+            raise ValueError(f"Unsupported dataset type: {self.required_cfg.dataset_type}")
+        
         if self.training_cfg.preload:
             self.logger.info("[yellow]Preloading enabled:[/yellow] loading all images into RAM...")
             self.dataset.preload_all_data()
+            
         self.scene_extent = self.dataset.scene_extent
 
     def _setup_model(self) -> None:
@@ -855,6 +988,7 @@ class GaussianSplatTrainer:
             else:
                 self.logger.info(f"[green]📊 TensorBoard:[/green] Logging to run [cyan]{self.tb_logger.run_name}[/cyan]")
             self.logger.info(f"[dim]Run: tensorboard --logdir={output_path / 'tensorboard'}[/dim]")
+            self.logger.info(f"[dim]Run directory: {self.tb_logger.log_dir}[/dim]")
 
     def _setup_strategy(self) -> None:
         dcfg = self.densification_cfg
@@ -934,6 +1068,12 @@ class GaussianSplatTrainer:
         if self.VERBOSITY >= 2:
             self.logger.debug("[cyan]📈 Optimizers & Schedulers:[/cyan] Adam + CosineAnnealingLR initialized")
 
+        # Validate strategy <-> params <-> optimizers wiring once optimizers exist.
+        self.strategy.check_sanity(
+            self.model.get_params_dict(),
+            self.model.get_optimizers_dict(self.optimizers),
+        )
+
         # Restore optimizer states from checkpoint
         if self._checkpoint is not None and "optimizers_state_dict" in self._checkpoint:
             for key, opt in self.optimizers.__dict__.items():
@@ -944,7 +1084,12 @@ class GaussianSplatTrainer:
 
     def _setup_components(self) -> None:
         """Initialize Rasterizer, LossComputer, TrainingLogger."""
-        self.rasterizer = Rasterizer(self.model, self.sh_cfg)
+        self.rasterizer = Rasterizer(
+            self.model,
+            self.sh_cfg,
+            packed=False,
+            absgrad=bool(getattr(self.strategy, "absgrad", False)),
+        )
         self.loss_computer = LossComputer(
             self.training_cfg, self.depth_cfg, self.floater_cfg,
             self.device, self.VERBOSITY, self.logger,
@@ -991,13 +1136,31 @@ class GaussianSplatTrainer:
             refresh_interval=self.viewer_cfg.viewer_refresh_interval,
         )
         self.server = viser.ViserServer(port=self.viewer_cfg.viewer_port, verbose=False)
-        self.viewer = nerfview.Viewer(
-            server=self.server,
-            render_fn=self.viewer_param_sync.render_fn,
-            mode="training",
-        )
+        if self.viewer_cfg.viewer_backend == "nerfview":
+            self.viewer = nerfview.Viewer(
+                server=self.server,
+                render_fn=self.viewer_param_sync.render_fn,
+                mode="training",
+            )
+        else:
+            replica_cfg = NSReplicaViewerConfig(
+                add_training_cameras=self.viewer_cfg.viewer_add_training_cameras,
+                camera_frustum_scale=self.viewer_cfg.viewer_camera_frustum_scale,
+                image_policy=self.viewer_cfg.viewer_image_policy,
+                image_cache_size=self.viewer_cfg.viewer_image_cache_size,
+                max_thumbnail_size=self.viewer_cfg.viewer_max_thumbnail_size,
+            )
+            self.viewer = NSReplicaViewer(
+                server=self.server,
+                render_fn=self.viewer_param_sync.render_fn,
+                dataset=self.dataset,
+                config=replica_cfg,
+            )
         if self.VERBOSITY >= 1:
-            self.logger.info(f"[green]📺 Viewer started:[/green] http://localhost:{self.viewer_cfg.viewer_port}")
+            self.logger.info(
+                f"[green]📺 Viewer started:[/green] http://localhost:{self.viewer_cfg.viewer_port} "
+                f"[dim](backend={self.viewer_cfg.viewer_backend})[/dim]"
+            )
 
     def _setup_dataloader(self) -> DataLoader:
         import multiprocessing
@@ -1059,6 +1222,22 @@ class GaussianSplatTrainer:
         }
         self.tb_logger.log_hyperparameters(hparams)
 
+    def _log_initial_pointcloud(self) -> None:
+        """Log initial scene point cloud to TensorBoard before training loop starts."""
+        if not self.tensorboard_cfg.tensorboard:
+            return
+        if self.tb_logger is None or self.dataset is None:
+            return
+
+        # Use dataset initialization cloud for a stable pre-training scene preview.
+        self.tb_logger.log_pointcloud_mesh(
+            points=self.dataset.init_points,
+            colors=self.dataset.init_colors,
+            tag="Scene/InitialPointCloud",
+            step=self.start_iteration,
+        )
+        self.tb_logger.flush()
+
     # -- per-step helpers ---------------------------------------------------
 
     def _next_batch(self) -> Tuple:
@@ -1073,8 +1252,20 @@ class GaussianSplatTrainer:
         cam, gt_image, depth_tensor = self._next_batch()
         torch.cuda.synchronize()
 
-        gt_image = _prepare_gt_image(gt_image, self.device)
-        depth_tensor = _prepare_depth_tensor(depth_tensor, self.device)
+        target_h = int(cam["height"])
+        target_w = int(cam["width"])
+        gt_image = _prepare_gt_image(
+            gt_image.detach(),
+            self.device,
+            target_h=target_h,
+            target_w=target_w,
+        )
+        # depth_tensor = _prepare_depth_tensor(
+        #     depth_tensor.detach() if depth_tensor is not None else None,
+        #     self.device,
+        #     target_h=target_h,
+        #     target_w=target_w,
+        # )
 
         # Safety check
         if len(self.model._means) == 0:
@@ -1093,8 +1284,12 @@ class GaussianSplatTrainer:
         )
 
         # Compute loss
+        if self.model is None:
+            raise RuntimeError("Model is not initialized before computing loss")
+        if self.loss_computer is None:
+            raise RuntimeError("LossComputer is not initialized before computing loss")
         loss_result = self.loss_computer.compute(
-            render_out, gt_image, depth_tensor, self.model, step,
+            render_out, gt_image, depth_tensor, self.model, cam, step,
         )
 
         # Validate loss
@@ -1118,7 +1313,7 @@ class GaussianSplatTrainer:
         self.strategy.step_post_backward(
             params=params, optimizers=optimizers_dict,
             state=self.strategy_state, step=step,
-            info=render_out.meta, packed=True,
+            info=render_out.meta, packed=self.rasterizer.packed,
         )
         self.model.update_params_from_dict(params)
         gaussians_after = len(self.model._means)
@@ -1208,38 +1403,42 @@ class GaussianSplatTrainer:
         self._setup_viewer()
         self._setup_dataloader()
         self._log_hyperparameters()
+        self._log_initial_pointcloud()
 
         last_loss_result = None
+        training_completed = False
 
-        for step in range(self.start_iteration, self.training_cfg.iterations):
-            # Handle viewer pause
-            if self.viewer is not None:
-                while self.viewer.state == "paused":
-                    time.sleep(0.01)
-                self.viewer.lock.acquire()
+        try:
+            for step in range(self.start_iteration, self.training_cfg.iterations):
+                # Handle viewer pause
+                if self.viewer is not None:
+                    while self.viewer.state == "paused":
+                        time.sleep(0.01)
+                    self.viewer.lock.acquire()
 
-            self._step_start_time = time.perf_counter()
-            last_loss_result = self._train_step(step)
+                self._step_start_time = time.perf_counter()
+                last_loss_result = self._train_step(step)
 
-            # Save checkpoints
-            if step % self.training_cfg.save_interval == 0 and step > 0:
-                self._save_checkpoint(step, last_loss_result.metrics["total_loss"])
+                # Save checkpoints
+                if step % self.training_cfg.save_interval == 0 and step > 0:
+                    self._save_checkpoint(step, last_loss_result.metrics["total_loss"])
+
+            training_completed = True
+        finally:
+            final_metrics = {}
+            if last_loss_result is not None:
+                final_metrics = {
+                    "final/loss": last_loss_result.metrics["total_loss"],
+                    "final/psnr": last_loss_result.metrics["psnr"],
+                    "final/gaussians": len(self.model._means),
+                }
+            self.training_logger.finalize(final_metrics)
 
         # Viewer complete
-        if self.viewer is not None:
+        if self.viewer is not None and training_completed:
             self.viewer.complete()
             if self.VERBOSITY >= 1:
                 self.logger.info("[green]✓ Training complete.[/green] Viewer remains active.")
-
-        # Finalize logging
-        final_metrics = {}
-        if last_loss_result is not None:
-            final_metrics = {
-                "final/loss": last_loss_result.metrics["total_loss"],
-                "final/psnr": last_loss_result.metrics["psnr"],
-                "final/gaussians": len(self.model._means),
-            }
-        self.training_logger.finalize(final_metrics)
 
         # Save final model
         output_path = Path(self.output_cfg.output_dir)
@@ -1328,7 +1527,15 @@ if __name__ == "__main__":
         config_table.add_column("Value", style="yellow")
 
         config_table.add_row("COLMAP Path", required_cfg.colmap_path)
+        config_table.add_row("Dataset Type", required_cfg.dataset_type)
         config_table.add_row("Images Path", required_cfg.images_path)
+        if required_cfg.dataset_type == "instant-ngp":
+            config_table.add_row("Transforms Path", required_cfg.transforms_path)
+        if required_cfg.dataset_type == "matrixcity":
+            config_table.add_row("MatrixCity Blocks", str(len(required_cfg.matrixcity_paths or [])))
+            config_table.add_row("MatrixCity Paths", ", ".join(required_cfg.matrixcity_paths or []))
+            if required_cfg.matrixcity_depth_paths:
+                config_table.add_row("MatrixCity Depth Paths", ", ".join(required_cfg.matrixcity_depth_paths))
         config_table.add_row("Output Directory", output_cfg.output_dir)
         config_table.add_row("Iterations", f"{training_cfg.iterations:,}")
         config_table.add_row("Densify From", f"{densification_cfg.densify_from_iter:,}")
@@ -1378,6 +1585,15 @@ if __name__ == "__main__":
     # Train model
     try:
         result = train_pipeline(config)
+    except KeyboardInterrupt:
+        if ACTIVE_PROGRESS is not None:
+            try:
+                ACTIVE_PROGRESS.stop()
+            except Exception:
+                pass
+        if runtime_cfg.verbosity >= 1:
+            logger.info("[yellow]Training interrupted by user.[/yellow]")
+        raise
     except Exception:
         if ACTIVE_PROGRESS is not None:
             try:
