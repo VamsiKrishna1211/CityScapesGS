@@ -1,9 +1,10 @@
-import torch.nn as nn
-from gsplat import spherical_harmonics
-import torch
 import logging
-from gs_types import Parameters, GSOptimizers
-from typing import Optional, Dict, Tuple
+from typing import Dict, Optional, Tuple
+
+import torch
+import torch.nn as nn
+from gs_types import GSOptimizers, Parameters
+from gsplat import spherical_harmonics
 
 # Module-level logger
 logger = logging.getLogger("cityscape_gs.model")
@@ -12,6 +13,7 @@ logger = logging.getLogger("cityscape_gs.model")
 from dataclasses import dataclass
 
 from simple_knn._C import distCUDA2
+
 
 @dataclass
 class ViewportInfo:
@@ -377,8 +379,8 @@ class GaussianModel(nn.Module):
             A populated GaussianModel instance.
         """
         import numpy as np
-        from plyfile import PlyData
         import torch.nn as nn
+        from plyfile import PlyData
 
         plydata = PlyData.read(path)
         el = plydata.elements[0]

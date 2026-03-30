@@ -370,7 +370,7 @@ REQUIRED_GROUP = ArgGroupDef(
             flags=("--matrixcity-max-init-points",),
             dest="matrixcity_max_init_points",
             arg_type=int,
-            default=20000,
+            default=300000,
             help="Maximum number of initialization points used from MatrixCity point clouds after merge (default: 300000).",
         ),
         ArgSpec(

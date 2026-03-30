@@ -1,8 +1,15 @@
+# ruff: noqa: E402
+
+import importlib.util
 import logging
 import os
+
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Optional, Tuple
 
 
 def _prepend_env_path(var_name: str, path_value: str) -> None:
@@ -46,93 +53,63 @@ def _configure_cuda_jit_env() -> None:
 
 _configure_cuda_jit_env()
 
+import time
+
 import torch
 import torch.nn.functional as F
-from gsplat import DefaultStrategy, rasterization
+from gsplat import DefaultStrategy, rasterization  # type: ignore[import-untyped]
 from torch.utils.data import DataLoader
-from gsplat import rasterization, DefaultStrategy
-from torchmetrics.image import PeakSignalNoiseRatio, LearnedPerceptualImagePatchSimilarity
-import os
-from pathlib import Path
-import time
-import numpy as np
-import logging
-from typing import Optional, Tuple
-from dataclasses import dataclass, field
+from torchmetrics.image import (
+    LearnedPerceptualImagePatchSimilarity,
+    PeakSignalNoiseRatio,
+)
 
 try:
-    import nerfview
-    import viser
+    import nerfview  # type: ignore[import-untyped]
+    import viser  # type: ignore[import-untyped]
     VIEWER_AVAILABLE = True
 except ImportError:
     VIEWER_AVAILABLE = False
 
-try:
-    import rerun as rr
-    RERUN_AVAILABLE = True
-except ImportError:
-    RERUN_AVAILABLE = False
+RERUN_AVAILABLE = importlib.util.find_spec("rerun") is not None
 
-from rich.console import Console
-from rich.logging import RichHandler
-from rich.progress import (
-    Progress, SpinnerColumn, BarColumn, TaskProgressColumn,
-    TimeElapsedColumn, TimeRemainingColumn, TextColumn,
-)
-from rich.table import Table
-from rich.panel import Panel
-from rich import box
-
-from dataset import ColmapDataset, InstantNGPDataset, MatrixCityDataset, create_dataset, CameraData
-from model import GaussianModel, inverse_sigmoid
-from gs_types import GSOptimizers, GS_LR_Schedulers
-from utils import format_phase_description
-from viewer_sync import ViewerParamSync
-from ns_viewer import NSReplicaViewer, NSReplicaViewerConfig
 import losses
-from logger import GaussianSplattingLogger, configure_app_logger
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from concurrent.futures import ThreadPoolExecutor
-from train_args import (TrainConfig, parse_args, DepthConfig, DensificationConfig, 
-                        CheckpointConfig, ExportConfig, FloaterPreventionConfig, 
-                        LearningRateConfig, OutputConfig, RequiredConfig, RuntimeConfig, 
-                        SemanticsConfig, TensorBoardConfig, SHConfig)
-from fused_ssim import fused_ssim
+from dataset import (
+    CameraData,
+    ColmapDataset,
+    InstantNGPDataset,
+    MatrixCityDataset,
+    create_dataset,
+)
+from fused_ssim import fused_ssim  # type: ignore[import-untyped]
 from gs_types import GS_LR_Schedulers, GSOptimizers
 from logger import GaussianSplattingLogger, configure_app_logger
-from model import GaussianModel, inverse_sigmoid
+from model import GaussianModel
+from ns_viewer import NSReplicaViewer, NSReplicaViewerConfig
 from rich import box
 from rich.console import Console
-from rich.layout import Layout
-from rich.live import Live
-from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
     Progress,
     SpinnerColumn,
+    TaskID,
     TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
 from rich.table import Table
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from train_args import TrainConfig, parse_args
+from train_args import DepthConfig, FloaterPreventionConfig, TrainConfig, parse_args
 from utils import format_phase_description
 from viewer_sync import ViewerParamSync
-
-try:
-    from rerun_viewer import RerunViewer
-except ImportError:
-    pass
 
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 
-ACTIVE_PROGRESS = None
+ACTIVE_PROGRESS: Optional[Progress] = None
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +268,7 @@ class Rasterizer:
         self.packed = packed
         self.absgrad = absgrad
 
-    def render(self, cam: dict, gt_image: torch.Tensor,
+    def render(self, cam: dict[str, Any], gt_image: torch.Tensor,
                device: torch.device) -> RenderOutput:
         """Rasterize the scene for a single camera view.
 
@@ -346,8 +323,8 @@ class Rasterizer:
             alpha=alpha,
             depth_map=depth_map,
             depth_mask=depth_mask,
-            depth_mask_bchw=depth_mask.unsqueeze(0),
-            depth_map_bchw=depth_map.unsqueeze(0),
+            depth_mask_bchw=depth_mask.unsqueeze(1),
+            depth_map_bchw=depth_map.unsqueeze(1),
             render_perm=render_perm,
             gt_perm=gt_perm,
             meta=render_meta,
@@ -374,6 +351,7 @@ class LossComputer:
         self.floater_cfg = floater_cfg
         self.device = device
         self.logger = logger
+        self.scene_extent: float = 1.0
 
         # Quality metric
         self.psnr = PeakSignalNoiseRatio(data_range=(0, 1.0)).to(device)
@@ -532,7 +510,7 @@ class LossComputer:
         psnr_value = self.psnr(render_perm, gt_perm)
 
         loss = 0.8 * l1_loss + 0.2 * ssim_loss
-        if lpips_loss is not None and lpips_loss > 0.0:
+        if self.lpips is not None:
             loss = loss + self.training_cfg.lpips_loss_weight * lpips_loss
 
         metrics = {
@@ -647,8 +625,8 @@ class TrainingLogger:
         self.executor = ThreadPoolExecutor(max_workers=16)
 
         # Rich progress bar
-        self.progress = None
-        self.task_id = None
+        self.progress: Optional[Progress] = None
+        self.task_id: Optional[TaskID] = None
         global ACTIVE_PROGRESS
         if verbosity >= 1:
             self.progress = Progress(
@@ -705,6 +683,8 @@ class TrainingLogger:
 
         # Update progress bar every iteration
         if self.progress is not None:
+            if self.task_id is None:
+                raise RuntimeError("Training progress task is not initialized")
             num_gaussians = len(model._means)
             phase = ("Densification"
                      if self.densify_from <= step <= self.densify_until
@@ -859,18 +839,18 @@ class GaussianSplatTrainer:
         self.rasterizer: Optional[Rasterizer] = None
         self.loss_computer: Optional[LossComputer] = None
         self.optimizers: Optional[GSOptimizers] = None
-        self.schedulers = None
-        self.strategy = None
-        self.strategy_state = None
-        self.viewer = None
-        self.server = None
-        self.viewer_param_sync = None
-        self.rerun_viewer = None
+        self.schedulers: Optional[GS_LR_Schedulers] = None
+        self.strategy: Optional[DefaultStrategy] = None
+        self.strategy_state: Optional[dict[str, Any]] = None
+        self.viewer: Optional[Any] = None
+        self.server: Optional[Any] = None
+        self.viewer_param_sync: Optional[ViewerParamSync] = None
+        self.rerun_viewer: Optional[Any] = None
         self.start_iteration = 0
         self.scene_extent = 0.0
 
-        self._dataloader = None
-        self._dataloader_iter = None
+        self._dataloader: Optional[DataLoader] = None
+        self._dataloader_iter: Optional[Any] = None
 
     # -- setup methods ------------------------------------------------------
 
@@ -883,6 +863,9 @@ class GaussianSplatTrainer:
         self.checkpoint_dir.mkdir(exist_ok=True)
 
     def _setup_dataset(self) -> None:
+        if self.logger is None:
+            raise RuntimeError("Logger must be initialized before dataset setup")
+
         # self.dataset = ColmapDataset(
         #     self.required_cfg.colmap_path,
         #     self.required_cfg.images_path,
@@ -935,6 +918,11 @@ class GaussianSplatTrainer:
         self.scene_extent = self.dataset.scene_extent
 
     def _setup_model(self) -> None:
+        if self.logger is None:
+            raise RuntimeError("Logger must be initialized before model setup")
+        if self.dataset is None:
+            raise RuntimeError("Dataset must be initialized before model setup")
+
         checkpoint = None
         tb_resume_run_name = None
         tb_purge_step = None
@@ -991,6 +979,11 @@ class GaussianSplatTrainer:
             self.logger.info(f"[dim]Run directory: {self.tb_logger.log_dir}[/dim]")
 
     def _setup_strategy(self) -> None:
+        if self.model is None:
+            raise RuntimeError("Model must be initialized before strategy setup")
+        if self.dataset is None:
+            raise RuntimeError("Dataset must be initialized before strategy setup")
+
         dcfg = self.densification_cfg
         self.strategy = DefaultStrategy(
             prune_opa=dcfg.prune_opa,
@@ -1018,11 +1011,14 @@ class GaussianSplatTrainer:
         auto_adjusted = False
         if mss == 20:
             if self.scene_extent > 300:
-                mss = 200; auto_adjusted = True
+                mss = 200
+                auto_adjusted = True
             elif self.scene_extent > 150:
-                mss = 100; auto_adjusted = True
+                mss = 100
+                auto_adjusted = True
             elif self.scene_extent > 75:
-                mss = 50; auto_adjusted = True
+                mss = 50
+                auto_adjusted = True
         self.max_screen_size = mss
 
         # Display init info
@@ -1053,6 +1049,13 @@ class GaussianSplatTrainer:
             self.console.print()
 
     def _setup_optimizers(self) -> None:
+        if self.model is None:
+            raise RuntimeError("Model must be initialized before optimizer setup")
+        if self.strategy is None:
+            raise RuntimeError("Strategy must be initialized before optimizer setup")
+        if self.logger is None:
+            raise RuntimeError("Logger must be initialized before optimizer setup")
+
         lr = self.lr_cfg
         self.optimizers = self.model.create_optimizers(
             lr_means=lr.lr_means, lr_scales=lr.lr_scales,
@@ -1084,6 +1087,15 @@ class GaussianSplatTrainer:
 
     def _setup_components(self) -> None:
         """Initialize Rasterizer, LossComputer, TrainingLogger."""
+        if self.model is None:
+            raise RuntimeError("Model must be initialized before component setup")
+        if self.tb_logger is None:
+            raise RuntimeError("TensorBoard logger must be initialized before component setup")
+        if self.logger is None:
+            raise RuntimeError("App logger must be initialized before component setup")
+        if self.strategy is None:
+            raise RuntimeError("Strategy must be initialized before component setup")
+
         self.rasterizer = Rasterizer(
             self.model,
             self.sh_cfg,
@@ -1112,10 +1124,21 @@ class GaussianSplatTrainer:
         )
 
     def _setup_viewer(self) -> None:
+        if self.logger is None:
+            raise RuntimeError("Logger must be initialized before viewer setup")
+        if self.model is None:
+            raise RuntimeError("Model must be initialized before viewer setup")
+
         if self.viewer_cfg.rerun_viewer:
             if not RERUN_AVAILABLE:
                 self.logger.warning("[yellow]⚠ Warning:[/yellow] rerun-sdk not available. Ignoring --rerun-viewer flag.")
             else:
+                try:
+                    from rerun_viewer import RerunViewer
+                except ImportError:
+                    self.logger.warning("[yellow]⚠ Warning:[/yellow] rerun_viewer module not available. Ignoring --rerun-viewer flag.")
+                    return
+
                 self.rerun_viewer = RerunViewer(
                     model=self.model,
                     disable_sh_rendering=self.sh_cfg.disable_sh_rendering,
@@ -1130,6 +1153,8 @@ class GaussianSplatTrainer:
         if not VIEWER_AVAILABLE:
             self.logger.warning("[yellow]⚠ Warning:[/yellow] nerfview not available.")
             return
+        if self.dataset is None:
+            raise RuntimeError("Dataset must be initialized before viewer setup")
         self.viewer_param_sync = ViewerParamSync(
             model=self.model, device=self.device,
             disable_sh_rendering=self.sh_cfg.disable_sh_rendering,
@@ -1163,6 +1188,11 @@ class GaussianSplatTrainer:
             )
 
     def _setup_dataloader(self) -> DataLoader:
+        if self.dataset is None:
+            raise RuntimeError("Dataset must be initialized before creating DataLoader")
+        if self.logger is None:
+            raise RuntimeError("Logger must be initialized before creating DataLoader")
+
         import multiprocessing
         max_workers = multiprocessing.cpu_count()
         num_workers = max(0, min(self.training_cfg.num_workers, max_workers))
@@ -1188,6 +1218,9 @@ class GaussianSplatTrainer:
         """Log all hyperparameters to TensorBoard."""
         if not self.tensorboard_cfg.tensorboard:
             return
+        if self.tb_logger is None:
+            raise RuntimeError("TensorBoard logger must be initialized before logging hyperparameters")
+
         dcfg = self.densification_cfg
         hparams = {
             "iterations": self.training_cfg.iterations,
@@ -1241,6 +1274,9 @@ class GaussianSplatTrainer:
     # -- per-step helpers ---------------------------------------------------
 
     def _next_batch(self) -> Tuple:
+        if self._dataloader_iter is None or self._dataloader is None:
+            raise RuntimeError("DataLoader is not initialized")
+
         try:
             return next(self._dataloader_iter)
         except StopIteration:
@@ -1249,6 +1285,23 @@ class GaussianSplatTrainer:
 
     def _train_step(self, step: int) -> LossResult:
         """Execute a single training iteration."""
+        if self._dataloader_iter is None:
+            raise RuntimeError("DataLoader iterator is not initialized")
+        if self.model is None:
+            raise RuntimeError("Model is not initialized")
+        if self.rasterizer is None:
+            raise RuntimeError("Rasterizer is not initialized")
+        if self.strategy is None or self.strategy_state is None:
+            raise RuntimeError("Strategy is not initialized")
+        if self.optimizers is None:
+            raise RuntimeError("Optimizers are not initialized")
+        if self.schedulers is None:
+            raise RuntimeError("Schedulers are not initialized")
+        if self.training_logger is None:
+            raise RuntimeError("Training logger is not initialized")
+        if self.logger is None:
+            raise RuntimeError("Logger is not initialized")
+
         cam, gt_image, depth_tensor = self._next_batch()
         torch.cuda.synchronize()
 
@@ -1368,6 +1421,19 @@ class GaussianSplatTrainer:
         return loss_result
 
     def _save_checkpoint(self, step: int, loss: float) -> None:
+        if self.model is None:
+            raise RuntimeError("Model is not initialized")
+        if self.optimizers is None:
+            raise RuntimeError("Optimizers are not initialized")
+        if self.logger is None:
+            raise RuntimeError("Logger is not initialized")
+
+        tb_run_name = None
+        if self.tensorboard_cfg.tensorboard:
+            if self.tb_logger is None:
+                raise RuntimeError("TensorBoard logger is not initialized")
+            tb_run_name = self.tb_logger.run_name
+
         checkpoint_path = self.checkpoint_dir / f"checkpoint_{step}.pt"
         torch.save({
             "iteration": step,
@@ -1378,9 +1444,7 @@ class GaussianSplatTrainer:
                 if opt is not None
             },
             "loss": loss,
-            "tensorboard_run_name": (
-                self.tb_logger.run_name if self.tensorboard_cfg.tensorboard else None
-            ),
+            "tensorboard_run_name": tb_run_name,
         }, checkpoint_path)
         if self.VERBOSITY >= 1:
             self.logger.info(f"[green]💾 Checkpoint saved:[/green] [dim]{checkpoint_path.name}[/dim]")
@@ -1404,6 +1468,13 @@ class GaussianSplatTrainer:
         self._setup_dataloader()
         self._log_hyperparameters()
         self._log_initial_pointcloud()
+
+        if self.model is None:
+            raise RuntimeError("Model failed to initialize")
+        if self.training_logger is None:
+            raise RuntimeError("Training logger failed to initialize")
+        if self.logger is None:
+            raise RuntimeError("Logger failed to initialize")
 
         last_loss_result = None
         training_completed = False
@@ -1449,7 +1520,7 @@ class GaussianSplatTrainer:
             "scene_extent": self.scene_extent,
             "num_gaussians": len(self.model._means),
             "tensorboard_run_name": (
-                self.tb_logger.run_name if self.tensorboard_cfg.tensorboard else None
+                self.tb_logger.run_name if (self.tensorboard_cfg.tensorboard and self.tb_logger is not None) else None
             ),
         }, final_path)
 
