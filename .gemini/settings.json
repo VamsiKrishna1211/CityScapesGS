@@ -1,0 +1,10 @@
+{
+    "general": {
+        "plan": {
+            "directory": ".gemini/plans"
+        }
+    },
+    "ui": {
+        "inlineThinkingMode": "full"
+    }
+}
