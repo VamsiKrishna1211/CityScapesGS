@@ -181,6 +181,7 @@ class GaussianSplattingLogger:
                    silog_loss: Optional[float] = None,
                    ordinal_depth_loss: Optional[float] = None,
                    affine_aligned_gradient_matching_loss: Optional[float] = None,
+                   metric_depth_normal_loss: Optional[float] = None,
                    sam_loss: Optional[float] = None,
                    semantic_loss: Optional[float] = None,
                    step: int = 0):
@@ -203,6 +204,7 @@ class GaussianSplattingLogger:
             silog_loss: Optional SI-Log depth loss
             ordinal_depth_loss: Optional ordinal depth ranking loss
             affine_aligned_gradient_matching_loss: Optional affine-aligned gradient matching loss
+            metric_depth_normal_loss: Optional metric depth normal loss
             sam_loss: Optional sharpness-aware minimization loss
             semantic_loss: Optional semantic reconstruction loss
             step: Current training step
@@ -237,6 +239,8 @@ class GaussianSplattingLogger:
             self.writer.add_scalar('Loss/OrdinalDepth', ordinal_depth_loss, step)
         if affine_aligned_gradient_matching_loss is not None and affine_aligned_gradient_matching_loss > 0:
             self.writer.add_scalar('Loss/AffineAlignedGradientMatching', affine_aligned_gradient_matching_loss, step)
+        if metric_depth_normal_loss is not None and metric_depth_normal_loss > 0:
+            self.writer.add_scalar('Loss/MetricDepthNormal', metric_depth_normal_loss, step)
         if sam_loss is not None and sam_loss > 0:
             self.writer.add_scalar('Loss/SAM', sam_loss, step)
         if semantic_loss is not None and semantic_loss > 0:

@@ -269,13 +269,14 @@ class Rasterizer:
         self.absgrad = absgrad
 
     def render(self, cam: dict[str, Any], gt_image: torch.Tensor,
-               device: torch.device) -> RenderOutput:
+               device: torch.device, lod: Optional[int] = None) -> RenderOutput:
         """Rasterize the scene for a single camera view.
 
         Args:
             cam: Camera dict with R, T, fx, fy, cx, cy, width, height.
             gt_image: Ground-truth image [B, H, W, C] (already on device).
             device: Target device.
+            lod: Optional LoD level to render.
 
         Returns:
             RenderOutput with all tensors needed for loss and logging.
@@ -283,13 +284,32 @@ class Rasterizer:
         viewmat = _build_viewmat(cam, device)
         K = _build_intrinsics(cam, device)
 
+        # Get LoD-specific parameters if requested
+        if lod is not None:
+            params = self.model.get_lod_params(lod)
+            means = params.means
+            scales = params.scales
+            quats = params.quats
+            opacities = params.opacities
+            # SH logic
+            if not self.sh_cfg.disable_sh_rendering:
+                colors = torch.cat([params.features_dc, params.features_rest], dim=1)
+            else:
+                colors = params.features_dc.squeeze(1)
+        else:
+            means = self.model.means
+            scales = self.model.scales
+            quats = self.model.quats
+            opacities = self.model.opacities
+            colors = (self.model.sh if not self.sh_cfg.disable_sh_rendering
+                    else self.model._features_dc.squeeze(1))
+
         render_output, render_alpha, render_meta = rasterization(
-            means=self.model.means,
-            quats=self.model.quats,
-            scales=self.model.scales,
-            opacities=self.model.opacities.squeeze(-1),
-            colors=(self.model.sh if not self.sh_cfg.disable_sh_rendering
-                    else self.model._features_dc.squeeze(1)),
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities.squeeze(-1),
+            colors=colors,
             viewmats=viewmat,
             Ks=K[None, ...],
             width=cam["width"],
@@ -428,7 +448,7 @@ class LossComputer:
             ("affine_aligned_gradient_matching_loss",
              dcfg.affine_aligned_gradient_matching_loss_weight,
              self.affine_aligned_gradient_matching_loss),
-            ("metric-depth-normal-loss", dcfg.metric_depth_normal_loss_weight,
+            ("metric_depth_normal_loss", dcfg.metric_depth_normal_loss_weight,
              self.metric_depth_normal_loss)
         ]
 
@@ -1181,6 +1201,20 @@ class GaussianSplatTrainer:
                 dataset=self.dataset,
                 config=replica_cfg,
             )
+        
+        # Add LoD slider if levels > 1
+        if len(self.model.lod_offsets) > 1:
+            self.lod_slider = self.server.gui.add_slider(
+                "Display LoD",
+                min=0,
+                max=len(self.model.lod_offsets) - 1,
+                step=1,
+                initial_value=0,
+            )
+            @self.lod_slider.on_update
+            def _(_) -> None:
+                self.viewer.render_tab_state.lod = self.lod_slider.value
+
         if self.VERBOSITY >= 1:
             self.logger.info(
                 f"[green]📺 Viewer started:[/green] http://localhost:{self.viewer_cfg.viewer_port} "
@@ -1513,12 +1547,23 @@ class GaussianSplatTrainer:
 
         # Save final model
         output_path = Path(self.output_cfg.output_dir)
+        
+        # Compute LoD levels if requested before saving
+        if self.config.lod.num_levels > 1:
+            self.logger.info(f"[cyan]🏔️ Computing {self.config.lod.num_levels} LoD levels...[/cyan]")
+            self.model.compute_lods(
+                num_levels=self.config.lod.num_levels,
+                factor=self.config.lod.reduction_factor,
+                optimizers=self.optimizers
+            )
+
         final_path = output_path / "model_final.pt"
         torch.save({
             "iteration": self.training_cfg.iterations,
             "model_state_dict": self.model.state_dict(),
             "scene_extent": self.scene_extent,
             "num_gaussians": len(self.model._means),
+            "lod_offsets": self.model.lod_offsets,
             "tensorboard_run_name": (
                 self.tb_logger.run_name if (self.tensorboard_cfg.tensorboard and self.tb_logger is not None) else None
             ),
@@ -1646,6 +1691,10 @@ if __name__ == "__main__":
             floater_techniques.append(f"Opacity Entropy Reg (λ={floater_cfg.opacity_entropy_reg_weight})")
         if floater_techniques:
             config_table.add_row("Floater Prevention", ", ".join(floater_techniques))
+
+        if config.lod.num_levels > 1:
+            lod_info = f"{config.lod.num_levels} levels (factor {config.lod.reduction_factor})"
+            config_table.add_row("Level of Detail", lod_info)
 
         console.print(config_table)
         console.print()

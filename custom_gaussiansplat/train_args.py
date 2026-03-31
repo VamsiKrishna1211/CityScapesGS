@@ -151,6 +151,19 @@ class TensorBoardConfig:
 
 
 @dataclass
+class LODConfig:
+    num_levels: int
+    reduction_factor: int
+
+
+@dataclass
+@dataclass
+class LODConfig:
+    num_levels: int
+    reduction_factor: int
+
+
+@dataclass
 class TrainConfig:
     raw: argparse.Namespace
     required: RequiredConfig
@@ -158,6 +171,7 @@ class TrainConfig:
     training: TrainingConfig
     densification: DensificationConfig
     floater_prevention: FloaterPreventionConfig
+    lod: LODConfig
     sh: SHConfig
     semantics: SemanticsConfig
     depth: DepthConfig
@@ -167,6 +181,7 @@ class TrainConfig:
     checkpoint: CheckpointConfig
     viewer: ViewerConfig
     tensorboard: TensorBoardConfig
+
 
 
 T = TypeVar("T")
@@ -571,6 +586,16 @@ VIEWER_GROUP = ArgGroupDef(
     ),
 )
 
+LOD_GROUP = ArgGroupDef(
+    key="lod",
+    title="Level of Detail (LoD) Options",
+    config_cls=LODConfig,
+    specs=(
+        ArgSpec(flags=("--num-lod-levels",), dest="num_levels", arg_type=int, default=1, help="Number of Level of Detail (LoD) levels to compute (1 = all, >1 enables LoD)"),
+        ArgSpec(flags=("--lod-reduction-factor",), dest="reduction_factor", arg_type=int, default=4, help="Reduction factor between LoD levels (e.g., 4 means 4x fewer Gaussians per level)"),
+    ),
+)
+
 TENSORBOARD_GROUP = ArgGroupDef(
     key="tensorboard",
     title="TensorBoard Options",
@@ -589,6 +614,7 @@ ARG_GROUP_DEFS: Tuple[ArgGroupDef[Any], ...] = (
     TRAINING_GROUP,
     DENSIFICATION_GROUP,
     FLOATER_PREVENTION_GROUP,
+    LOD_GROUP,
     SH_GROUP,
     SEMANTICS_GROUP,
     DEPTH_GROUP,
@@ -639,6 +665,7 @@ def parse_args() -> TrainConfig:
         training=_build_group_config(flat_args, TRAINING_GROUP),
         densification=_build_group_config(flat_args, DENSIFICATION_GROUP),
         floater_prevention=_build_group_config(flat_args, FLOATER_PREVENTION_GROUP),
+        lod=_build_group_config(flat_args, LOD_GROUP),
         sh=_build_group_config(flat_args, SH_GROUP),
         semantics=_build_group_config(flat_args, SEMANTICS_GROUP),
         depth=_build_group_config(flat_args, DEPTH_GROUP),

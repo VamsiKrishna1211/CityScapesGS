@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List, Any
 
 import numpy as np
 import torch
@@ -16,6 +16,7 @@ class _ViewerRenderCache:
     opacities: torch.Tensor
     colors: torch.Tensor
     sh_degree: Optional[int]
+    lod_offsets: List[int]
 
 
 class ViewerParamSync:
@@ -34,6 +35,7 @@ class ViewerParamSync:
         self.refresh_interval = max(1, int(refresh_interval))
         self._cache: Optional[_ViewerRenderCache] = None
         self._last_refresh_step = -1
+        self.lod_slider: Optional[Any] = None # Optional viser slider for LoD control
         self.refresh(step=0, force=True)
 
     @torch.no_grad()
@@ -54,6 +56,7 @@ class ViewerParamSync:
             opacities=self.model.opacities.squeeze(-1).detach(),
             colors=colors.detach(),
             sh_degree=None if self.disable_sh_rendering else self.model.sh_degree,
+            lod_offsets=getattr(self.model, "lod_offsets", [len(self.model.means)]),
         )
         self._last_refresh_step = step
 
@@ -78,13 +81,29 @@ class ViewerParamSync:
         K = torch.from_numpy(camera_state.get_K((width, height))).float().to(self.device)
         viewmat = torch.linalg.inv(c2w)
 
+        # Handle LoD slicing
+        # Priority: 1. lod_slider (viser GUI), 2. render_tab_state.lod, 3. Default (0)
+        lod = 0
+        if self.lod_slider is not None:
+            lod = int(self.lod_slider.value)
+        else:
+            lod = getattr(render_tab_state, "lod", 0)
+        
+        offsets = self._cache.lod_offsets
+        if lod < 0 or lod >= len(offsets):
+            end_idx = offsets[-1] # All
+        else:
+            # Level 0 = Finest (last offset), Level N = Coarsest (first offset)
+            idx = len(offsets) - 1 - lod
+            end_idx = offsets[idx]
+
         try:
             render, _, _ = rasterization(
-                means=self._cache.means,
-                quats=self._cache.quats,
-                scales=self._cache.scales,
-                opacities=self._cache.opacities,
-                colors=self._cache.colors,
+                means=self._cache.means[:end_idx],
+                quats=self._cache.quats[:end_idx],
+                scales=self._cache.scales[:end_idx],
+                opacities=self._cache.opacities[:end_idx],
+                colors=self._cache.colors[:end_idx],
                 viewmats=viewmat[None, ...],
                 Ks=K[None, ...],
                 width=width,

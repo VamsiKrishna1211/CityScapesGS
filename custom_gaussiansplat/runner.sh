@@ -178,3 +178,35 @@ python custom_gaussiansplat/train.py \
     --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_1_depth --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_2_depth \
     --matrixcity-pointcloud-path $BASE_PATH/small_city_pointcloud/point_cloud/aerial/Block_A.ply \
     --metric-depth-normal-loss --metric-depth-normal-loss-weight 0.1
+
+python custom_gaussiansplat/train.py \
+  --output-dir $BASE_PATH/cust_gs_outputs \
+  --log-interval 10 \
+  --densify-from-iter 500 \
+  --densify-interval 100 \
+  --densify-until-iter 35000 \
+  --tb-image-interval 100 \
+  --save-interval 10000 \
+  --iterations 70000 \
+  --sh-degree 3 \
+  --lr-means 0.00002 \
+  --lr-quats 0.0002 \
+  --lr-scales 0.001 \
+  --lr-sh 0.002 \
+  --dataset-type "matrixcity" \
+  --matrixcity-path $BASE_PATH/small_city/aerial/train/block_1 --matrixcity-path $BASE_PATH/small_city/aerial/train/block_2 \
+  --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_1_depth --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_2_depth \
+  --metric-depth-normal-loss --metric-depth-normal-loss-weight 0.1 \
+  --enable-scale-reg --scale-reg-weight 0.01 \
+  --enable-opacity-reg --opacity-reg-weight 0.0005 \
+  --verbosity 1 \
+  --grad-threshold 0.0002 \
+  --grow-grad2d 0.0002 \
+  --grow-scale3d 0.01 \
+  --grow-scale2d 0.05 \
+  --prune-scale3d 0.1 \
+  --prune-scale2d 0.15 \
+  --viewer \
+  --tensorboard \
+  --num-lod-levels 3 \
+  --lod-reduction-factor 4
