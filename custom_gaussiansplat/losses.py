@@ -1442,28 +1442,37 @@ class MetricNormalLoss(nn.Module):
         self.cached_u = None
         self.cached_v = None
 
-    def _get_coordinate_grid(self, H: int, W: int, device: torch.device):
+    def _get_coordinate_grid(self, H: int, W: int, device: torch.device, dtype: torch.dtype):
         """Fetches or generates the pixel coordinate grid."""
         if self.cached_grid_shape != (H, W):
             v, u = torch.meshgrid(
-                torch.arange(H, dtype=torch.float32, device=device),
-                torch.arange(W, dtype=torch.float32, device=device),
+                torch.arange(H, dtype=dtype, device=device),
+                torch.arange(W, dtype=dtype, device=device),
                 indexing='ij'
             )
             self.cached_u = u.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
             self.cached_v = v.unsqueeze(0).unsqueeze(0)
             self.cached_grid_shape = (H, W)
+        # Ensure cached grids match the requested dtype
+        if self.cached_u.dtype != dtype:
+            self.cached_u = self.cached_u.to(dtype)
+            self.cached_v = self.cached_v.to(dtype)
         return self.cached_u, self.cached_v
 
     def depth_to_normals(self, depth: torch.Tensor, fx: float, fy: float, cx: float, cy: float) -> torch.Tensor:
         """Unprojects metric depth to 3D points and extracts unit normal vectors."""
         logger.debug(f"Depth Tensor Shape: {depth.shape}, Camera Intrinsics: fx={fx}, fy={fy}, cx={cx}, cy={cy}")
         B, C, H, W = depth.shape
-        u, v = self._get_coordinate_grid(H, W, depth.device)
+        u, v = self._get_coordinate_grid(H, W, depth.device, depth.dtype)
 
-        # Unproject to 3D Points
-        X = (u - cx) * depth / fx
-        Y = (v - cy) * depth / fy
+        # Unproject to 3D Points (ensure camera params match depth dtype)
+        fx_t = torch.tensor(fx, dtype=depth.dtype, device=depth.device)
+        fy_t = torch.tensor(fy, dtype=depth.dtype, device=depth.device)
+        cx_t = torch.tensor(cx, dtype=depth.dtype, device=depth.device)
+        cy_t = torch.tensor(cy, dtype=depth.dtype, device=depth.device)
+        
+        X = (u - cx_t) * depth / fx_t
+        Y = (v - cy_t) * depth / fy_t
         points3D = torch.cat([X, Y, depth], dim=1) # [1, 3, H, W]
 
         # Calculate Tangent Vectors via Sobel

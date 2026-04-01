@@ -164,6 +164,14 @@ class SemanticTrainer:
         self.tb_logger = tb_logger
         self.global_step_offset = global_step_offset
 
+        # Low VRAM optimizations: Initialize gradient scaler for mixed precision training
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.train_cfg.use_low_vram)
+        if self.train_cfg.use_low_vram and logger is not None:
+            logger.info(
+                "[yellow]⚡ Low VRAM mode enabled for semantic training:[/yellow] "
+                "Using mixed precision (FP16/AMP) and gradient scaling"
+            )
+
         # Lazily initialised in run()
         self._provider = None
         self._dataloader_iter = None
@@ -250,39 +258,47 @@ class SemanticTrainer:
         if gt_image.dim() == 3:
             gt_image = gt_image.unsqueeze(0)
 
-        # Render semantic features and RGB
-        rgb_pred, semantic_pred = self._rasterizer.render(cam, device=self.device)
+        # Forward pass with optional mixed precision
+        with torch.cuda.amp.autocast(enabled=self.train_cfg.use_low_vram):
+            # Render semantic features and RGB
+            rgb_pred, semantic_pred = self._rasterizer.render(cam, device=self.device)
 
-        # Obtain ground-truth target
-        semantic_target = self._provider.get_target(
-            image_id=image_id,
-            gt_image=gt_image[0].detach(),
-            dataset_semantic_tensor=semantic_tensor,
-            device=self.device,
-        )
-        semantic_target = _as_hwc(semantic_target, expected_channels=self.semantics_cfg.semantics_dim)
-
-        # Spatial resolution matching
-        if semantic_target.shape[:2] != semantic_pred.shape[:2]:
-            pred_nchw = semantic_pred.permute(2, 0, 1).unsqueeze(0)
-            pred_nchw = F.interpolate(
-                pred_nchw,
-                size=(semantic_target.shape[0], semantic_target.shape[1]),
-                mode="bilinear",
-                align_corners=False,
+            # Obtain ground-truth target
+            semantic_target = self._provider.get_target(
+                image_id=image_id,
+                gt_image=gt_image[0].detach(),
+                dataset_semantic_tensor=semantic_tensor,
+                device=self.device,
             )
-            semantic_pred = pred_nchw.squeeze(0).permute(1, 2, 0)
+            semantic_target = _as_hwc(semantic_target, expected_channels=self.semantics_cfg.semantics_dim)
 
-        # Loss computation
-        total_loss, semantic_loss = self._compute_loss(semantic_pred, semantic_target)
+            # Spatial resolution matching
+            if semantic_target.shape[:2] != semantic_pred.shape[:2]:
+                pred_nchw = semantic_pred.permute(2, 0, 1).unsqueeze(0)
+                pred_nchw = F.interpolate(
+                    pred_nchw,
+                    size=(semantic_target.shape[0], semantic_target.shape[1]),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                semantic_pred = pred_nchw.squeeze(0).permute(1, 2, 0)
 
+            # Loss computation
+            total_loss, semantic_loss = self._compute_loss(semantic_pred, semantic_target)
+
+        # Validation (outside autocast for accurate checking)
         if not total_loss.isfinite():
             raise RuntimeError(f"Semantic fine-tuning loss is invalid: {total_loss.item()}")
 
-        # Backward + update
+        # Backward + update with gradient scaling
         self._optimizer.zero_grad(set_to_none=True)
-        total_loss.backward()
-        self._optimizer.step()
+        if self.train_cfg.use_low_vram:
+            self.scaler.scale(total_loss).backward()
+            self.scaler.step(self._optimizer)
+            self.scaler.update()
+        else:
+            total_loss.backward()
+            self._optimizer.step()
 
         return {
             "total_loss": float(total_loss.item()),

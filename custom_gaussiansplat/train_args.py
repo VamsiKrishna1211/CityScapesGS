@@ -33,7 +33,9 @@ class TrainingConfig:
     preload: bool
     enable_lpips_loss: bool
     lpips_loss_weight: float
+    use_low_vram: bool
     lpips_model: str = "vgg"  # Could be made configurable if desired, but VGG is a good default for perceptual similarity
+
 
 
 @dataclass
@@ -90,17 +92,22 @@ class DepthConfig:
     depth_loss_weight: float
     depth_loss_start_iter: int
     sam_loss_weight: float
+    enable_affine_invariant_depth_loss: bool
     affine_invariant_depth_loss_weight: float
+    enable_pearson_correlation_loss: bool
     pearson_correlation_loss_weight: float
+    enable_silog_loss: bool
     silog_loss_weight: float
+    enable_ordinal_depth_loss: bool
     ordinal_depth_loss_weight: float
+    enable_affine_aligned_gradient_matching_loss: bool
     affine_aligned_gradient_matching_loss_weight: float
     enable_depth_smoothness_loss: bool
     depth_smoothness_start_alpha: float
     depth_smoothness_end_alpha: float
     depth_smoothness_max_steps: int # If not used, then it will default to total iterations
     depth_smoothness_loss_weight: float
-    metric_depth_normal_loss: bool
+    enable_metric_depth_normal_loss: bool
     metric_depth_normal_loss_weight: float
 
 
@@ -430,6 +437,7 @@ TRAINING_GROUP = ArgGroupDef(
         ArgSpec(flags=("--log-interval",), dest="log_interval", arg_type=int, default=1, help="Log progress every N iterations"),
         ArgSpec(flags=("--num-workers",), dest="num_workers", arg_type=int, default=0, help="Number of worker threads for data loading"),
         ArgSpec(flags=("--preload",), dest="preload", action="store_true", help="Preload all images into RAM before training (can speed up training but requires more memory)"),
+        ArgSpec(flags=("--use-low-vram",), dest="use_low_vram", action="store_true", default=False, help="Enable low VRAM optimizations: mixed precision training (FP16/AMP), aggressive cache clearing, and gradient scaling. Reduces memory usage by ~30-40%% with minimal impact on quality. Consider disabling --enable-lpips-loss for additional savings."),
         ArgSpec(flags=("--enable-lpips-loss",), dest="enable_lpips_loss", action="store_true", help="Enable LPIPS loss for perceptual similarity (requires additional dependencies and GPU memory)"),
         ArgSpec(flags=("--lpips-loss-weight",), dest="lpips_loss_weight", arg_type=float, default=0.2, help="Weight for LPIPS loss (0.01-0.4 recommended if enabled), default: 0.2"),
         ArgSpec(flags=("--lpips-model",), dest="lpips_model", arg_type=str, default="vgg", choices=("vgg", "alex", "squeeze"), help="Model to use for LPIPS loss (default: vgg)"),
@@ -511,17 +519,22 @@ DEPTH_GROUP = ArgGroupDef(
         ArgSpec(flags=("--depth-loss-weight",), dest="depth_loss_weight", arg_type=float, default=0.0, help="Weight for depth loss (0.05-0.2 recommended)"),
         ArgSpec(flags=("--depth-loss-start-iter",), dest="depth_loss_start_iter", arg_type=int, default=1000, help="Start applying depth loss after this many iterations"),
         ArgSpec(flags=("--sam-loss-weight",), dest="sam_loss_weight", arg_type=float, default=0.0, help="Weight for sharpness-aware minimization loss in gradient space (0.0 disables)"),
+        ArgSpec(flags=("--enable-affine-invariant-depth-loss",), dest="enable_affine_invariant_depth_loss", action="store_true", help="Enable affine-invariant depth loss"),
         ArgSpec(flags=("--affine-invariant-depth-loss-weight",), dest="affine_invariant_depth_loss_weight", arg_type=float, default=0.0, help="Weight for AffineInvariantDepthLoss (0.0 disables)"),
+        ArgSpec(flags=("--enable-pearson-correlation-loss",), dest="enable_pearson_correlation_loss", action="store_true", help="Enable Pearson correlation depth loss"),
         ArgSpec(flags=("--pearson-correlation-loss-weight",), dest="pearson_correlation_loss_weight", arg_type=float, default=0.0, help="Weight for PearsonCorrelationLoss module (0.0 disables)"),
+        ArgSpec(flags=("--enable-silog-loss",), dest="enable_silog_loss", action="store_true", help="Enable scale-invariant log depth loss"),
         ArgSpec(flags=("--silog-loss-weight",), dest="silog_loss_weight", arg_type=float, default=0.0, help="Weight for SILogLoss (0.0 disables)"),
+        ArgSpec(flags=("--enable-ordinal-depth-loss",), dest="enable_ordinal_depth_loss", action="store_true", help="Enable ordinal depth ranking loss"),
         ArgSpec(flags=("--ordinal-depth-loss-weight",), dest="ordinal_depth_loss_weight", arg_type=float, default=0.0, help="Weight for OrdinalDepthLoss (0.0 disables)"),
+        ArgSpec(flags=("--enable-affine-aligned-gradient-matching-loss",), dest="enable_affine_aligned_gradient_matching_loss", action="store_true", help="Enable affine-aligned gradient matching loss"),
         ArgSpec(flags=("--affine-aligned-gradient-matching-loss-weight",), dest="affine_aligned_gradient_matching_loss_weight", arg_type=float, default=0.0, help="Weight for AffineAlignedGradientMatchingLoss (0.0 disables)"),
         ArgSpec(flags=("--enable-depth-smoothness-loss",), dest="enable_depth_smoothness_loss", action="store_true", help="Enable edge-aware depth smoothness loss to regularize depth maps and reduce noise"),
         ArgSpec(flags=("--depth-smoothness-start-alpha",), dest="depth_smoothness_start_alpha", arg_type=float, default=0.5, help="Starting alpha value for edge-aware depth smoothness loss (lower = more edge-sensitive)"),
         ArgSpec(flags=("--depth-smoothness-end-alpha",), dest="depth_smoothness_end_alpha", arg_type=float, default=2.5, help="Ending alpha value for edge-aware depth smoothness loss (higher = less edge-sensitive)"),
         ArgSpec(flags=("--depth-smoothness-max-steps",), dest="depth_smoothness_max_steps", arg_type=int, default=None, help="Number of steps over which to schedule alpha for depth smoothness loss (defaults to total iterations if not set)"),
         ArgSpec(flags=("--depth-smoothness-loss-weight",), dest="depth_smoothness_loss_weight", arg_type=float, default=0.0, help="Weight for depth smoothness loss (0.01-0.1 recommended)"),
-        ArgSpec(flags=("--metric-depth-normal-loss",), dest="metric_depth_normal_loss", action="store_true", help="Enable metric depth normal loss"),
+        ArgSpec(flags=("--enable-metric-depth-normal-loss",), dest="enable_metric_depth_normal_loss", action="store_true", help="Enable metric depth normal loss"),
         ArgSpec(flags=("--metric-depth-normal-loss-weight",), dest="metric_depth_normal_loss_weight", arg_type=float, default=0.1, help="Weight for metric depth normal loss (0.01-0.1 recommended)"),
     ),
 )

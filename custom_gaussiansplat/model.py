@@ -26,6 +26,8 @@ def inverse_sigmoid(x):
     return torch.log(x / (1 - x))
 
 class GaussianModel(nn.Module):
+    SH_C0 = 0.28209479177387814
+
     def __init__(self, init_points: torch.Tensor, 
                  init_colors: torch.Tensor, 
                  sh_degree=3,
@@ -101,6 +103,16 @@ class GaussianModel(nn.Module):
     
     @property
     def sh(self): return torch.cat([self._features_dc, self._features_rest], dim=1)
+
+    @staticmethod
+    def sh_dc_to_rgb(features_dc: torch.Tensor) -> torch.Tensor:
+        """Convert SH DC coefficient(s) to RGB space used by non-SH rendering."""
+        return features_dc * GaussianModel.SH_C0 + 0.5
+
+    @property
+    def dc_rgb(self) -> torch.Tensor:
+        """Return per-Gaussian RGB from stored SH DC coefficients."""
+        return self.sh_dc_to_rgb(self._features_dc)
 
     @property
     def semantics(self):

@@ -198,6 +198,27 @@ def _prepare_depth_tensor(
     return depth_tensor
 
 
+def _optimizer_has_any_grad(optimizer: torch.optim.Optimizer) -> bool:
+    """Return True when at least one parameter in this optimizer has a gradient.
+
+    Fast path: most optimizers in this codebase own a single large tensor
+    (for example means/scales/quats/opacities/features). In that case we do
+    a single grad check and avoid iterating parameter lists.
+    """
+    groups = optimizer.param_groups
+    if len(groups) == 1:
+        params = groups[0].get("params", [])
+        if len(params) == 1:
+            return params[0].grad is not None
+
+    for group in groups:
+        params = group.get("params", [])
+        for param in params:
+            if param.grad is not None:
+                return True
+    return False
+
+
 def setup_logger(verbosity: int, output_dir: Path) -> logging.Logger:
     """Setup logging with RichHandler.
 
@@ -284,25 +305,20 @@ class Rasterizer:
         viewmat = _build_viewmat(cam, device)
         K = _build_intrinsics(cam, device)
 
-        # Get LoD-specific parameters if requested
-        if lod is not None:
-            params = self.model.get_lod_params(lod)
-            means = params.means
-            scales = params.scales
-            quats = params.quats
-            opacities = params.opacities
-            # SH logic
-            if not self.sh_cfg.disable_sh_rendering:
-                colors = torch.cat([params.features_dc, params.features_rest], dim=1)
-            else:
-                colors = params.features_dc.squeeze(1)
+        # Always resolve parameters through LoD access.
+        # Even when lod is None, this keeps render-time behavior aligned with
+        # future LoD/parameter logic (scale compensation, slicing semantics,
+        # and additional per-LoD feature branches).
+        params = self.model.get_lod_params(lod)
+        means = params.means
+        scales = params.scales
+        quats = params.quats
+        opacities = params.opacities
+
+        if not self.sh_cfg.disable_sh_rendering:
+            colors = torch.cat([params.features_dc, params.features_rest], dim=1)
         else:
-            means = self.model.means
-            scales = self.model.scales
-            quats = self.model.quats
-            opacities = self.model.opacities
-            colors = (self.model.sh if not self.sh_cfg.disable_sh_rendering
-                    else self.model._features_dc.squeeze(1))
+            colors = self.model.sh_dc_to_rgb(params.features_dc).squeeze(1)
 
         render_output, render_alpha, render_meta = rasterization(
             means=means,
@@ -429,7 +445,8 @@ class LossComputer:
             (accumulated_loss, metrics_dict)
         """
         dcfg = self.depth_cfg
-        acc = torch.tensor(0.0, device=self.device)
+        # Use zeros_like to inherit dtype from render output (important for mixed precision)
+        acc = torch.zeros(1, device=self.device, dtype=depth_map_bchw.dtype).squeeze()
         m: dict = {}
 
         if depth_tensor is None:
@@ -438,22 +455,22 @@ class LossComputer:
         depth_tensor_bchw = depth_tensor.unsqueeze(0).unsqueeze(1).to(self.device)
 
         depth_loss_items = [
-            ("affine_invariant_depth_loss", dcfg.affine_invariant_depth_loss_weight,
+            ("affine_invariant_depth_loss", dcfg.enable_affine_invariant_depth_loss, dcfg.affine_invariant_depth_loss_weight,
              self.affine_invariant_depth_loss),
-            ("pearson_correlation_loss", dcfg.pearson_correlation_loss_weight,
+            ("pearson_correlation_loss", dcfg.enable_pearson_correlation_loss, dcfg.pearson_correlation_loss_weight,
              self.pearson_correlation_loss),
-            ("silog_loss", dcfg.silog_loss_weight, self.silog_depth_loss),
-            ("ordinal_depth_loss", dcfg.ordinal_depth_loss_weight,
+            ("silog_loss", dcfg.enable_silog_loss, dcfg.silog_loss_weight, self.silog_depth_loss),
+            ("ordinal_depth_loss", dcfg.enable_ordinal_depth_loss, dcfg.ordinal_depth_loss_weight,
              self.ordinal_depth_loss),
-            ("affine_aligned_gradient_matching_loss",
+            ("affine_aligned_gradient_matching_loss", dcfg.enable_affine_aligned_gradient_matching_loss,
              dcfg.affine_aligned_gradient_matching_loss_weight,
              self.affine_aligned_gradient_matching_loss),
-            ("metric_depth_normal_loss", dcfg.metric_depth_normal_loss_weight,
+            ("metric_depth_normal_loss", dcfg.enable_metric_depth_normal_loss, dcfg.metric_depth_normal_loss_weight,
              self.metric_depth_normal_loss)
         ]
 
-        for name, weight, module in depth_loss_items:
-            if weight > 0.0:
+        for name, enabled, weight, module in depth_loss_items:
+            if enabled and weight > 0.0:
                 try:
                     val = module(depth_map_bchw, depth_tensor_bchw, depth_mask_bchw)
                     acc = acc + weight * val
@@ -470,7 +487,8 @@ class LossComputer:
     ) -> Tuple[torch.Tensor, dict]:
         """Compute floater-prevention regularization losses."""
         fcfg = self.floater_cfg
-        acc = torch.tensor(0.0, device=self.device)
+        # Use zeros with dtype from model parameters (important for mixed precision)
+        acc = torch.zeros(1, device=self.device, dtype=model.opacities.dtype).squeeze()
         m: dict = {}
 
         if fcfg.enable_scale_reg:
@@ -679,10 +697,11 @@ class TrainingLogger:
         }
         # Only include optional depth keys when active
         optional_keys = [
-            "depth_loss", "depth_corr",
+            "depth_loss", "depth_corr", "depth_smoothness_loss",
             "affine_invariant_depth_loss", "pearson_correlation_loss",
             "silog_loss", "ordinal_depth_loss",
-            "affine_aligned_gradient_matching_loss", "sam_loss",
+            "affine_aligned_gradient_matching_loss", "metric_depth_normal_loss",
+            "sam_loss",
         ]
         for k in optional_keys:
             if k in metrics and metrics[k] != 0.0:
@@ -850,6 +869,10 @@ class GaussianSplatTrainer:
         self.console = Console()
         self.VERBOSITY = self.runtime_cfg.verbosity
 
+        # Low VRAM optimizations: Initialize gradient scaler for mixed precision training
+        # Note: TF32 is already enabled globally at module level (lines 107-110)
+        self.scaler = torch.amp.GradScaler(device=self.device, enabled=self.training_cfg.use_low_vram)
+
         # Will be initialized in setup methods
         self.model: Optional[GaussianModel] = None
         self.dataset: Optional[ColmapDataset | InstantNGPDataset | MatrixCityDataset] = None
@@ -879,6 +902,14 @@ class GaussianSplatTrainer:
         output_path.mkdir(parents=True, exist_ok=True)
         self.logger = setup_logger(self.VERBOSITY, output_path)
         self.logger.info("[bold cyan]🚀 Starting 3D Gaussian Splatting training pipeline[/bold cyan]")
+        
+        # Log low VRAM mode status
+        if self.training_cfg.use_low_vram:
+            self.logger.info(
+                "[yellow]⚡ Low VRAM mode enabled:[/yellow] Using mixed precision (FP16/AMP), "
+                "aggressive cache clearing, and gradient scaling"
+            )
+        
         self.checkpoint_dir = output_path / "checkpoints"
         self.checkpoint_dir.mkdir(exist_ok=True)
 
@@ -886,13 +917,6 @@ class GaussianSplatTrainer:
         if self.logger is None:
             raise RuntimeError("Logger must be initialized before dataset setup")
 
-        # self.dataset = ColmapDataset(
-        #     self.required_cfg.colmap_path,
-        #     self.required_cfg.images_path,
-        #     device=self.device,
-        #     image_scale=self.required_cfg.scale,
-        #     scene_extent_margin=1.5,
-        # )
         if self.required_cfg.dataset_type == "colmap":
             self.dataset = create_dataset(
                 dataset_type="colmap",
@@ -1360,26 +1384,36 @@ class GaussianSplatTrainer:
                 f"Model has no Gaussians at iteration {step}. Training cannot continue."
             )
 
-        # Render
-        render_out = self.rasterizer.render(cam, gt_image, self.device)
+        # Render and compute loss (with optional mixed precision)
+        with torch.cuda.amp.autocast(enabled=self.training_cfg.use_low_vram):
+            render_out = self.rasterizer.render(cam, gt_image, self.device)
 
-        # Strategy pre-backward
-        params = self.model.get_params_dict()
-        optimizers_dict = self.model.get_optimizers_dict(self.optimizers)
-        self.strategy.step_pre_backward(
-            params, optimizers_dict, self.strategy_state, step, render_out.meta,
-        )
+            if self.sh_cfg.disable_sh_rendering and step == self.start_iteration and self.VERBOSITY >= 1:
+                dc_rgb = self.model.dc_rgb.detach()
+                self.logger.debug(
+                    "[cyan]DC-only RGB stats:[/cyan] "
+                    f"min={dc_rgb.min().item():.4f}, "
+                    f"max={dc_rgb.max().item():.4f}, "
+                    f"mean={dc_rgb.mean().item():.4f}"
+                )
 
-        # Compute loss
-        if self.model is None:
-            raise RuntimeError("Model is not initialized before computing loss")
-        if self.loss_computer is None:
-            raise RuntimeError("LossComputer is not initialized before computing loss")
-        loss_result = self.loss_computer.compute(
-            render_out, gt_image, depth_tensor, self.model, cam, step,
-        )
+            # Strategy pre-backward
+            params = self.model.get_params_dict()
+            optimizers_dict = self.model.get_optimizers_dict(self.optimizers)
+            self.strategy.step_pre_backward(
+                params, optimizers_dict, self.strategy_state, step, render_out.meta,
+            )
 
-        # Validate loss
+            # Compute loss
+            if self.model is None:
+                raise RuntimeError("Model is not initialized before computing loss")
+            if self.loss_computer is None:
+                raise RuntimeError("LossComputer is not initialized before computing loss")
+            loss_result = self.loss_computer.compute(
+                render_out, gt_image, depth_tensor, self.model, cam, step,
+            )
+
+        # Validate loss (outside autocast for accurate checking)
         if not loss_result.total_loss.isfinite():
             m = loss_result.metrics
             self.logger.warning(
@@ -1387,11 +1421,29 @@ class GaussianSplatTrainer:
                 f"total={m['total_loss']:.4f}, l1={m['l1_loss']:.4f}, "
                 f"ssim={m['ssim_loss']:.4f}"
             )
+            
+            # Print ALL loss components for debugging
+            self.logger.error("[red]═══ NaN Loss Debug Info ═══[/red]")
+            self.logger.error(f"[red]Step: {step}[/red]")
+            self.logger.error(f"[red]All loss components:[/red]")
+            for key, value in sorted(m.items()):
+                is_finite = "✓" if isinstance(value, (int, float)) and torch.isfinite(torch.tensor(value)) else "✗ NaN/Inf"
+                dtype_info = ""
+                # Try to get dtype if it's a recent tensor
+                if key == "total_loss" and hasattr(loss_result.total_loss, 'dtype'):
+                    dtype_info = f" (dtype: {loss_result.total_loss.dtype})"
+                self.logger.error(f"  {key:40s}: {value:12.6f} {is_finite}{dtype_info}")
+            self.logger.error("[red]═══════════════════════════[/red]")
+            
             if self.VERBOSITY >= 1 and self.training_logger.progress:
                 self.training_logger.progress.stop()
             raise RuntimeError(f"Loss is NaN or too large at step {step}")
 
-        loss_result.total_loss.backward()
+        # Backward pass (with gradient scaling for mixed precision)
+        if self.training_cfg.use_low_vram:
+            self.scaler.scale(loss_result.total_loss).backward()
+        else:
+            loss_result.total_loss.backward()
 
         # Strategy post-backward (densification/pruning)
         gaussians_before = len(self.model._means)
@@ -1405,9 +1457,13 @@ class GaussianSplatTrainer:
         self.model.update_params_from_dict(params)
         gaussians_after = len(self.model._means)
 
-        # Clear CUDA cache periodically
-        if step % (self.densification_cfg.densify_interval * 1) == 0:
-            torch.cuda.empty_cache()
+        # Clear CUDA cache periodically (more aggressive in low VRAM mode)
+        if self.training_cfg.use_low_vram:
+            if step % 50 == 0:
+                torch.cuda.empty_cache()
+        else:
+            if step % (self.densification_cfg.densify_interval * 1) == 0:
+                torch.cuda.empty_cache()
 
         # Handle densification events
         dcfg = self.densification_cfg
@@ -1422,12 +1478,31 @@ class GaussianSplatTrainer:
             step, loss_result, self.model, render_out, gt_image, depth_tensor,
         )
 
-        # Optimizer step
-        for opt in self.optimizers.__dict__.values():
-            if opt is None:
-                continue
-            opt.step()
-            opt.zero_grad(set_to_none=True)
+        # Optimizer step (with gradient scaling for mixed precision)
+        if self.training_cfg.use_low_vram:
+            # With GradScaler and multiple optimizers, we need to:
+            # 1. Step each optimizer with scaler (it unscales internally)
+            # 2. Update scaler once at the end
+            did_scaled_step = False
+            for opt in self.optimizers.__dict__.values():
+                if opt is None:
+                    continue
+                # Some parameter groups can be inactive in a step; skip scaled
+                # stepping for optimizers with no gradients to avoid AMP assert.
+                if _optimizer_has_any_grad(opt):
+                    self.scaler.step(opt)
+                    did_scaled_step = True
+                opt.zero_grad(set_to_none=True)
+            
+            # Update scaler only if at least one scaled step happened.
+            if did_scaled_step:
+                self.scaler.update()
+        else:
+            for opt in self.optimizers.__dict__.values():
+                if opt is None:
+                    continue
+                opt.step()
+                opt.zero_grad(set_to_none=True)
 
         # LR schedulers
         for sched in self.schedulers.__dict__.values():

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, List, Any
+from typing import Any, List, Optional
 
 import numpy as np
 import torch
 from gsplat import rasterization
+from model import GaussianModel
 
 
 @dataclass
@@ -29,7 +30,7 @@ class ViewerParamSync:
         disable_sh_rendering: bool,
         refresh_interval: int = 100,
     ) -> None:
-        self.model = model
+        self.model: GaussianModel = model
         self.device = device
         self.disable_sh_rendering = disable_sh_rendering
         self.refresh_interval = max(1, int(refresh_interval))
@@ -44,7 +45,7 @@ class ViewerParamSync:
             return
 
         colors = (
-            self.model._features_dc.squeeze(1)
+            self.model.dc_rgb.squeeze(1)
             if self.disable_sh_rendering
             else self.model.sh
         )
