@@ -30,7 +30,7 @@ class ViewerParamSync:
         disable_sh_rendering: bool,
         refresh_interval: int = 100,
     ) -> None:
-        self.model: GaussianModel = model
+        self.model = model
         self.device = device
         self.disable_sh_rendering = disable_sh_rendering
         self.refresh_interval = max(1, int(refresh_interval))
@@ -82,34 +82,59 @@ class ViewerParamSync:
         K = torch.from_numpy(camera_state.get_K((width, height))).float().to(self.device)
         viewmat = torch.linalg.inv(c2w)
 
-        # Handle LoD slicing
-        # Priority: 1. lod_slider (viser GUI), 2. render_tab_state.lod, 3. Default (0)
-        lod = 0
-        if self.lod_slider is not None:
-            lod = int(self.lod_slider.value)
+        if hasattr(self.model, "generate_neural_gaussians"):
+            # Scaffold-GS dynamic rendering path
+            cam = {
+                "camera_center": c2w[:3, 3],
+                "uid": 0,
+                "width": width,
+                "height": height,
+            }
+            # Note: generate_neural_gaussians handles its own LOD internally or uses all anchors
+            xyz, color, opacity, scaling, rot = self.model.generate_neural_gaussians(
+                cam, is_training=False
+            )
+            means = xyz
+            quats = rot
+            scales = scaling
+            opacities = opacity.squeeze(-1)
+            colors = color
+            sh_degree = None
         else:
-            lod = getattr(render_tab_state, "lod", 0)
-        
-        offsets = self._cache.lod_offsets
-        if lod < 0 or lod >= len(offsets):
-            end_idx = offsets[-1] # All
-        else:
-            # Level 0 = Finest (last offset), Level N = Coarsest (first offset)
-            idx = len(offsets) - 1 - lod
-            end_idx = offsets[idx]
+            # Standard GaussianModel cached path
+            # Handle LoD slicing
+            lod = 0
+            if self.lod_slider is not None:
+                lod = int(self.lod_slider.value)
+            else:
+                lod = getattr(render_tab_state, "lod", 0)
+            
+            offsets = self._cache.lod_offsets
+            if lod < 0 or lod >= len(offsets):
+                end_idx = offsets[-1]
+            else:
+                idx = len(offsets) - 1 - lod
+                end_idx = offsets[idx]
+                
+            means = self._cache.means[:end_idx]
+            quats = self._cache.quats[:end_idx]
+            scales = self._cache.scales[:end_idx]
+            opacities = self._cache.opacities[:end_idx]
+            colors = self._cache.colors[:end_idx]
+            sh_degree = self._cache.sh_degree
 
         try:
             render, _, _ = rasterization(
-                means=self._cache.means[:end_idx],
-                quats=self._cache.quats[:end_idx],
-                scales=self._cache.scales[:end_idx],
-                opacities=self._cache.opacities[:end_idx],
-                colors=self._cache.colors[:end_idx],
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors,
                 viewmats=viewmat[None, ...],
                 Ks=K[None, ...],
                 width=width,
                 height=height,
-                sh_degree=self._cache.sh_degree,
+                sh_degree=sh_degree,
             )
             render_rgb = torch.clamp(render[0, ..., 0:3], 0, 1)
             return (render_rgb.detach().cpu().numpy() * 255).astype(np.uint8)

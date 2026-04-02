@@ -30,9 +30,16 @@ class GSOptimizers:
     features_dc: torch.optim.Optimizer
     features_rest: torch.optim.Optimizer
     features_semantics: torch.optim.Optimizer | None = None
+    extra: dict[str, torch.optim.Optimizer] = None
+
+    def __post_init__(self):
+        if self.extra is None:
+            self.extra = {}
 
     def __getitem__(self, key):
-        return getattr(self, key)
+        if hasattr(self, key):
+            return getattr(self, key)
+        return self.extra.get(key)
 
     def __setitem__(self, key, value):
         setattr(self, key, value)
@@ -49,9 +56,16 @@ class GS_LR_Schedulers:
     features_dc: torch.optim.lr_scheduler._LRScheduler | bool = False
     features_rest: torch.optim.lr_scheduler._LRScheduler | bool = False
     features_semantics: torch.optim.lr_scheduler._LRScheduler | bool = False
+    extra: dict[str, torch.optim.lr_scheduler._LRScheduler] = None
+
+    def __post_init__(self):
+        if self.extra is None:
+            self.extra = {}
 
     def __getitem__(self, key):
-        return getattr(self, key)
+        if hasattr(self, key):
+            return getattr(self, key)
+        return self.extra.get(key)
 
     def __setitem__(self, key, value):
         setattr(self, key, value)
@@ -74,8 +88,11 @@ class GS_LR_Schedulers:
     @classmethod
     def create_schedulers(cls, optimizers: GSOptimizers, enabled_lrs, step_size: int, gamma: float):
         schedulers_dict: dict[str, Any] = {}
+        extra_schedulers = {}
 
-        for name, enabled in enabled_lrs.__dict__.items():
+        # Handle main fields
+        for name in ['means', 'scales', 'quats', 'opacities', 'features_dc', 'features_rest', 'features_semantics']:
+            enabled = getattr(enabled_lrs, name, False)
             if not enabled:
                 schedulers_dict[name] = None
                 continue
@@ -85,9 +102,21 @@ class GS_LR_Schedulers:
             initial_lr = optimizer.param_groups[0]['lr']
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
-                T_max=step_size,  # Full cosine period = total training iterations
-                eta_min=initial_lr * 1e-4,  # Minimum LR = 0.01% of initial LR
+                T_max=step_size,
+                eta_min=initial_lr * 1e-4,
             )
             schedulers_dict[name] = scheduler
+
+        # Handle extra fields (MLPs etc)
+        if optimizers.extra:
+            for name, optimizer in optimizers.extra.items():
+                initial_lr = optimizer.param_groups[0]['lr']
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=step_size,
+                    eta_min=initial_lr * 1e-4,
+                )
+                extra_schedulers[name] = scheduler
             
+        schedulers_dict['extra'] = extra_schedulers
         return cls(**schedulers_dict)

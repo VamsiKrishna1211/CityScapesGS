@@ -40,11 +40,21 @@ class CameraData:
     width: int
     height: int
     image_path: str
+    uid: int  # Camera index for appearance embeddings (must be unique per camera)
     depth_dir: Optional[str] = None
     depth_scale: float = 1.0
 
     def __getitem__(self, key: str):
         return getattr(self, key)
+    
+    @property
+    def camera_center(self) -> torch.Tensor:
+        """
+        Compute camera center (camera position in world coordinates).
+        The view matrix transforms world -> camera: [R|T]
+        Camera center is at -R^T @ T in world coordinates.
+        """
+        return -self.R.T @ self.T
 
 
 class BaseReconstructionDataset(Dataset):
@@ -571,6 +581,7 @@ class ColmapDataset(BaseReconstructionDataset):
                     width=max(1, int(round(float(cam.width) * scale_factor))),
                     height=max(1, int(round(float(cam.height) * scale_factor))),
                     image_path=str(img_path),
+                    uid=len(self.cameras),  # Assign sequential camera ID
                 )
             )
 
@@ -877,6 +888,7 @@ class InstantNGPDataset(BaseReconstructionDataset):
                     width=max(1, int(round(width * scale_factor))),
                     height=max(1, int(round(height * scale_factor))),
                     image_path=str(img_path),
+                    uid=len(self.cameras),  # Assign sequential camera ID
                     depth_dir=str(depth_dir_override) if depth_dir_override is not None else (str(self.depth_dir) if self.depth_dir is not None else None),
                 )
             )
@@ -1202,6 +1214,7 @@ class MatrixCityDataset(BaseReconstructionDataset):
                         width=max(1, int(round(width * scale_factor))),
                         height=max(1, int(round(height * scale_factor))),
                         image_path=str(img_path),
+                        uid=len(self.cameras),  # Assign sequential camera ID
                         depth_dir=str(depth_dir) if depth_dir is not None else None,
                         # MatrixCity depth is exported in centimeters.
                         depth_scale=0.01,

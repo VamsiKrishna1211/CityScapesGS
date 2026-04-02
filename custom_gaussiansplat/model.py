@@ -93,6 +93,9 @@ class GaussianModel(nn.Module):
     def means(self): return self._means
     
     @property
+    def means(self): return self._means
+
+    @property
     def scales(self): return torch.exp(self._scales)
     
     @property
@@ -101,6 +104,12 @@ class GaussianModel(nn.Module):
     @property
     def opacities(self): return torch.sigmoid(self._opacities)
     
+    @property
+    def features_dc(self): return self._features_dc
+
+    @property
+    def features_rest(self): return self._features_rest
+
     @property
     def sh(self): return torch.cat([self._features_dc, self._features_rest], dim=1)
 

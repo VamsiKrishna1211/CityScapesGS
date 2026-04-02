@@ -9,7 +9,7 @@ os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Union
 
 
 def _prepend_env_path(var_name: str, path_value: str) -> None:
@@ -100,6 +100,7 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 from rich.table import Table
+from scaffold_model import ScaffoldModel
 from train_args import DepthConfig, FloaterPreventionConfig, TrainConfig, parse_args
 from utils import format_phase_description
 from viewer_sync import ViewerParamSync
@@ -279,7 +280,7 @@ class Rasterizer:
 
     def __init__(
         self,
-        model: GaussianModel,
+        model: Union[GaussianModel, ScaffoldModel],
         sh_cfg,
         packed: bool = False,
         absgrad: bool = False,
@@ -305,20 +306,30 @@ class Rasterizer:
         viewmat = _build_viewmat(cam, device)
         K = _build_intrinsics(cam, device)
 
-        # Always resolve parameters through LoD access.
-        # Even when lod is None, this keeps render-time behavior aligned with
-        # future LoD/parameter logic (scale compensation, slicing semantics,
-        # and additional per-LoD feature branches).
-        params = self.model.get_lod_params(lod)
-        means = params.means
-        scales = params.scales
-        quats = params.quats
-        opacities = params.opacities
-
-        if not self.sh_cfg.disable_sh_rendering:
-            colors = torch.cat([params.features_dc, params.features_rest], dim=1)
+        if isinstance(self.model, ScaffoldModel):
+            # Scaffold-GS path: generate Gaussians from anchors
+            xyz, color, opacity, scaling, rot, neural_opacity, mask = self.model.generate_neural_gaussians(
+                cam, is_training=True
+            )
+            means = xyz
+            quats = rot
+            scales = scaling
+            opacities = opacity
+            colors = color
+            sh_degree = None # Scaffold-GS typically doesn't use SH on decoded Gaussians
         else:
-            colors = self.model.sh_dc_to_rgb(params.features_dc).squeeze(1)
+            # Original GaussianModel path
+            params = self.model.get_lod_params(lod)
+            means = params.means
+            scales = params.scales
+            quats = params.quats
+            opacities = params.opacities
+
+            if not self.sh_cfg.disable_sh_rendering:
+                colors = torch.cat([params.features_dc, params.features_rest], dim=1)
+            else:
+                colors = self.model.sh_dc_to_rgb(params.features_dc).squeeze(1)
+            sh_degree = self.model.sh_degree if not self.sh_cfg.disable_sh_rendering else None
 
         render_output, render_alpha, render_meta = rasterization(
             means=means,
@@ -330,13 +341,16 @@ class Rasterizer:
             Ks=K[None, ...],
             width=cam["width"],
             height=cam["height"],
-            sh_degree=(self.model.sh_degree
-                       if not self.sh_cfg.disable_sh_rendering else None),
+            sh_degree=sh_degree,
             packed=self.packed,
             absgrad=self.absgrad,
             render_mode="RGB+ED",
             camera_model="pinhole"
         )
+
+        if isinstance(self.model, ScaffoldModel):
+            render_meta["neural_opacity"] = neural_opacity
+            render_meta["selection_mask"] = mask
 
         render = render_output[..., 0:3]             # [B, H, W, 3]
         alpha = render_alpha                          # [B, H, W, 1]
@@ -712,7 +726,7 @@ class TrainingLogger:
         self,
         step: int,
         loss_result: LossResult,
-        model: GaussianModel,
+        model: Union[GaussianModel, ScaffoldModel],
         render_out: RenderOutput,
         gt_image: torch.Tensor,
         depth_tensor: Optional[torch.Tensor],
@@ -724,7 +738,7 @@ class TrainingLogger:
         if self.progress is not None:
             if self.task_id is None:
                 raise RuntimeError("Training progress task is not initialized")
-            num_gaussians = len(model._means)
+            num_gaussians = len(model.means)
             phase = ("Densification"
                      if self.densify_from <= step <= self.densify_until
                      else "Refinement")
@@ -751,7 +765,7 @@ class TrainingLogger:
                     psnr_snapshot=float(m["psnr"]),
                     ssim_snapshot=float(m["ssim_loss"]),
                     lpips_snapshot=float(m["lpips_loss"]),
-                    num_gaussians_snapshot=int(len(model._means)),
+                    num_gaussians_snapshot=int(len(model.means)),
                     max_radii_snapshot=max_radii_snapshot,
                     step_snapshot=int(step),
                 )
@@ -976,30 +990,73 @@ class GaussianSplatTrainer:
             if not checkpoint_path.exists():
                 raise FileNotFoundError(f"Checkpoint file does not exist: {checkpoint_path}")
             self.logger.info(f"[cyan]📂 Loading checkpoint:[/cyan] {checkpoint_path.name}")
-            self.model, checkpoint = GaussianModel.resume_from_checkpoint(
-                checkpoint_path=checkpoint_path,
-                device=str(self.device),
-                sh_degree=self.sh_cfg.sh_degree,
-                console=self.console,
-                strict=False,
-            )
+            
+            if self.config.model.model_type == "scaffold":
+                # Assuming ScaffoldModel has a compatible from_checkpoint or we load it manually
+                # For now, let's initialize and load state_dict
+                self.model = ScaffoldModel(
+                    init_points=None, # Loaded from checkpoint
+                    feat_dim=self.config.model.feat_dim,
+                    n_offsets=self.config.model.n_offsets,
+                    voxel_size=self.config.model.voxel_size,
+                    update_depth=self.config.model.update_depth,
+                    update_init_factor=self.config.model.update_init_factor,
+                    update_hierachy_factor=self.config.model.update_hierachy_factor,
+                    use_feat_bank=self.config.model.use_feat_bank,
+                    appearance_dim=self.config.model.appearance_dim,
+                    add_opacity_dist=self.config.model.add_opacity_dist,
+                    add_cov_dist=self.config.model.add_cov_dist,
+                    add_color_dist=self.config.model.add_color_dist,
+                    sh_degree=self.sh_cfg.sh_degree,
+                    console=self.console,
+                ).to(self.device)
+                self.model.set_appearance(len(self.dataset))
+                checkpoint = torch.load(checkpoint_path, map_location=self.device)
+                self.model.load_state_dict(checkpoint["model_state_dict"])
+            else:
+                self.model, checkpoint = GaussianModel.resume_from_checkpoint(
+                    checkpoint_path=checkpoint_path,
+                    device=str(self.device),
+                    sh_degree=self.sh_cfg.sh_degree,
+                    console=self.console,
+                    strict=False,
+                )
+            
             self.model.to(self.device)
             self.start_iteration = checkpoint.get("iteration", 0) + 1
             tb_resume_run_name = checkpoint.get("tensorboard_run_name", None)
             if tb_resume_run_name is not None:
                 tb_purge_step = self.start_iteration
             if self.VERBOSITY >= 1:
-                self.logger.info(f"[green]✓ Loaded model with {len(self.model._means):,} Gaussians[/green]")
+                num_pts = len(self.model.means)
+                self.logger.info(f"[green]✓ Loaded model with {num_pts:,} {'anchors' if isinstance(self.model, ScaffoldModel) else 'Gaussians'}[/green]")
                 self.logger.info(f"[green]  Resuming from iteration {checkpoint['iteration']:,}[/green]")
-                if "loss" in checkpoint:
-                    self.logger.info(f"[green]  Previous loss: {checkpoint['loss']:.6f}[/green]")
         else:
-            self.model = GaussianModel(
-                self.dataset.init_points,
-                self.dataset.init_colors,
-                sh_degree=self.sh_cfg.sh_degree,
-                console=self.console,
-            ).to(self.device)
+            if self.config.model.model_type == "scaffold":
+                self.model = ScaffoldModel(
+                    self.dataset.init_points,
+                    feat_dim=self.config.model.feat_dim,
+                    n_offsets=self.config.model.n_offsets,
+                    voxel_size=self.config.model.voxel_size,
+                    update_depth=self.config.model.update_depth,
+                    update_init_factor=self.config.model.update_init_factor,
+                    update_hierachy_factor=self.config.model.update_hierachy_factor,
+                    use_feat_bank=self.config.model.use_feat_bank,
+                    appearance_dim=self.config.model.appearance_dim,
+                    add_opacity_dist=self.config.model.add_opacity_dist,
+                    add_cov_dist=self.config.model.add_cov_dist,
+                    add_color_dist=self.config.model.add_color_dist,
+                    sh_degree=self.sh_cfg.sh_degree,
+                    console=self.console,
+                ).to(self.device)
+                self.model.set_appearance(len(self.dataset))
+            else:
+                self.model = GaussianModel(
+                    self.dataset.init_points,
+                    self.dataset.init_colors,
+                    sh_degree=self.sh_cfg.sh_degree,
+                    console=self.console,
+                ).to(self.device)
 
         self._checkpoint = checkpoint
 
@@ -1023,31 +1080,38 @@ class GaussianSplatTrainer:
             self.logger.info(f"[dim]Run directory: {self.tb_logger.log_dir}[/dim]")
 
     def _setup_strategy(self) -> None:
+        dcfg = self.densification_cfg
+
         if self.model is None:
             raise RuntimeError("Model must be initialized before strategy setup")
         if self.dataset is None:
             raise RuntimeError("Dataset must be initialized before strategy setup")
 
-        dcfg = self.densification_cfg
-        self.strategy = DefaultStrategy(
-            prune_opa=dcfg.prune_opa,
-            grow_grad2d=dcfg.grow_grad2d,
-            grow_scale3d=dcfg.grow_scale3d,
-            grow_scale2d=dcfg.grow_scale2d,
-            prune_scale3d=dcfg.prune_scale3d,
-            prune_scale2d=dcfg.prune_scale2d,
-            refine_start_iter=dcfg.densify_from_iter,
-            refine_stop_iter=dcfg.densify_until_iter,
-            refine_every=dcfg.densify_interval,
-            reset_every=dcfg.opacity_reset_interval,
-            pause_refine_after_reset=0,
-            absgrad=False,
-            revised_opacity=False,
-            verbose=(self.VERBOSITY >= 2),
-        )
-        self.strategy_state = self.strategy.initialize_state(
-            scene_scale=float(self.scene_extent),
-        )
+        if self.config.model.model_type == "scaffold":
+            self.strategy = None
+            self.strategy_state = None
+            if self.VERBOSITY >= 1:
+                self.logger.info("[cyan]🏗️ Scaffold-GS approach:[/cyan] Using anchor-based densification (skipping DefaultStrategy)")
+        else:
+            self.strategy = DefaultStrategy(
+                prune_opa=dcfg.prune_opa,
+                grow_grad2d=dcfg.grow_grad2d,
+                grow_scale3d=dcfg.grow_scale3d,
+                grow_scale2d=dcfg.grow_scale2d,
+                prune_scale3d=dcfg.prune_scale3d,
+                prune_scale2d=dcfg.prune_scale2d,
+                refine_start_iter=dcfg.densify_from_iter,
+                refine_stop_iter=dcfg.densify_until_iter,
+                refine_every=dcfg.densify_interval,
+                reset_every=dcfg.opacity_reset_interval,
+                pause_refine_after_reset=0,
+                absgrad=False,
+                revised_opacity=False,
+                verbose=(self.VERBOSITY >= 2),
+            )
+            self.strategy_state = self.strategy.initialize_state(
+                scene_scale=float(self.scene_extent),
+            )
 
         # Auto-adjust max_screen_size for large scenes
         mss = dcfg.max_screen_size
@@ -1070,7 +1134,7 @@ class GaussianSplatTrainer:
             init_info = Table.grid(padding=(0, 2))
             init_info.add_column(style="cyan", justify="right")
             init_info.add_column(style="green")
-            init_info.add_row("Initial Gaussians:", f"{len(self.model._means):,}")
+            init_info.add_row("Initial Gaussians:", f"{len(self.model.means):,}")
             init_info.add_row("Scene Extent:", f"{self.scene_extent:.3f}")
             init_info.add_row("Training Images:", f"{len(self.dataset)}")
             init_info.add_row("Total Iterations:", f"{self.training_cfg.iterations:,}")
@@ -1095,7 +1159,7 @@ class GaussianSplatTrainer:
     def _setup_optimizers(self) -> None:
         if self.model is None:
             raise RuntimeError("Model must be initialized before optimizer setup")
-        if self.strategy is None:
+        if self.strategy is None and self.config.model.model_type != "scaffold":
             raise RuntimeError("Strategy must be initialized before optimizer setup")
         if self.logger is None:
             raise RuntimeError("Logger must be initialized before optimizer setup")
@@ -1116,15 +1180,27 @@ class GaussianSplatTrainer:
             self.logger.debug("[cyan]📈 Optimizers & Schedulers:[/cyan] Adam + CosineAnnealingLR initialized")
 
         # Validate strategy <-> params <-> optimizers wiring once optimizers exist.
-        self.strategy.check_sanity(
-            self.model.get_params_dict(),
-            self.model.get_optimizers_dict(self.optimizers),
-        )
+        if self.strategy is not None:
+            self.strategy.check_sanity(
+                self.model.get_params_dict(),
+                self.model.get_optimizers_dict(self.optimizers),
+            )
 
         # Restore optimizer states from checkpoint
         if self._checkpoint is not None and "optimizers_state_dict" in self._checkpoint:
             for key, opt in self.optimizers.__dict__.items():
-                if opt is not None and key in self._checkpoint["optimizers_state_dict"]:
+                if opt is None:
+                    continue
+                if key not in self._checkpoint["optimizers_state_dict"]:
+                    continue
+                # Handle extra optimizers dict for Scaffold-GS
+                if key == "extra" and isinstance(opt, dict):
+                    saved_extra = self._checkpoint["optimizers_state_dict"][key]
+                    if isinstance(saved_extra, dict):
+                        for extra_key, extra_opt in opt.items():
+                            if extra_opt is not None and extra_key in saved_extra:
+                                extra_opt.load_state_dict(saved_extra[extra_key])
+                else:
                     opt.load_state_dict(self._checkpoint["optimizers_state_dict"][key])
             if self.VERBOSITY >= 1:
                 self.logger.info("[green]✓ Restored optimizer states[/green]")
@@ -1137,14 +1213,16 @@ class GaussianSplatTrainer:
             raise RuntimeError("TensorBoard logger must be initialized before component setup")
         if self.logger is None:
             raise RuntimeError("App logger must be initialized before component setup")
-        if self.strategy is None:
+        
+        # Strategy can be None for ScaffoldModel
+        if self.strategy is None and self.config.model.model_type != "scaffold":
             raise RuntimeError("Strategy must be initialized before component setup")
 
         self.rasterizer = Rasterizer(
             self.model,
             self.sh_cfg,
             packed=False,
-            absgrad=bool(getattr(self.strategy, "absgrad", False)),
+            absgrad=bool(getattr(self.strategy, "absgrad", False)) if self.strategy is not None else False,
         )
         self.loss_computer = LossComputer(
             self.training_cfg, self.depth_cfg, self.floater_cfg,
@@ -1227,7 +1305,7 @@ class GaussianSplatTrainer:
             )
         
         # Add LoD slider if levels > 1
-        if len(self.model.lod_offsets) > 1:
+        if hasattr(self.model, 'lod_offsets') and len(self.model.lod_offsets) > 1:
             self.lod_slider = self.server.gui.add_slider(
                 "Display LoD",
                 min=0,
@@ -1349,8 +1427,10 @@ class GaussianSplatTrainer:
             raise RuntimeError("Model is not initialized")
         if self.rasterizer is None:
             raise RuntimeError("Rasterizer is not initialized")
-        if self.strategy is None or self.strategy_state is None:
-            raise RuntimeError("Strategy is not initialized")
+        # Strategy is None for Scaffold-GS (uses manual densification)
+        if self.config.model.model_type != "scaffold":
+            if self.strategy is None or self.strategy_state is None:
+                raise RuntimeError("Strategy is not initialized")
         if self.optimizers is None:
             raise RuntimeError("Optimizers are not initialized")
         if self.schedulers is None:
@@ -1379,7 +1459,7 @@ class GaussianSplatTrainer:
         # )
 
         # Safety check
-        if len(self.model._means) == 0:
+        if len(self.model.means) == 0:
             raise RuntimeError(
                 f"Model has no Gaussians at iteration {step}. Training cannot continue."
             )
@@ -1397,12 +1477,13 @@ class GaussianSplatTrainer:
                     f"mean={dc_rgb.mean().item():.4f}"
                 )
 
-            # Strategy pre-backward
-            params = self.model.get_params_dict()
-            optimizers_dict = self.model.get_optimizers_dict(self.optimizers)
-            self.strategy.step_pre_backward(
-                params, optimizers_dict, self.strategy_state, step, render_out.meta,
-            )
+            # Strategy pre-backward (only for non-Scaffold models)
+            if self.config.model.model_type != "scaffold":
+                params = self.model.get_params_dict()
+                optimizers_dict = self.model.get_optimizers_dict(self.optimizers)
+                self.strategy.step_pre_backward(
+                    params, optimizers_dict, self.strategy_state, step, render_out.meta,
+                )
 
             # Compute loss
             if self.model is None:
@@ -1446,16 +1527,57 @@ class GaussianSplatTrainer:
             loss_result.total_loss.backward()
 
         # Strategy post-backward (densification/pruning)
-        gaussians_before = len(self.model._means)
-        params = self.model.get_params_dict()
-        optimizers_dict = self.model.get_optimizers_dict(self.optimizers)
-        self.strategy.step_post_backward(
-            params=params, optimizers=optimizers_dict,
-            state=self.strategy_state, step=step,
-            info=render_out.meta, packed=self.rasterizer.packed,
-        )
-        self.model.update_params_from_dict(params)
-        gaussians_after = len(self.model._means)
+        gaussians_before = len(self.model.means)
+        if self.config.model.model_type == "scaffold":
+            # Scaffold-GS specific densification logic
+            dcfg = self.densification_cfg
+            if step >= dcfg.densify_from_iter and step <= dcfg.densify_until_iter:
+                # Add stats for anchor growing
+                means2d = render_out.meta.get("means2d")
+                if means2d is not None:
+                    opacity = render_out.meta.get("neural_opacity")
+                    selection_mask = render_out.meta.get("selection_mask")
+                    radii = render_out.meta.get("radii")
+                    
+                    # Ensure radii is 1D boolean mask
+                    if radii is not None:
+                        visibility_filter = (radii > 0)
+                        # Handle potential extra dimensions
+                        while visibility_filter.dim() > 1:
+                            visibility_filter = visibility_filter.any(dim=-1)
+                    else:
+                        # Fallback if radii not available
+                        visibility_filter = torch.ones(means2d.shape[0], dtype=torch.bool, device=self.device)
+                    
+                    anchor_visible_mask = torch.ones(len(self.model.anchors), dtype=torch.bool, device=self.device)
+                    
+                    self.model.training_statis(
+                        viewspace_point_tensor=means2d,
+                        opacity=opacity,
+                        update_filter=visibility_filter,
+                        offset_selection_mask=selection_mask,
+                        anchor_visible_mask=anchor_visible_mask
+                    )
+
+                # Periodically adjust anchors
+                if step > dcfg.densify_from_iter and step % dcfg.densify_interval == 0:
+                    self.model.adjust_anchor(
+                        check_interval=dcfg.densify_interval,
+                        success_threshold=0.8,
+                        grad_threshold=dcfg.grad_threshold,
+                        min_opacity=dcfg.prune_opa,
+                        optimizers=self.optimizers
+                    )
+        else:
+            params = self.model.get_params_dict()
+            optimizers_dict = self.model.get_optimizers_dict(self.optimizers)
+            self.strategy.step_post_backward(
+                params=params, optimizers=optimizers_dict,
+                state=self.strategy_state, step=step,
+                info=render_out.meta, packed=self.rasterizer.packed,
+            )
+            self.model.update_params_from_dict(params)
+        gaussians_after = len(self.model.means)
 
         # Clear CUDA cache periodically (more aggressive in low VRAM mode)
         if self.training_cfg.use_low_vram:
@@ -1484,8 +1606,17 @@ class GaussianSplatTrainer:
             # 1. Step each optimizer with scaler (it unscales internally)
             # 2. Update scaler once at the end
             did_scaled_step = False
-            for opt in self.optimizers.__dict__.values():
+            for key, opt in self.optimizers.__dict__.items():
                 if opt is None:
+                    continue
+                # Handle extra optimizers dict for Scaffold-GS
+                if key == "extra" and isinstance(opt, dict):
+                    for extra_opt in opt.values():
+                        if extra_opt is not None and _optimizer_has_any_grad(extra_opt):
+                            self.scaler.step(extra_opt)
+                            did_scaled_step = True
+                        if extra_opt is not None:
+                            extra_opt.zero_grad(set_to_none=True)
                     continue
                 # Some parameter groups can be inactive in a step; skip scaled
                 # stepping for optimizers with no gradients to avoid AMP assert.
@@ -1498,15 +1629,28 @@ class GaussianSplatTrainer:
             if did_scaled_step:
                 self.scaler.update()
         else:
-            for opt in self.optimizers.__dict__.values():
+            for key, opt in self.optimizers.__dict__.items():
                 if opt is None:
+                    continue
+                # Handle extra optimizers dict for Scaffold-GS
+                if key == "extra" and isinstance(opt, dict):
+                    for extra_opt in opt.values():
+                        if extra_opt is not None:
+                            extra_opt.step()
+                            extra_opt.zero_grad(set_to_none=True)
                     continue
                 opt.step()
                 opt.zero_grad(set_to_none=True)
 
         # LR schedulers
         for sched in self.schedulers.__dict__.values():
-            if sched is not None:
+            if sched is None:
+                continue
+            if isinstance(sched, dict):
+                for s in sched.values():
+                    if s is not None:
+                        s.step()
+            elif hasattr(sched, "step"):
                 sched.step()
 
         # Learning rate logging
@@ -1544,14 +1688,21 @@ class GaussianSplatTrainer:
             tb_run_name = self.tb_logger.run_name
 
         checkpoint_path = self.checkpoint_dir / f"checkpoint_{step}.pt"
+        # Prepare optimizer state dict, handling extra optimizers for Scaffold-GS
+        optimizers_state = {}
+        for key, opt in self.optimizers.__dict__.items():
+            if opt is None:
+                continue
+            if key == "extra" and isinstance(opt, dict):
+                # Save extra optimizers as nested dict
+                optimizers_state[key] = {k: v.state_dict() for k, v in opt.items() if v is not None}
+            else:
+                optimizers_state[key] = opt.state_dict()
+        
         torch.save({
             "iteration": step,
             "model_state_dict": self.model.state_dict(),
-            "optimizers_state_dict": {
-                key: opt.state_dict()
-                for key, opt in self.optimizers.__dict__.items()
-                if opt is not None
-            },
+            "optimizers_state_dict": optimizers_state,
             "loss": loss,
             "tensorboard_run_name": tb_run_name,
         }, checkpoint_path)
@@ -1610,7 +1761,7 @@ class GaussianSplatTrainer:
                 final_metrics = {
                     "final/loss": last_loss_result.metrics["total_loss"],
                     "final/psnr": last_loss_result.metrics["psnr"],
-                    "final/gaussians": len(self.model._means),
+                    "final/gaussians": len(self.model.means),
                 }
             self.training_logger.finalize(final_metrics)
 
@@ -1637,7 +1788,7 @@ class GaussianSplatTrainer:
             "iteration": self.training_cfg.iterations,
             "model_state_dict": self.model.state_dict(),
             "scene_extent": self.scene_extent,
-            "num_gaussians": len(self.model._means),
+            "num_gaussians": len(self.model.means),
             "lod_offsets": self.model.lod_offsets,
             "tensorboard_run_name": (
                 self.tb_logger.run_name if (self.tensorboard_cfg.tensorboard and self.tb_logger is not None) else None
@@ -1654,7 +1805,7 @@ class GaussianSplatTrainer:
             summary_grid.add_row("Final Loss:", f"{m['total_loss']:.6f}")
             summary_grid.add_row("Final L1:", f"{m['l1_loss']:.6f}")
             summary_grid.add_row("Final SSIM:", f"{m['ssim_loss']:.6f}")
-            summary_grid.add_row("Final Gaussians:", f"{len(self.model._means):,}")
+            summary_grid.add_row("Final Gaussians:", f"{len(self.model.means):,}")
             summary_grid.add_row("Model Saved:", str(final_path.name))
             panel = Panel(summary_grid, title="[bold green]✅ Training Complete![/bold green]",
                           border_style="green", box=box.ROUNDED)

@@ -37,6 +37,22 @@ class TrainingConfig:
     lpips_model: str = "vgg"  # Could be made configurable if desired, but VGG is a good default for perceptual similarity
 
 
+@dataclass
+class ModelConfig:
+    model_type: str  # "gaussian" or "scaffold"
+    # Scaffold-GS specific
+    feat_dim: int
+    n_offsets: int
+    voxel_size: float
+    update_depth: int
+    update_init_factor: int
+    update_hierachy_factor: int
+    use_feat_bank: bool
+    appearance_dim: int
+    add_opacity_dist: bool
+    add_cov_dist: bool
+    add_color_dist: bool
+
 
 @dataclass
 class DensificationConfig:
@@ -164,17 +180,11 @@ class LODConfig:
 
 
 @dataclass
-@dataclass
-class LODConfig:
-    num_levels: int
-    reduction_factor: int
-
-
-@dataclass
 class TrainConfig:
     raw: argparse.Namespace
     required: RequiredConfig
     output: OutputConfig
+    model: ModelConfig
     training: TrainingConfig
     densification: DensificationConfig
     floater_prevention: FloaterPreventionConfig
@@ -188,7 +198,6 @@ class TrainConfig:
     checkpoint: CheckpointConfig
     viewer: ViewerConfig
     tensorboard: TensorBoardConfig
-
 
 
 T = TypeVar("T")
@@ -427,6 +436,26 @@ OUTPUT_GROUP = ArgGroupDef(
     ),
 )
 
+MODEL_GROUP = ArgGroupDef(
+    key="model",
+    title="Model Options",
+    config_cls=ModelConfig,
+    specs=(
+        ArgSpec(flags=("--model-type",), dest="model_type", arg_type=str, default="gaussian", choices=("gaussian", "scaffold"), help="Model architecture to use"),
+        ArgSpec(flags=("--feat-dim",), dest="feat_dim", arg_type=int, default=32, help="Scaffold-GS: anchor feature dimension"),
+        ArgSpec(flags=("--n-offsets",), dest="n_offsets", arg_type=int, default=10, help="Scaffold-GS: number of Gaussians per anchor"),
+        ArgSpec(flags=("--voxel-size",), dest="voxel_size", arg_type=float, default=0.01, help="Scaffold-GS: initial voxel size for anchors"),
+        ArgSpec(flags=("--update-depth",), dest="update_depth", arg_type=int, default=3, help="Scaffold-GS: anchor growing depth"),
+        ArgSpec(flags=("--update-init-factor",), dest="update_init_factor", arg_type=int, default=100, help="Scaffold-GS: anchor growing factor"),
+        ArgSpec(flags=("--update-hierachy-factor",), dest="update_hierachy_factor", arg_type=int, default=4, help="Scaffold-GS: anchor growing hierarchy factor"),
+        ArgSpec(flags=("--use-feat-bank",), dest="use_feat_bank", action="store_true", help="Scaffold-GS: use feature bank for view-dependency"),
+        ArgSpec(flags=("--appearance-dim",), dest="appearance_dim", arg_type=int, default=32, help="Scaffold-GS: appearance embedding dimension"),
+        ArgSpec(flags=("--add-opacity-dist",), dest="add_opacity_dist", action="store_true", help="Scaffold-GS: include distance in opacity MLP"),
+        ArgSpec(flags=("--add-cov-dist",), dest="add_cov_dist", action="store_true", help="Scaffold-GS: include distance in covariance MLP"),
+        ArgSpec(flags=("--add-color-dist",), dest="add_color_dist", action="store_true", help="Scaffold-GS: include distance in color MLP"),
+    ),
+)
+
 TRAINING_GROUP = ArgGroupDef(
     key="training",
     title="Training Parameters",
@@ -624,6 +653,7 @@ TENSORBOARD_GROUP = ArgGroupDef(
 ARG_GROUP_DEFS: Tuple[ArgGroupDef[Any], ...] = (
     REQUIRED_GROUP,
     OUTPUT_GROUP,
+    MODEL_GROUP,
     TRAINING_GROUP,
     DENSIFICATION_GROUP,
     FLOATER_PREVENTION_GROUP,
@@ -675,6 +705,7 @@ def parse_args() -> TrainConfig:
         raw=flat_args,
         required=required_cfg,
         output=_build_group_config(flat_args, OUTPUT_GROUP),
+        model=_build_group_config(flat_args, MODEL_GROUP),
         training=_build_group_config(flat_args, TRAINING_GROUP),
         densification=_build_group_config(flat_args, DENSIFICATION_GROUP),
         floater_prevention=_build_group_config(flat_args, FLOATER_PREVENTION_GROUP),
