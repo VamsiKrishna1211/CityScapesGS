@@ -1,7 +1,49 @@
 from dataclasses import dataclass, asdict
-from typing import TypedDict, Any
+from typing import TypedDict, Any, Dict, Iterator, Optional, Tuple
 
 import torch
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Return Type Dataclasses (for type-safe multi-return values)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class NeuralGaussianOutput:
+    """Typed return from ScaffoldModel.generate_neural_gaussians().
+
+    Fields neural_opacity and selection_mask are None in inference mode.
+    """
+    means: torch.Tensor                         # [M, 3] generated Gaussian positions
+    colors: torch.Tensor                        # [M, 3] RGB colors
+    opacities: torch.Tensor                     # [M, 1] opacity values
+    scales: torch.Tensor                        # [M, 3] scales
+    quats: torch.Tensor                         # [M, 4] quaternion rotations
+    neural_opacity: Optional[torch.Tensor] = None  # [N*k, 1] full opacity before mask (training only)
+    selection_mask: Optional[torch.Tensor] = None  # [N*k] bool mask (training only)
+
+
+@dataclass
+class RenderParams:
+    """Typed return from BaseTrainableModel.get_render_params().
+
+    Replaces the untyped dict currently returned by both GaussianModel and ScaffoldModel.
+    Scaffold-GS-specific fields (neural_opacity, selection_mask) are optional.
+    """
+    means: torch.Tensor                         # [N, 3]
+    colors: torch.Tensor                        # [N, D, 3] SH tensor OR [N, 3] RGB
+    opacities: torch.Tensor                     # [N, 1]
+    scales: torch.Tensor                        # [N, 3]
+    quats: torch.Tensor                         # [N, 4]
+    sh_degree: Optional[int]                    # SH degree or None for SH-disabled
+    neural_opacity: Optional[torch.Tensor] = None   # Scaffold-GS training only
+    selection_mask: Optional[torch.Tensor] = None   # Scaffold-GS training only
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameter and Optimizer Dataclasses
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class Parameters:
@@ -44,8 +86,25 @@ class GSOptimizers:
     def __setitem__(self, key, value):
         setattr(self, key, value)
 
+    def all_optimizers(self) -> Iterator[Tuple[str, "torch.optim.Optimizer"]]:
+        """Iterate over all non-None optimizers (flattened, including extra dict entries).
+
+        Yields:
+            (name, optimizer) tuples for all active optimizers
+        """
+        for name in ("means", "scales", "quats", "opacities", "features_dc", "features_rest"):
+            opt = getattr(self, name)
+            if opt is not None:
+                yield name, opt
+        if self.features_semantics is not None:
+            yield "features_semantics", self.features_semantics
+        for name, opt in self.extra.items():
+            if opt is not None:
+                yield name, opt
+
     # def as_dict(self) -> dict[str, torch.optim.Optimizer]:
     #     return asdict(self)
+
 
 @dataclass
 class GS_LR_Schedulers:
@@ -70,7 +129,22 @@ class GS_LR_Schedulers:
     def __setitem__(self, key, value):
         setattr(self, key, value)
 
-    
+    def all_schedulers(self) -> Iterator[Tuple[str, "torch.optim.lr_scheduler._LRScheduler"]]:
+        """Iterate over all active schedulers (flattened, including extra dict entries).
+
+        Yields:
+            (name, scheduler) tuples for all active schedulers
+        """
+        for name in ("means", "scales", "quats", "opacities", "features_dc", "features_rest", "features_semantics"):
+            sched = getattr(self, name)
+            # Check if it's a scheduler (not None, not a bool, and has a step method)
+            if sched is not None and not isinstance(sched, bool) and hasattr(sched, "step"):
+                yield name, sched
+        for name, sched in self.extra.items():
+            if sched is not None:
+                yield name, sched
+
+
     # schedulers = type('GSSchedulers', (), {})()
     # for name, optimizer in optimizers.__dict__.items():
     #     max_lr = optimizer.param_groups[0]['lr']

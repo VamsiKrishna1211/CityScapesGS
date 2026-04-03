@@ -6,7 +6,7 @@ from typing import Any, List, Optional
 import numpy as np
 import torch
 from gsplat import rasterization
-from model import GaussianModel
+from models.base import BaseTrainableModel, NeuralRenderingMixin
 
 
 @dataclass
@@ -37,6 +37,8 @@ class ViewerParamSync:
         self._cache: Optional[_ViewerRenderCache] = None
         self._last_refresh_step = -1
         self.lod_slider: Optional[Any] = None # Optional viser slider for LoD control
+        self.show_anchors: bool = False  # Toggle flag for anchor point cloud visualization
+        self.hide_gaussians: bool = False  # Toggle flag to hide Gaussian rendering
         self.refresh(step=0, force=True)
 
     @torch.no_grad()
@@ -78,27 +80,32 @@ class ViewerParamSync:
             width = render_tab_state.viewer_width
             height = render_tab_state.viewer_height
 
+        # Return blank frame if Gaussians are hidden
+        if self.hide_gaussians:
+            return np.zeros((height, width, 3), dtype=np.uint8)
+
         c2w = torch.from_numpy(camera_state.c2w).float().to(self.device)
         K = torch.from_numpy(camera_state.get_K((width, height))).float().to(self.device)
         viewmat = torch.linalg.inv(c2w)
 
-        if hasattr(self.model, "generate_neural_gaussians"):
-            # Scaffold-GS dynamic rendering path
+        if isinstance(self.model, NeuralRenderingMixin):
+            # Scaffold-GS dynamic rendering path — model implements neural Gaussian generation
+            if self.show_anchors:
+                # Anchor overlay is shown via viser scene; return blank render
+                return np.zeros((height, width, 3), dtype=np.uint8)
+
             cam = {
                 "camera_center": c2w[:3, 3],
                 "uid": 0,
                 "width": width,
                 "height": height,
             }
-            # Note: generate_neural_gaussians handles its own LOD internally or uses all anchors
-            xyz, color, opacity, scaling, rot = self.model.generate_neural_gaussians(
-                cam, is_training=False
-            )
-            means = xyz
-            quats = rot
-            scales = scaling
-            opacities = opacity.squeeze(-1)
-            colors = color
+            out = self.model.generate_neural_gaussians(cam, is_training=False)
+            means = out.means
+            quats = out.quats
+            scales = out.scales
+            opacities = out.opacities.squeeze(-1)
+            colors = out.colors
             sh_degree = None
         else:
             # Standard GaussianModel cached path

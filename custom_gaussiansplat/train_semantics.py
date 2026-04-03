@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 
 from dataset import ColmapDataset
 from logger import GaussianSplattingLogger
-from model import GaussianModel
+from models import GaussianModel
 from semantic_dataset import SemanticColmapDataset
 from semantic_providers import build_semantic_provider
 from train_semantics_args import SemanticStandaloneConfig, parse_semantic_args

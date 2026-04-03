@@ -1,15 +1,31 @@
 # Custom Gaussian Splatting
 
-This folder contains the training code for a `gsplat`-based 3D Gaussian Splatting pipeline with:
+This folder contains a unified, type-safe training framework for multiple Gaussian Splatting variants using an Abstract Base Class (ABC) + capability mixin pattern.
 
-- COLMAP dataset loading (`custom_gaussiansplat/dataset.py`)
+## Architecture Highlights
+
+- **Unified Model Interface**: `BaseTrainableModel` ABC in `models/base.py` defines a shared contract for all model variants
+  - **Standard 3DGS**: `GaussianModel` with `gsplat.DefaultStrategy` densification
+  - **Scaffold-GS**: `ScaffoldModel` with neural Gaussians and sparse anchor optimization
+  - **Type-Safe Capability Detection**: `isinstance(model, NeuralRenderingMixin)` replaces brittle `hasattr()` checks
+  
+- **Typed Return Values**: `RenderParams` and `NeuralGaussianOutput` dataclasses eliminate untyped dicts and tuple unpacking
+
+- **Flattened Optimizer/Scheduler Access**: `GSOptimizers.all_optimizers()` and `GS_LR_Schedulers.all_schedulers()` iterators simplify training loops
+
+- **Clean Imports**: All models and utilities accessible via `from models import ...` and `from gs_types import ...`
+
+## Features
+
+- COLMAP dataset loading (`dataset.py`)
 - Densification and pruning via `gsplat.DefaultStrategy`
 - Optional depth and regularization losses
 - TensorBoard logging, checkpoint resume, and optional live viewers
-- Standalone semantic fine-tuning (`custom_gaussiansplat/train_semantics.py`)
+- Standalone semantic fine-tuning (`train_semantics.py`)
 
 ## Table of Contents
 
+- [Model Architecture](#model-architecture)
 - [Requirements](#requirements)
 - [Install](#install)
 - [Data Layout](#data-layout)
@@ -21,6 +37,56 @@ This folder contains the training code for a `gsplat`-based 3D Gaussian Splattin
 - [Useful Flags](#useful-flags)
 - [Troubleshooting](#troubleshooting)
 - [Additional Docs](#additional-docs)
+
+## Model Architecture
+
+### Folder Structure
+
+```
+custom_gaussiansplat/
+├── models/                           # Model implementations (ABC + variants)
+│   ├── __init__.py                   # Clean re-export facade
+│   ├── base.py                       # BaseTrainableModel ABC + NeuralRenderingMixin
+│   ├── gaussian.py                   # GaussianModel (standard 3DGS)
+│   └── scaffold.py                   # ScaffoldModel (Scaffold-GS with neural Gaussians)
+├── gs_types.py                       # Typed dataclasses + optimizer/scheduler containers
+├── train.py                          # Training orchestrator using unified model interface
+├── train_semantics.py                # Standalone semantic fine-tuning
+├── dataset.py                        # COLMAP dataset loader
+├── losses.py                         # Loss functions (depth, regularization, photometric)
+└── ...                               # Other utilities
+```
+
+### Model Selection
+
+Both models conform to `BaseTrainableModel` but have different capabilities:
+
+- **`GaussianModel`** (default): Standard 3D Gaussian Splatting
+  - Deterministic point positions (no per-view generation)
+  - `gsplat.DefaultStrategy` handles densification (split/clone) and pruning
+  - Smaller memory footprint
+
+- **`ScaffoldModel`**: Scaffold-GS with neural Gaussians (when `--model-type scaffold`)
+  - Sparse anchor set + MLPs generate view-dependent Gaussians
+  - Implements `NeuralRenderingMixin` (detectable via `isinstance()`)
+  - Higher quality for complex scenes, more memory/compute
+
+### Import Patterns
+
+```python
+# Safe imports (updated in all training/viewer files)
+from models import BaseTrainableModel, GaussianModel, ScaffoldModel, NeuralRenderingMixin
+from gs_types import RenderParams, NeuralGaussianOutput, GSOptimizers, GS_LR_Schedulers
+
+# Type-safe capability detection (replaces hasattr checks)
+if isinstance(model, NeuralRenderingMixin):
+    output = model.generate_neural_gaussians(cam)  # pyright knows this exists
+```
+
+### Typed Returns
+
+- **`RenderParams`** (from `model.get_render_params()`): Typed container with `means`, `colors`, `opacities`, `scales`, `quats`, `sh_degree`, and optional `neural_opacity`/`selection_mask`.
+- **`NeuralGaussianOutput`** (from `ScaffoldModel.generate_neural_gaussians()`): Typed container with generated Gaussian properties and optional training-only fields.
 
 ## Requirements
 
