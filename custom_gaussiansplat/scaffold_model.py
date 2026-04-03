@@ -6,11 +6,10 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+from gs_types import GSOptimizers, Parameters
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from torch_scatter import scatter_max
-
-from gs_types import GSOptimizers, Parameters
 
 # Module-level logger
 logger = logging.getLogger("cityscape_gs.scaffold_model")
@@ -135,6 +134,15 @@ class ScaffoldModel(nn.Module):
     def opacities(self): return torch.sigmoid(self._opacity)
 
     @property
+    def point_name(self) -> str:
+        return "anchors"
+
+    @property
+    def count_label(self) -> str:
+        """Short label used in the training progress bar."""
+        return "Anchors"
+
+    @property
     def features_dc(self): return self._anchor_feat
 
     @property
@@ -152,34 +160,34 @@ class ScaffoldModel(nn.Module):
 
     def get_params_dict(self) -> Dict[str, nn.Parameter]:
         return {
-            "anchor": self._anchor,
-            "scaling": self._scaling,
-            "rotation": self._rotation,
-            "opacity": self._opacity,
-            "anchor_feat": self._anchor_feat,
-            "offset": self._offset,
+            "means": self._anchor,
+            "scales": self._scaling,
+            "quats": self._rotation,
+            "opacities": self._opacity,
+            "features_dc": self._anchor_feat,
+            "features_rest": self._offset,
         }
 
     def get_optimizers_dict(self, optimizers: GSOptimizers) -> Dict[str, torch.optim.Optimizer]:
         d = {
-            "anchor": optimizers.means,
-            "scaling": optimizers.scales,
-            "rotation": optimizers.quats,
-            "opacity": optimizers.opacities,
-            "anchor_feat": optimizers.features_dc,
-            "offset": optimizers.features_rest,
+            "means": optimizers.means,
+            "scales": optimizers.scales,
+            "quats": optimizers.quats,
+            "opacities": optimizers.opacities,
+            "features_dc": optimizers.features_dc,
+            "features_rest": optimizers.features_rest,
         }
         if optimizers.extra:
             d.update(optimizers.extra)
         return d
 
     def update_params_from_dict(self, params: Dict[str, nn.Parameter]):
-        self._anchor = params["anchor"]
-        self._scaling = params["scaling"]
-        self._rotation = params["rotation"]
-        self._opacity = params["opacity"]
-        self._anchor_feat = params["anchor_feat"]
-        self._offset = params["offset"]
+        self._anchor = params["means"]
+        self._scaling = params["scales"]
+        self._rotation = params["quats"]
+        self._opacity = params["opacities"]
+        self._anchor_feat = params["features_dc"]
+        self._offset = params["features_rest"]
 
     def create_from_pcd(self, points: torch.Tensor):
         num_init_points = points.shape[0]
@@ -226,6 +234,7 @@ class ScaffoldModel(nn.Module):
         # Update LoD info for compatibility
         self.lod_offsets = [num_points]
 
+    @torch.compile
     def generate_neural_gaussians(self, viewpoint_camera, visible_mask=None, is_training=True):
         if visible_mask is None:
             visible_mask = torch.ones(self._anchor.shape[0], dtype=torch.bool, device=self._anchor.device)
@@ -322,7 +331,7 @@ class ScaffoldModel(nn.Module):
         else:
             return xyz, masked_color, opacity, scaling, rot
 
-    def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask):
+    def update_training_stats(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask):
         with torch.no_grad():
             temp_opacity = opacity.clone().view(-1).detach()
             temp_opacity[temp_opacity < 0] = 0
@@ -346,7 +355,11 @@ class ScaffoldModel(nn.Module):
             final_mask[combined_mask] = update_filter
             
             if viewspace_point_tensor.grad is not None:
-                grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True)
+                # grad may have a leading camera/batch dim from gsplat: (C, N, 2) → (N, 2)
+                grad = viewspace_point_tensor.grad
+                if grad.dim() == 3:
+                    grad = grad.squeeze(0)
+                grad_norm = torch.norm(grad[update_filter, :2], dim=-1, keepdim=True)
                 self.offset_gradient_accum[final_mask] += grad_norm
                 self.offset_denom[final_mask] += 1
 
@@ -434,22 +447,22 @@ class ScaffoldModel(nn.Module):
         
         new_offsets = torch.zeros((num_new, self.n_offsets, 3), device=device)
 
-        # Update parameters and optimizers
+        # Keys match GSOptimizers field names for correct optimizer state updates.
         d = {
-            "anchor": new_anchors,
-            "scaling": new_scaling,
-            "rotation": new_rotation,
-            "anchor_feat": new_feat,
-            "offset": new_offsets,
-            "opacity": new_opacities,
+            "means": new_anchors,
+            "scales": new_scaling,
+            "quats": new_rotation,
+            "features_dc": new_feat,
+            "features_rest": new_offsets,
+            "opacities": new_opacities,
         }
         
-        self._anchor = nn.Parameter(torch.cat([self._anchor, d["anchor"]], dim=0))
-        self._scaling = nn.Parameter(torch.cat([self._scaling, d["scaling"]], dim=0))
-        self._rotation = nn.Parameter(torch.cat([self._rotation, d["rotation"]], dim=0))
-        self._anchor_feat = nn.Parameter(torch.cat([self._anchor_feat, d["anchor_feat"]], dim=0))
-        self._offset = nn.Parameter(torch.cat([self._offset, d["offset"]], dim=0))
-        self._opacity = nn.Parameter(torch.cat([self._opacity, d["opacity"]], dim=0))
+        self._anchor = nn.Parameter(torch.cat([self._anchor, d["means"]], dim=0))
+        self._scaling = nn.Parameter(torch.cat([self._scaling, d["scales"]], dim=0))
+        self._rotation = nn.Parameter(torch.cat([self._rotation, d["quats"]], dim=0))
+        self._anchor_feat = nn.Parameter(torch.cat([self._anchor_feat, d["features_dc"]], dim=0))
+        self._offset = nn.Parameter(torch.cat([self._offset, d["features_rest"]], dim=0))
+        self._opacity = nn.Parameter(torch.cat([self._opacity, d["opacities"]], dim=0))
 
         # Update buffers
         self.opacity_accum = torch.cat([self.opacity_accum, torch.zeros((num_new, 1), device=device)], dim=0)
@@ -458,34 +471,48 @@ class ScaffoldModel(nn.Module):
         if optimizers is not None:
             self.update_optimizers_after_growth(d, optimizers)
 
+    # Mapping from unified GSOptimizers key names to internal parameter attributes.
+    _PARAM_ATTR = {
+        "means": "_anchor",
+        "scales": "_scaling",
+        "quats": "_rotation",
+        "opacities": "_opacity",
+        "features_dc": "_anchor_feat",
+        "features_rest": "_offset",
+    }
+
+    def _get_opt(self, optimizers, name):
+        """Retrieve optimizer by unified name from GSOptimizers or a plain dict."""
+        if isinstance(optimizers, dict):
+            return optimizers.get(name)
+        return getattr(optimizers, name, None)
+
     def update_optimizers_after_growth(self, new_data, optimizers):
-        # Implementation of cat_tensors_to_optimizer logic
+        """Extend Adam moment tensors and re-point optimizers to new Parameters.
+
+        new_data uses unified GSOptimizers key names ("means", "scales", etc.).
+        """
         for name, tensor in new_data.items():
-            opt = getattr(optimizers, name, None)
-            if opt is None: continue
-            
+            opt = self._get_opt(optimizers, name)
+            if opt is None:
+                continue
+
             param = opt.param_groups[0]['params'][0]
             stored_state = opt.state.get(param, None)
-            
+            attr = self._PARAM_ATTR[name]
+            new_param = getattr(self, attr)
+
             if stored_state is not None:
-                stored_state["exp_avg"] = torch.cat([stored_state["exp_avg"], torch.zeros_like(tensor)], dim=0)
-                stored_state["exp_avg_sq"] = torch.cat([stored_state["exp_avg_sq"], torch.zeros_like(tensor)], dim=0)
-                
+                stored_state["exp_avg"] = torch.cat(
+                    [stored_state["exp_avg"], torch.zeros_like(tensor)], dim=0
+                )
+                stored_state["exp_avg_sq"] = torch.cat(
+                    [stored_state["exp_avg_sq"], torch.zeros_like(tensor)], dim=0
+                )
                 del opt.state[param]
-                # The parameter itself is already updated in self._anchor etc.
-                # We just need to point the optimizer to the new Parameter object
-                new_param = getattr(self, f"_{name}" if name == "anchor" or name == "offset" or name == "anchor_feat" else f"_{name}")
-                if name == "anchor": new_param = self._anchor
-                elif name == "offset": new_param = self._offset
-                elif name == "anchor_feat": new_param = self._anchor_feat
-                elif name == "scaling": new_param = self._scaling
-                elif name == "rotation": new_param = self._rotation
-                elif name == "opacity": new_param = self._opacity
-                
                 opt.param_groups[0]['params'][0] = new_param
                 opt.state[new_param] = stored_state
             else:
-                new_param = getattr(self, f"_{name}") # Simplified
                 opt.param_groups[0]['params'][0] = new_param
 
     def prune_anchor(self, mask, optimizers=None):
@@ -504,20 +531,21 @@ class ScaffoldModel(nn.Module):
             self.update_optimizers_after_pruning(valid_mask, optimizers)
 
     def update_optimizers_after_pruning(self, valid_mask, optimizers):
-        for name in ["anchor", "offset", "anchor_feat", "scaling", "rotation", "opacity"]:
-            opt = getattr(optimizers, name, None)
-            if opt is None: continue
-            
+        """Slice Adam moment tensors and re-point optimizers after anchor pruning."""
+        for name, attr in self._PARAM_ATTR.items():
+            opt = self._get_opt(optimizers, name)
+            if opt is None:
+                continue
+
             param = opt.param_groups[0]['params'][0]
             stored_state = opt.state.get(param, None)
-            
+
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][valid_mask]
                 stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][valid_mask]
-                
+
                 del opt.state[param]
-                new_param = getattr(self, f"_{name}" if name in ["anchor", "offset", "anchor_feat"] else f"_{name}")
-                if name == "anchor": new_param = self._anchor
+                new_param = getattr(self, attr)
                 opt.param_groups[0]['params'][0] = new_param
                 opt.state[new_param] = stored_state
 
@@ -602,6 +630,38 @@ class ScaffoldModel(nn.Module):
         if self.embedding_appearance is not None and checkpoint['appearance'] is not None:
             self.embedding_appearance.load_state_dict(checkpoint['appearance'])
     
+    def get_render_params(self, cam, sh_cfg=None, is_training: bool = True, lod=None) -> dict:
+        """Return rasterization-ready tensors for this view.
+
+        Returns a dict with keys matching GaussianModel.get_render_params so
+        that Rasterizer.render() can call the same method on both model types
+        without any isinstance checks.
+        """
+        if is_training:
+            xyz, color, opacity, scaling, rot, neural_opacity, mask = \
+                self.generate_neural_gaussians(cam, is_training=True)
+            return {
+                "means": xyz,
+                "colors": color,
+                "opacities": opacity,
+                "scales": scaling,
+                "quats": rot,
+                "sh_degree": None,
+                "neural_opacity": neural_opacity,
+                "selection_mask": mask,
+            }
+        else:
+            xyz, color, opacity, scaling, rot = \
+                self.generate_neural_gaussians(cam, is_training=False)
+            return {
+                "means": xyz,
+                "colors": color,
+                "opacities": opacity,
+                "scales": scaling,
+                "quats": rot,
+                "sh_degree": None,
+            }
+
     def compute_lods(self, num_levels: int = 1, factor: int = 4, optimizers=None):
         """
         Scaffold-GS doesn't support LoD in the traditional sense, but this method

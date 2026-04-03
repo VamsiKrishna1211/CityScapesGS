@@ -90,8 +90,14 @@ class GaussianModel(nn.Module):
         self.lod_offsets = [num_points] # Default to single level (all points)
 
     @property
-    def means(self): return self._means
-    
+    def point_name(self) -> str:
+        return "Gaussians"
+
+    @property
+    def count_label(self) -> str:
+        """Short label used in the training progress bar."""
+        return "GS"
+
     @property
     def means(self): return self._means
 
@@ -258,6 +264,30 @@ class GaussianModel(nn.Module):
             features_dc=self._features_dc[:end_idx],
             features_rest=self._features_rest[:end_idx]
         )
+
+    def get_render_params(self, cam, sh_cfg, is_training: bool = True, lod: Optional[int] = None) -> dict:
+        """Return rasterization-ready tensors for this view.
+
+        Returns a dict with the same keys as ScaffoldModel.get_render_params so
+        that Rasterizer.render() can call one unified method on both model types.
+        """
+        params = self.get_lod_params(lod)
+
+        if not sh_cfg.disable_sh_rendering:
+            colors = torch.cat([params.features_dc, params.features_rest], dim=1)
+            sh_degree = self.sh_degree
+        else:
+            colors = self.sh_dc_to_rgb(params.features_dc).squeeze(1)
+            sh_degree = None
+
+        return {
+            "means": params.means,
+            "colors": colors,
+            "opacities": params.opacities,
+            "scales": params.scales,
+            "quats": params.quats,
+            "sh_degree": sh_degree,
+        }
 
     def get_params_dict(self) -> Dict[str, nn.Parameter]:
         """Get model parameters as dictionary for strategy interface.

@@ -110,6 +110,9 @@ torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 
+# Allows dynamism on parms
+torch._dynamo.config.force_parameter_static_shapes = False
+
 ACTIVE_PROGRESS: Optional[Progress] = None
 
 
@@ -306,51 +309,29 @@ class Rasterizer:
         viewmat = _build_viewmat(cam, device)
         K = _build_intrinsics(cam, device)
 
-        if isinstance(self.model, ScaffoldModel):
-            # Scaffold-GS path: generate Gaussians from anchors
-            xyz, color, opacity, scaling, rot, neural_opacity, mask = self.model.generate_neural_gaussians(
-                cam, is_training=True
-            )
-            means = xyz
-            quats = rot
-            scales = scaling
-            opacities = opacity
-            colors = color
-            sh_degree = None # Scaffold-GS typically doesn't use SH on decoded Gaussians
-        else:
-            # Original GaussianModel path
-            params = self.model.get_lod_params(lod)
-            means = params.means
-            scales = params.scales
-            quats = params.quats
-            opacities = params.opacities
-
-            if not self.sh_cfg.disable_sh_rendering:
-                colors = torch.cat([params.features_dc, params.features_rest], dim=1)
-            else:
-                colors = self.model.sh_dc_to_rgb(params.features_dc).squeeze(1)
-            sh_degree = self.model.sh_degree if not self.sh_cfg.disable_sh_rendering else None
+        rp = self.model.get_render_params(cam, self.sh_cfg, is_training=True, lod=lod)
 
         render_output, render_alpha, render_meta = rasterization(
-            means=means,
-            quats=quats,
-            scales=scales,
-            opacities=opacities.squeeze(-1),
-            colors=colors,
+            means=rp["means"],
+            quats=rp["quats"],
+            scales=rp["scales"],
+            opacities=rp["opacities"].squeeze(-1),
+            colors=rp["colors"],
             viewmats=viewmat,
             Ks=K[None, ...],
             width=cam["width"],
             height=cam["height"],
-            sh_degree=sh_degree,
+            sh_degree=rp["sh_degree"],
             packed=self.packed,
             absgrad=self.absgrad,
             render_mode="RGB+ED",
             camera_model="pinhole"
         )
 
-        if isinstance(self.model, ScaffoldModel):
-            render_meta["neural_opacity"] = neural_opacity
-            render_meta["selection_mask"] = mask
+        # Forward any model-specific meta fields (e.g. Scaffold-GS neural_opacity).
+        for key in ("neural_opacity", "selection_mask"):
+            if key in rp:
+                render_meta[key] = rp[key]
 
         render = render_output[..., 0:3]             # [B, H, W, 3]
         alpha = render_alpha                          # [B, H, W, 1]
@@ -497,7 +478,7 @@ class LossComputer:
         return acc, m
 
     def _compute_regularization(
-        self, model: GaussianModel, step: int,
+        self, model: GaussianModel | ScaffoldModel, step: int,
     ) -> Tuple[torch.Tensor, dict]:
         """Compute floater-prevention regularization losses."""
         fcfg = self.floater_cfg
@@ -508,7 +489,7 @@ class LossComputer:
         if fcfg.enable_scale_reg:
             v = losses.scale_regularization(
                 model.scales, weight=fcfg.scale_reg_weight,
-                scene_extent=float(getattr(self, "scene_extent", 1.0)),
+                scene_extent=float(self.scene_extent),
             )
             acc = acc + v
             m["scale_reg_loss"] = v.item()
@@ -526,7 +507,7 @@ class LossComputer:
                 and step >= fcfg.opacity_entropy_reg_start_iter
                 and step <= fcfg.opacity_entropy_reg_end_iter):
             v = losses.opacity_entropy_regularization(
-                model._opacities, weight=fcfg.opacity_entropy_reg_weight,
+                model.opacities, weight=fcfg.opacity_entropy_reg_weight,
             )
             acc = acc + v
             m["opacity_entropy_reg_loss"] = v.item()
@@ -542,7 +523,7 @@ class LossComputer:
         render_out: RenderOutput,
         gt_image: torch.Tensor,
         depth_tensor: Optional[torch.Tensor],
-        model: GaussianModel,
+        model: GaussianModel | ScaffoldModel,
         cam_data: CameraData,
         step: int,
     ) -> LossResult:
@@ -705,9 +686,9 @@ class TrainingLogger:
             "l1_loss": metrics["l1_loss"],
             "ssim_loss": metrics["ssim_loss"],
             "lpips_loss": metrics["lpips_loss"],
-            "scale_reg_loss": metrics.get("scale_reg_loss", 0.0),
-            "opacity_reg_loss": metrics.get("opacity_reg_loss", 0.0),
-            "opacity_entropy_reg_loss": metrics.get("opacity_entropy_reg_loss", 0.0),
+            "scale_reg_loss": metrics["scale_reg_loss"],
+            "opacity_reg_loss": metrics["opacity_reg_loss"],
+            "opacity_entropy_reg_loss": metrics["opacity_entropy_reg_loss"],
         }
         # Only include optional depth keys when active
         optional_keys = [
@@ -744,8 +725,9 @@ class TrainingLogger:
                      else "Refinement")
             desc = format_phase_description(
                 step, phase, m["total_loss"], m["l1_loss"], m["ssim_loss"],
-                m["lpips_loss"], m["psnr"], m.get("scale_reg_loss", 0.0),
+                m["lpips_loss"], m["psnr"], m["scale_reg_loss"],
                 num_gaussians,
+                count_label=model.count_label,
             )
             self.progress.update(self.task_id, advance=1, description=desc)
 
@@ -888,7 +870,7 @@ class GaussianSplatTrainer:
         self.scaler = torch.amp.GradScaler(device=self.device, enabled=self.training_cfg.use_low_vram)
 
         # Will be initialized in setup methods
-        self.model: Optional[GaussianModel] = None
+        self.model: Optional[Union[GaussianModel, ScaffoldModel]] = None
         self.dataset: Optional[ColmapDataset | InstantNGPDataset | MatrixCityDataset] = None
         self.logger: Optional[logging.Logger] = None
         self.tb_logger: Optional[GaussianSplattingLogger] = None
@@ -897,7 +879,7 @@ class GaussianSplatTrainer:
         self.loss_computer: Optional[LossComputer] = None
         self.optimizers: Optional[GSOptimizers] = None
         self.schedulers: Optional[GS_LR_Schedulers] = None
-        self.strategy: Optional[DefaultStrategy] = None
+        self.strategy: Optional[Any] = None  # DefaultStrategy or ScaffoldStrategy
         self.strategy_state: Optional[dict[str, Any]] = None
         self.viewer: Optional[Any] = None
         self.server: Optional[Any] = None
@@ -1029,7 +1011,7 @@ class GaussianSplatTrainer:
                 tb_purge_step = self.start_iteration
             if self.VERBOSITY >= 1:
                 num_pts = len(self.model.means)
-                self.logger.info(f"[green]✓ Loaded model with {num_pts:,} {'anchors' if isinstance(self.model, ScaffoldModel) else 'Gaussians'}[/green]")
+                self.logger.info(f"[green]✓ Loaded model with {num_pts:,} {self.model.point_name}[/green]")
                 self.logger.info(f"[green]  Resuming from iteration {checkpoint['iteration']:,}[/green]")
         else:
             if self.config.model.model_type == "scaffold":
@@ -1088,10 +1070,19 @@ class GaussianSplatTrainer:
             raise RuntimeError("Dataset must be initialized before strategy setup")
 
         if self.config.model.model_type == "scaffold":
-            self.strategy = None
-            self.strategy_state = None
+            from strategy_scaffold import ScaffoldStrategy
+            self.strategy = ScaffoldStrategy(
+                model=self.model,
+                densify_from_iter=dcfg.densify_from_iter,
+                densify_until_iter=dcfg.densify_until_iter,
+                densify_interval=dcfg.densify_interval,
+                grad_threshold=dcfg.grad_threshold,
+                prune_opa=dcfg.prune_opa,
+                verbose=(self.VERBOSITY >= 2),
+            )
+            self.strategy_state = self.strategy.initialize_state()
             if self.VERBOSITY >= 1:
-                self.logger.info("[cyan]🏗️ Scaffold-GS approach:[/cyan] Using anchor-based densification (skipping DefaultStrategy)")
+                self.logger.info("[cyan]🏗️ Scaffold-GS:[/cyan] Using ScaffoldStrategy for anchor-based densification")
         else:
             self.strategy = DefaultStrategy(
                 prune_opa=dcfg.prune_opa,
@@ -1105,7 +1096,7 @@ class GaussianSplatTrainer:
                 refine_every=dcfg.densify_interval,
                 reset_every=dcfg.opacity_reset_interval,
                 pause_refine_after_reset=0,
-                absgrad=False,
+                absgrad=self.config.densification.absgrad,
                 revised_opacity=False,
                 verbose=(self.VERBOSITY >= 2),
             )
@@ -1159,7 +1150,7 @@ class GaussianSplatTrainer:
     def _setup_optimizers(self) -> None:
         if self.model is None:
             raise RuntimeError("Model must be initialized before optimizer setup")
-        if self.strategy is None and self.config.model.model_type != "scaffold":
+        if self.strategy is None:
             raise RuntimeError("Strategy must be initialized before optimizer setup")
         if self.logger is None:
             raise RuntimeError("Logger must be initialized before optimizer setup")
@@ -1180,11 +1171,10 @@ class GaussianSplatTrainer:
             self.logger.debug("[cyan]📈 Optimizers & Schedulers:[/cyan] Adam + CosineAnnealingLR initialized")
 
         # Validate strategy <-> params <-> optimizers wiring once optimizers exist.
-        if self.strategy is not None:
-            self.strategy.check_sanity(
-                self.model.get_params_dict(),
-                self.model.get_optimizers_dict(self.optimizers),
-            )
+        self.strategy.check_sanity(
+            self.model.get_params_dict(),
+            self.model.get_optimizers_dict(self.optimizers),
+        )
 
         # Restore optimizer states from checkpoint
         if self._checkpoint is not None and "optimizers_state_dict" in self._checkpoint:
@@ -1214,15 +1204,14 @@ class GaussianSplatTrainer:
         if self.logger is None:
             raise RuntimeError("App logger must be initialized before component setup")
         
-        # Strategy can be None for ScaffoldModel
-        if self.strategy is None and self.config.model.model_type != "scaffold":
+        if self.strategy is None:
             raise RuntimeError("Strategy must be initialized before component setup")
 
         self.rasterizer = Rasterizer(
             self.model,
             self.sh_cfg,
             packed=False,
-            absgrad=bool(getattr(self.strategy, "absgrad", False)) if self.strategy is not None else False,
+            absgrad=self.config.densification.absgrad,
         )
         self.loss_computer = LossComputer(
             self.training_cfg, self.depth_cfg, self.floater_cfg,
@@ -1427,10 +1416,8 @@ class GaussianSplatTrainer:
             raise RuntimeError("Model is not initialized")
         if self.rasterizer is None:
             raise RuntimeError("Rasterizer is not initialized")
-        # Strategy is None for Scaffold-GS (uses manual densification)
-        if self.config.model.model_type != "scaffold":
-            if self.strategy is None or self.strategy_state is None:
-                raise RuntimeError("Strategy is not initialized")
+        if self.strategy is None or self.strategy_state is None:
+            raise RuntimeError("Strategy is not initialized")
         if self.optimizers is None:
             raise RuntimeError("Optimizers are not initialized")
         if self.schedulers is None:
@@ -1465,7 +1452,7 @@ class GaussianSplatTrainer:
             )
 
         # Render and compute loss (with optional mixed precision)
-        with torch.cuda.amp.autocast(enabled=self.training_cfg.use_low_vram):
+        with torch.amp.autocast(device_type=self.device.type, enabled=self.training_cfg.use_low_vram):
             render_out = self.rasterizer.render(cam, gt_image, self.device)
 
             if self.sh_cfg.disable_sh_rendering and step == self.start_iteration and self.VERBOSITY >= 1:
@@ -1477,13 +1464,11 @@ class GaussianSplatTrainer:
                     f"mean={dc_rgb.mean().item():.4f}"
                 )
 
-            # Strategy pre-backward (only for non-Scaffold models)
-            if self.config.model.model_type != "scaffold":
-                params = self.model.get_params_dict()
-                optimizers_dict = self.model.get_optimizers_dict(self.optimizers)
-                self.strategy.step_pre_backward(
-                    params, optimizers_dict, self.strategy_state, step, render_out.meta,
-                )
+            params = self.model.get_params_dict()
+            optimizers_dict = self.model.get_optimizers_dict(self.optimizers)
+            self.strategy.step_pre_backward(
+                params, optimizers_dict, self.strategy_state, step, render_out.meta,
+            )
 
             # Compute loss
             if self.model is None:
@@ -1526,57 +1511,14 @@ class GaussianSplatTrainer:
         else:
             loss_result.total_loss.backward()
 
-        # Strategy post-backward (densification/pruning)
+        # Strategy post-backward (densification/pruning) — unified for all model types.
         gaussians_before = len(self.model.means)
-        if self.config.model.model_type == "scaffold":
-            # Scaffold-GS specific densification logic
-            dcfg = self.densification_cfg
-            if step >= dcfg.densify_from_iter and step <= dcfg.densify_until_iter:
-                # Add stats for anchor growing
-                means2d = render_out.meta.get("means2d")
-                if means2d is not None:
-                    opacity = render_out.meta.get("neural_opacity")
-                    selection_mask = render_out.meta.get("selection_mask")
-                    radii = render_out.meta.get("radii")
-                    
-                    # Ensure radii is 1D boolean mask
-                    if radii is not None:
-                        visibility_filter = (radii > 0)
-                        # Handle potential extra dimensions
-                        while visibility_filter.dim() > 1:
-                            visibility_filter = visibility_filter.any(dim=-1)
-                    else:
-                        # Fallback if radii not available
-                        visibility_filter = torch.ones(means2d.shape[0], dtype=torch.bool, device=self.device)
-                    
-                    anchor_visible_mask = torch.ones(len(self.model.anchors), dtype=torch.bool, device=self.device)
-                    
-                    self.model.training_statis(
-                        viewspace_point_tensor=means2d,
-                        opacity=opacity,
-                        update_filter=visibility_filter,
-                        offset_selection_mask=selection_mask,
-                        anchor_visible_mask=anchor_visible_mask
-                    )
-
-                # Periodically adjust anchors
-                if step > dcfg.densify_from_iter and step % dcfg.densify_interval == 0:
-                    self.model.adjust_anchor(
-                        check_interval=dcfg.densify_interval,
-                        success_threshold=0.8,
-                        grad_threshold=dcfg.grad_threshold,
-                        min_opacity=dcfg.prune_opa,
-                        optimizers=self.optimizers
-                    )
-        else:
-            params = self.model.get_params_dict()
-            optimizers_dict = self.model.get_optimizers_dict(self.optimizers)
-            self.strategy.step_post_backward(
-                params=params, optimizers=optimizers_dict,
-                state=self.strategy_state, step=step,
-                info=render_out.meta, packed=self.rasterizer.packed,
-            )
-            self.model.update_params_from_dict(params)
+        self.strategy.step_post_backward(
+            params=params, optimizers=optimizers_dict,
+            state=self.strategy_state, step=step,
+            info=render_out.meta, packed=self.rasterizer.packed,
+        )
+        self.model.update_params_from_dict(params)
         gaussians_after = len(self.model.means)
 
         # Clear CUDA cache periodically (more aggressive in low VRAM mode)

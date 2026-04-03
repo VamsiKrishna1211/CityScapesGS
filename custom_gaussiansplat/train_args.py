@@ -69,6 +69,7 @@ class DensificationConfig:
     max_screen_size: int
     opacity_reset_interval: int
     opacity_reset_value: float
+    absgrad: bool
 
 
 @dataclass
@@ -491,6 +492,7 @@ DENSIFICATION_GROUP = ArgGroupDef(
         ArgSpec(flags=("--max-screen-size",), dest="max_screen_size", arg_type=int, default=5000, help="Maximum screen size in pixels for pruning (increase for large scenes, e.g., 100-200)"),
         ArgSpec(flags=("--opacity-reset-interval",), dest="opacity_reset_interval", arg_type=int, default=3000, help="Reset opacity every N iterations"),
         ArgSpec(flags=("--opacity-reset-value",), dest="opacity_reset_value", arg_type=float, default=0.01, help="Opacity value to reset to (0.01-0.1, lower = more aggressive floater removal)"),
+        ArgSpec(flags=("--absgrad",), dest="absgrad", action="store_true", default=False, help="Use absolute gradients for densification decisions (standard Gaussian model only)"),
     ),
 )
 
