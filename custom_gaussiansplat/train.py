@@ -87,7 +87,12 @@ from fused_ssim import fused_ssim  # type: ignore[import-untyped]
 from gs_types import GS_LR_Schedulers, GSOptimizers, RenderParams
 from logger import GaussianSplattingLogger, configure_app_logger
 from model_factory import ModelFactory
-from models import BaseTrainableModel, GaussianModel, NeuralRenderingMixin, ScaffoldModel
+from models import (
+    BaseTrainableModel,
+    GaussianModel,
+    NeuralRenderingMixin,
+    ScaffoldModel,
+)
 from ns_viewer import NSReplicaViewer, NSReplicaViewerConfig
 from rich import box
 from rich.console import Console
@@ -104,8 +109,11 @@ from rich.progress import (
 )
 from rich.table import Table
 from train_args import DepthConfig, FloaterPreventionConfig, TrainConfig, parse_args
-from utils import format_phase_description
+from utils import format_phase_description, seed_everything
 from viewer_sync import ViewerParamSync
+
+seed_everything(42)
+
 
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.allow_tf32 = True

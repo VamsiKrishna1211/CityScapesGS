@@ -13,14 +13,16 @@ class NeuralGaussianOutput:
     """Typed return from ScaffoldModel.generate_neural_gaussians().
 
     Fields neural_opacity and selection_mask are None in inference mode.
+    language_features is None when language feature learning is disabled.
     """
     means: torch.Tensor                         # [M, 3] generated Gaussian positions
     colors: torch.Tensor                        # [M, 3] RGB colors
     opacities: torch.Tensor                     # [M, 1] opacity values
     scales: torch.Tensor                        # [M, 3] scales
     quats: torch.Tensor                         # [M, 4] quaternion rotations
-    neural_opacity: Optional[torch.Tensor] = None  # [N*k, 1] full opacity before mask (training only)
-    selection_mask: Optional[torch.Tensor] = None  # [N*k] bool mask (training only)
+    neural_opacity: Optional[torch.Tensor] = None    # [N*k, 1] full opacity before mask (training only)
+    selection_mask: Optional[torch.Tensor] = None    # [N*k] bool mask (training only)
+    language_features: Optional[torch.Tensor] = None # [M, lang_feat_dim] compact language features
 
 
 @dataclass
@@ -29,6 +31,7 @@ class RenderParams:
 
     Replaces the untyped dict currently returned by both GaussianModel and ScaffoldModel.
     Scaffold-GS-specific fields (neural_opacity, selection_mask) are optional.
+    language_features is populated when the model has enable_language_features=True.
     """
     means: torch.Tensor                         # [N, 3]
     colors: torch.Tensor                        # [N, D, 3] SH tensor OR [N, 3] RGB
@@ -36,8 +39,9 @@ class RenderParams:
     scales: torch.Tensor                        # [N, 3]
     quats: torch.Tensor                         # [N, 4]
     sh_degree: Optional[int]                    # SH degree or None for SH-disabled
-    neural_opacity: Optional[torch.Tensor] = None   # Scaffold-GS training only
-    selection_mask: Optional[torch.Tensor] = None   # Scaffold-GS training only
+    neural_opacity: Optional[torch.Tensor] = None    # Scaffold-GS training only
+    selection_mask: Optional[torch.Tensor] = None    # Scaffold-GS training only
+    language_features: Optional[torch.Tensor] = None # [N, lang_feat_dim] compact language features
 
 
 # ─────────────────────────────────────────────────────────────────────────────

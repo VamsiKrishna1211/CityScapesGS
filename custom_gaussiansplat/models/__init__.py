@@ -7,8 +7,8 @@ Provides:
 - ScaffoldModel: Scaffold-GS with neural MLPs for Gaussian generation
 """
 
-from .base import BaseTrainableModel, NeuralRenderingMixin
+from .base import BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin
 from .gaussian import GaussianModel
 from .scaffold import ScaffoldModel
 
-__all__ = ["BaseTrainableModel", "NeuralRenderingMixin", "GaussianModel", "ScaffoldModel"]
+__all__ = ["BaseTrainableModel", "NeuralRenderingMixin", "SemanticsMixin", "GaussianModel", "ScaffoldModel"]

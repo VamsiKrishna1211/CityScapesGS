@@ -6,12 +6,12 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+from gs_types import GSOptimizers, NeuralGaussianOutput, Parameters, RenderParams
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from torch_scatter import scatter_max
 
 from .base import BaseTrainableModel, NeuralRenderingMixin
-from gs_types import GSOptimizers, Parameters, NeuralGaussianOutput, RenderParams
 
 # Module-level logger
 logger = logging.getLogger("cityscape_gs.models.scaffold")
@@ -29,6 +29,25 @@ class Embedding(nn.Module):
     def forward(self, in_tensor: torch.Tensor) -> torch.Tensor:
         return self.embedding(in_tensor)
 
+class GaussianFourierFeatureMapping(nn.Module):
+    """
+    Projects low-dimensional coordinates (like view directions) into a higher-dimensional 
+    Fourier feature space to overcome the spectral bias of MLPs.
+    """
+    def __init__(self, input_dim: int = 3, num_frequencies: int = 64, scale: float = 5.0) -> None:
+        super().__init__()
+        # Sample frequencies from a Gaussian distribution: N(0, scale^2)
+        B = torch.randn(num_frequencies, input_dim) * scale
+        
+        # Register B as a buffer so it saves in the state_dict and moves to the correct GPU,
+        # but is NOT updated by the optimizer.
+        self.register_buffer('B', B)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Project the input coordinates onto the frequency basis
+        x_projected = (2.0 * np.pi * x) @ self.B.t()
+        # Apply sin and cos, then concatenate
+        return torch.cat([torch.sin(x_projected), torch.cos(x_projected)], dim=-1).contiguous()
 
 class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin):
     def __init__(self, 
@@ -45,6 +64,8 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin):
                  add_cov_dist: bool = False,
                  add_color_dist: bool = False,
                  sh_degree: int = 3,
+                 fourier_freqs: int = 256, 
+                 fourier_scale: float = 6.05,
                  console=None):
         super().__init__()
         self.console = console
@@ -79,37 +100,55 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin):
         # LoD compatibility (Scaffold-GS doesn't use LoD but needs this for unified API)
         self.lod_offsets = [0]  # Will be updated in create_from_pcd
 
+        self.fourier_embedder = GaussianFourierFeatureMapping(
+            input_dim=3, 
+            num_frequencies=fourier_freqs, 
+            scale=fourier_scale
+        )
+        self.fourier_embedder = torch.compile(self.fourier_embedder)
+        
+        # The new view dimension size (concatenated sin and cos)
+        view_embed_dim = fourier_freqs * 2
+
         # --- MLPs ---
         self.opacity_dist_dim = 1 if self.add_opacity_dist else 0
         self.mlp_opacity = nn.Sequential(
-            nn.Linear(feat_dim + 3 + self.opacity_dist_dim, feat_dim),
+            # nn.Linear(feat_dim + 3 + self.opacity_dist_dim, feat_dim),
+            nn.Linear(feat_dim + view_embed_dim + self.opacity_dist_dim, feat_dim),
             nn.ReLU(True),
             nn.Linear(feat_dim, n_offsets),
             nn.Tanh()
         )
+        self.mlp_opacity = torch.compile(self.mlp_opacity)
 
         self.cov_dist_dim = 1 if self.add_cov_dist else 0
         self.mlp_cov = nn.Sequential(
-            nn.Linear(feat_dim + 3 + self.cov_dist_dim, feat_dim),
+            # nn.Linear(feat_dim + 3 + self.cov_dist_dim, feat_dim),
+            nn.Linear(feat_dim + view_embed_dim + self.cov_dist_dim, feat_dim),
             nn.ReLU(True),
             nn.Linear(feat_dim, 7 * self.n_offsets),
         )
+        self.mlp_cov = torch.compile(self.mlp_cov)
 
         self.color_dist_dim = 1 if self.add_color_dist else 0
         self.mlp_color = nn.Sequential(
-            nn.Linear(feat_dim + 3 + self.color_dist_dim + self.appearance_dim, feat_dim),
+            # nn.Linear(feat_dim + 3 + self.color_dist_dim + self.appearance_dim, feat_dim),
+            nn.Linear(feat_dim + view_embed_dim + self.color_dist_dim + self.appearance_dim, feat_dim),
             nn.ReLU(True),
             nn.Linear(feat_dim, 3 * self.n_offsets),
             nn.Sigmoid()
         )
+        self.mlp_color = torch.compile(self.mlp_color)
 
         if self.use_feat_bank:
             self.mlp_feature_bank = nn.Sequential(
-                nn.Linear(3 + 1, feat_dim),
+                # nn.Linear(3 + 1, feat_dim),
+                nn.Linear(view_embed_dim + 1, feat_dim),
                 nn.ReLU(True),
                 nn.Linear(feat_dim, 3),
                 nn.Softmax(dim=1)
             )
+            torch.compile(self.mlp_feature_bank)
         
         self.embedding_appearance = None
 
@@ -243,7 +282,6 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin):
         # Update LoD info for compatibility
         self.lod_offsets = [num_points]
 
-    @torch.compile
     def generate_neural_gaussians(self, viewpoint_camera, visible_mask=None, is_training=True):
         if visible_mask is None:
             visible_mask = torch.ones(self._anchor.shape[0], dtype=torch.bool, device=self._anchor.device)
@@ -265,8 +303,10 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin):
         ob_dist = ob_view.norm(dim=1, keepdim=True)
         ob_view = ob_view / (ob_dist + 1e-10)
 
+        embedded_view = self.fourier_embedder(ob_view)
+
         if self.use_feat_bank:
-            cat_view = torch.cat([ob_view, ob_dist], dim=1)
+            cat_view = torch.cat([embedded_view, ob_dist], dim=1)
             bank_weight = self.mlp_feature_bank(cat_view) # [n, 3]
             
             # Simplified multi-res feat (matching Scaffold-GS)
@@ -275,8 +315,8 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin):
             f3 = feat[:, ::1]
             feat = f1 * bank_weight[:, 0:1] + f2 * bank_weight[:, 1:2] + f3 * bank_weight[:, 2:3]
 
-        cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1)
-        cat_local_view_wodist = torch.cat([feat, ob_view], dim=1)
+        cat_local_view = torch.cat([feat, embedded_view, ob_dist], dim=1).contiguous()
+        cat_local_view_wodist = torch.cat([feat, embedded_view], dim=1).contiguous()
         
         if self.embedding_appearance is not None:
             camera_indices = torch.ones_like(cat_local_view[:, 0], dtype=torch.long) * viewpoint_camera["uid"]
@@ -288,7 +328,7 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin):
         else:
             neural_opacity = self.mlp_opacity(cat_local_view_wodist)
 
-        neural_opacity = neural_opacity.view([-1, 1])
+        neural_opacity = neural_opacity.contiguous().view([-1, 1])
         mask = (neural_opacity > 0.0).view(-1)
         opacity = neural_opacity[mask]
 
@@ -298,7 +338,7 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin):
         else:
             color_input = cat_local_view if self.add_color_dist else cat_local_view_wodist
         
-        color = self.mlp_color(color_input).view([-1, 3])
+        color = self.mlp_color(color_input).contiguous().view([-1, 3])
 
         # Get offset's covariance
         if self.add_cov_dist:
@@ -306,8 +346,8 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin):
         else:
             scale_rot = self.mlp_cov(cat_local_view_wodist)
         
-        scale_rot = scale_rot.view([-1, 7])
-        offsets = grid_offsets.view([-1, 3])
+        scale_rot = scale_rot.contiguous().view([-1, 7])
+        offsets = grid_offsets.contiguous().view([-1, 3])
 
         # We need to apply the mask to all generated Gaussians
         # But wait, gsplat/rasterizer expects ALL Gaussians. 
@@ -388,24 +428,56 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin):
         grads[grads.isnan()] = 0.0
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval * success_threshold * 0.5).squeeze(1)
-        
+
         self.anchor_growing(grads_norm, grad_threshold, offset_mask, optimizers)
-        
-        # Pruning
+
+        # Selectively reset offset accumulators only for offsets that had enough visits
+        # (offset_mask), then pad zeros for newly grown anchors.
+        # This matches the original Scaffold-GS behaviour: undervisited anchors keep their
+        # accumulated gradient signal across intervals rather than being wiped.
+        self.offset_denom[offset_mask] = 0
+        padding_offset_denom = torch.zeros(
+            [self._anchor.shape[0] * self.n_offsets - self.offset_denom.shape[0], 1],
+            dtype=torch.int32,
+            device=self.offset_denom.device,
+        )
+        self.offset_denom = torch.cat([self.offset_denom, padding_offset_denom], dim=0)
+
+        self.offset_gradient_accum[offset_mask] = 0
+        padding_offset_gradient_accum = torch.zeros(
+            [self._anchor.shape[0] * self.n_offsets - self.offset_gradient_accum.shape[0], 1],
+            dtype=torch.int32,
+            device=self.offset_gradient_accum.device,
+        )
+        self.offset_gradient_accum = torch.cat([self.offset_gradient_accum, padding_offset_gradient_accum], dim=0)
+
+        # Pruning decision
         prune_mask = (self.opacity_accum < min_opacity * self.anchor_denom).squeeze(1)
         anchors_mask = (self.anchor_denom > check_interval * success_threshold).squeeze(1)
         prune_mask = torch.logical_and(prune_mask, anchors_mask)
-        
+
+        # Prune offset accumulators by reshaping to [N, k], slicing by valid anchors, then
+        # flattening.  This preserves the offset↔anchor correspondence through pruning.
+        offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]
+        self.offset_denom = offset_denom.view([-1, 1])
+
+        offset_gradient_accum = self.offset_gradient_accum.view([-1, self.n_offsets])[~prune_mask]
+        self.offset_gradient_accum = offset_gradient_accum.view([-1, 1])
+
+        # Selectively reset opacity/anchor_denom for anchors that were sufficiently visited;
+        # anchors with too few visits keep their accumulators for the next interval.
+        if anchors_mask.sum() > 0:
+            self.opacity_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device=self._anchor.device).float()
+            self.anchor_denom[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device=self._anchor.device).float()
+
+        # Prune opacity/anchor_denom for removed anchors
+        self.opacity_accum = self.opacity_accum[~prune_mask]
+        self.anchor_denom = self.anchor_denom[~prune_mask]
+
         if prune_mask.any():
             self.prune_anchor(prune_mask, optimizers)
-            
-        # Reset accumulation buffers for remaining/new anchors
-        num_anchors = self._anchor.shape[0]
-        self.opacity_accum = torch.zeros((num_anchors, 1), device=self._anchor.device)
-        self.anchor_denom = torch.zeros((num_anchors, 1), device=self._anchor.device)
-        self.max_radii2D = torch.zeros(num_anchors, device=self._anchor.device)
-        self.offset_denom = torch.zeros((num_anchors * self.n_offsets, 1), device=self._anchor.device)
-        self.offset_gradient_accum = torch.zeros((num_anchors * self.n_offsets, 1), device=self._anchor.device)
+
+        self.max_radii2D = torch.zeros(self._anchor.shape[0], device=self._anchor.device)
 
     def anchor_growing(self, grads, threshold, offset_mask, optimizers=None):
         init_length = self._anchor.shape[0] * self.n_offsets
@@ -413,14 +485,20 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin):
             cur_threshold = threshold * ((self.update_hierachy_factor // 2)**i)
             candidate_mask = (grads >= cur_threshold)
             candidate_mask = torch.logical_and(candidate_mask, offset_mask)
-            
+
             rand_mask = torch.rand_like(candidate_mask.float()) > (0.5**(i + 1))
             candidate_mask = torch.logical_and(candidate_mask, rand_mask)
-            
-            # Handle growth for subsequent iterations in the loop
-            curr_num_gaussians = self._anchor.shape[0] * self.n_offsets
-            if curr_num_gaussians > init_length:
-                candidate_mask = torch.cat([candidate_mask, torch.zeros(curr_num_gaussians - init_length, dtype=torch.bool, device=self._anchor.device)], dim=0)
+
+            # Mirror original Scaffold-GS logic exactly:
+            # - If no new anchors have been added yet (length_inc==0) AND this is not the first
+            #   depth level (i>0), skip — there's nothing new to grow from.
+            # - Only pad the candidate_mask when new anchors were added in a prior depth level.
+            length_inc = self._anchor.shape[0] * self.n_offsets - init_length
+            if length_inc == 0:
+                if i > 0:
+                    continue
+            else:
+                candidate_mask = torch.cat([candidate_mask, torch.zeros(length_inc, dtype=torch.bool, device=self._anchor.device)], dim=0)
 
             if not candidate_mask.any():
                 continue
@@ -428,28 +506,29 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin):
             # Calculate new anchor positions
             all_xyz = self._anchor.unsqueeze(1) + self._offset * self.scales[:, :3].unsqueeze(1)
             selected_xyz = all_xyz.view(-1, 3)[candidate_mask]
-            
+
             size_factor = self.update_init_factor // (self.update_hierachy_factor**i)
             cur_size = self.voxel_size * size_factor
-            
+
             selected_grid_coords = torch.round(selected_xyz / cur_size).int()
             selected_grid_coords_unique, inverse_indices = torch.unique(selected_grid_coords, return_inverse=True, dim=0)
-            
-            # Filter existing anchors
-            existing_grid_coords = torch.round(self._anchor / cur_size).int()
-            
-            # Efficient duplication check
-            # For simplicity in this implementation, we use a slower but safer check
-            # In production, a hash table or voxel grid would be better.
-            new_mask = torch.ones(selected_grid_coords_unique.shape[0], dtype=torch.bool, device=self._anchor.device)
-            for chunk in torch.split(existing_grid_coords, 10000):
-                matches = (selected_grid_coords_unique.unsqueeze(1) == chunk).all(-1).any(-1)
-                new_mask = torch.logical_and(new_mask, ~matches)
-            
-            candidate_anchor = selected_grid_coords_unique[new_mask].float() * cur_size
-            
+
+            # Chunked duplicate check matching original's memory-efficient approach (4096 chunk size).
+            # Uses reduce(logical_or) so a candidate is "duplicate" if it appears in ANY chunk.
+            grid_coords = torch.round(self._anchor / cur_size).int()
+            chunk_size = 4096
+            max_iters = grid_coords.shape[0] // chunk_size + (1 if grid_coords.shape[0] % chunk_size != 0 else 0)
+            remove_duplicates_list = []
+            for j in range(max_iters):
+                cur_remove_duplicates = (selected_grid_coords_unique.unsqueeze(1) == grid_coords[j*chunk_size:(j+1)*chunk_size, :]).all(-1).any(-1).view(-1)
+                remove_duplicates_list.append(cur_remove_duplicates)
+            remove_duplicates = reduce(torch.logical_or, remove_duplicates_list)
+            remove_duplicates = ~remove_duplicates  # True = not a duplicate = keep
+
+            candidate_anchor = selected_grid_coords_unique[remove_duplicates] * cur_size
+
             if candidate_anchor.shape[0] > 0:
-                self.add_anchors(candidate_anchor, candidate_mask, inverse_indices, new_mask, cur_size, optimizers)
+                self.add_anchors(candidate_anchor, candidate_mask, inverse_indices, remove_duplicates, cur_size, optimizers)
 
     def add_anchors(self, new_anchors, candidate_mask, inverse_indices, new_mask, cur_size, optimizers=None):
         num_new = new_anchors.shape[0]
@@ -543,9 +622,10 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin):
         self._scaling = nn.Parameter(self._scaling[valid_mask])
         self._rotation = nn.Parameter(self._rotation[valid_mask])
         self._opacity = nn.Parameter(self._opacity[valid_mask])
-        
-        self.opacity_accum = self.opacity_accum[valid_mask]
-        self.anchor_denom = self.anchor_denom[valid_mask]
+
+        # NOTE: opacity_accum, anchor_denom, offset_denom, and offset_gradient_accum are
+        # pruned directly in adjust_anchor (which owns the full buffer lifecycle).
+        # prune_anchor only handles anchor parameter tensors and their optimizer states.
 
         if optimizers is not None:
             self.update_optimizers_after_pruning(valid_mask, optimizers)

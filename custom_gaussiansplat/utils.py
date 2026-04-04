@@ -1,10 +1,31 @@
 """
 Utility functions for 3D Gaussian Splatting training.
 """
-import torch
+import os
+import random
+
 import numpy as np
-from rich.table import Table
+import torch
 from rich import box
+from rich.table import Table
+
+
+def seed_everything(seed=32):
+    # 1. Python built-in random module
+    random.seed(seed)
+    
+    # 2. Python hash seed 
+    # (Forces dictionary and set operations to be reproducible)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    # 3. NumPy
+    np.random.seed(seed)
+    
+    # 4. PyTorch
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # For multi-GPU environments
+
 
 
 class ShuffledCameraSampler:

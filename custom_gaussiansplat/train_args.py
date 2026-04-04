@@ -164,7 +164,7 @@ class ViewerConfig:
     viewer_image_cache_size: int = 256
     viewer_max_thumbnail_size: int = 128
     viewer_add_training_cameras: bool = True
-    viewer_camera_frustum_scale: float = 0.1
+    viewer_camera_frustum_scale: float = 0.3
 
 
 @dataclass
@@ -626,7 +626,7 @@ VIEWER_GROUP = ArgGroupDef(
         ArgSpec(flags=("--viewer-max-thumbnail-size",), dest="viewer_max_thumbnail_size", arg_type=int, default=128, help="Max dimension for camera thumbnail images"),
         ArgSpec(flags=("--viewer-add-training-cameras",), dest="viewer_add_training_cameras", action="store_true", default=True, help="Display training cameras as frustums in viewer"),
         ArgSpec(flags=("--no-viewer-add-training-cameras",), dest="viewer_add_training_cameras", action="store_false", help="Disable training camera frustums in viewer"),
-        ArgSpec(flags=("--viewer-camera-frustum-scale",), dest="viewer_camera_frustum_scale", arg_type=float, default=0.1, help="Scale factor for training camera frustums"),
+        ArgSpec(flags=("--viewer-camera-frustum-scale",), dest="viewer_camera_frustum_scale", arg_type=float, default=0.3, help="Scale factor for training camera frustums"),
     ),
 )
 

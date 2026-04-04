@@ -46,13 +46,38 @@ class NeuralRenderingMixin(ABC):
         ...
 
 
+class SemanticsMixin(ABC):
+    """Mixin for models that support language / semantic feature learning.
+
+    Implemented by ScaffoldModel when enable_language_features=True.
+    Callers use isinstance(model, SemanticsMixin) for type-safe detection.
+    """
+
+    @abstractmethod
+    def decode_language_features(self, gaussian_lang_feat: torch.Tensor) -> torch.Tensor:
+        """Decode compact language features → CLIP space via codebook.
+
+        Args:
+            gaussian_lang_feat: [M, lang_feat_dim] compact latent vectors.
+
+        Returns:
+            [M, clip_dim] unit-normalized CLIP-space feature vectors.
+        """
+        ...
+
+    @abstractmethod
+    def init_codebook_from_pca(self, pca_components: torch.Tensor) -> None:
+        """Seed the codebook with PCA principal components for a meaningful start.
+
+        Args:
+            pca_components: [n, clip_dim] — top-n PCA directions over training CLIP features.
+        """
+        ...
+
+
 # Future mixin stubs for other capabilities (add as needed):
 # class LoDAwareMixin(ABC):
 #     """Mixin for models with Level-of-Detail support."""
-#     ...
-#
-# class SemanticsMixin(ABC):
-#     """Mixin for models with semantic feature learning."""
 #     ...
 
 
