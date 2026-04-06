@@ -5,7 +5,7 @@ import os
 # Ensure custom_gaussiansplat is in the Python path if run from outside
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from models import GaussianModel
+from model import GaussianModel
 
 def main():
     parser = argparse.ArgumentParser(description="Convert custom GS checkpoint to original 3DGS format.")

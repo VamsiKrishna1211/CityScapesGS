@@ -10,7 +10,7 @@ This implementation adds comprehensive anti-floater optimizations to the 3D Gaus
 - SH degree configurable (default: 3, supports up to 3rd order)
 - Separate learning rates for DC and higher-order coefficients
 - Integrated with gsplat's rasterization pipeline
-- See [model.py#L40-44](custom_gaussiansplat/model.py#L40-L44) for implementation
+- See [models/gaussian.py#L40-44](custom_gaussiansplat/models/gaussian.py#L40-L44) for implementation
 
 ## 🆕 Floater Prevention Techniques Implemented
 
@@ -31,7 +31,7 @@ This implementation adds comprehensive anti-floater optimizations to the 3D Gaus
 
 ### 3. ✅ Aggressive World-Space Pruning
 - **Status:** Newly implemented
-- **Location:** [model.py#L165-179](custom_gaussiansplat/model.py#L165-L179)
+- **Location:** [models/gaussian.py#L165-179](custom_gaussiansplat/models/gaussian.py#L165-L179)
 - **Parameters:**
   - `--enable-aggressive-pruning` (flag)
   - `--max-world-scale` (default: 0.1 = 10% of scene extent)
@@ -42,7 +42,7 @@ This implementation adds comprehensive anti-floater optimizations to the 3D Gaus
 
 ### 4. ✅ Multi-View Consistency (Visibility Tracking)
 - **Status:** Newly implemented
-- **Location:** [model.py#L90](custom_gaussiansplat/model.py#L90), [train.py#L350-360](custom_gaussiansplat/train.py#L350-L360)
+- **Location:** [models/gaussian.py#L90](custom_gaussiansplat/models/gaussian.py#L90), [train.py#L350-360](custom_gaussiansplat/train.py#L350-L360)
 - **Parameters:**
   - `--enable-visibility-tracking` (flag)
   - `--min-view-count` (default: 3 views)
@@ -66,7 +66,7 @@ This implementation adds comprehensive anti-floater optimizations to the 3D Gaus
 - `scale_regularization()` - Penalize large scales
 - `depth_regularization()` - Penalize near-camera Gaussians (helper)
 
-### 2. [model.py](custom_gaussiansplat/model.py) - MODIFIED
+### 2. [models/gaussian.py](custom_gaussiansplat/models/gaussian.py) - MODIFIED
 - Added `view_count` buffer for visibility tracking (line 48)
 - Added `add_view_count()` method (lines 90-97)
 - Updated `reset_densification_stats()` to reset view_count (line 84)
@@ -74,6 +74,7 @@ This implementation adds comprehensive anti-floater optimizations to the 3D Gaus
 - Enabled aggressive pruning with configurable thresholds (lines 165-179)
 - Updated `_append_params()` to handle view_count buffer (line 250)
 - Fixed optimizer state management (removed `.as_dict()` calls)
+- **Note:** Inherits from `BaseTrainableModel` ABC for unified interface
 
 ### 3. [train.py](custom_gaussiansplat/train.py) - MODIFIED
 - Imported `losses` module (line 29)

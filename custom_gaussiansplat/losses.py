@@ -6,8 +6,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 from typing import cast
+from dataset import CameraData
 
-logger = logging.getLogger("cityscape_gs.model")
+logger = logging.getLogger("cityscape_gs.losses")
 
 
 def _to_bchw_depth(tensor: torch.Tensor) -> torch.Tensor:
@@ -1413,3 +1414,121 @@ class AffineAlignedGradientMatchingLoss(nn.Module):
 
         diff_sum = torch.abs(ren_grads - pri_grads).sum(dim=1, keepdim=True)
         return (diff_sum * eroded_mask_f).sum() / valid_count
+
+
+
+class MetricNormalLoss(nn.Module):
+    def __init__(self, lambda_weight=0.1):
+        """
+        Extracts 3D surface normals directly from metric depth maps and 
+        penalizes angular differences using Cosine Distance.
+        """
+        super().__init__()
+        self.lambda_weight = lambda_weight
+        
+        # 1. Register Sobel Kernels for robust spatial gradients
+        sobel_x = torch.tensor([[[-1.,  0.,  1.], 
+                                 [-2.,  0.,  2.], 
+                                 [-1.,  0.,  1.]]], dtype=torch.float32)
+        sobel_y = torch.tensor([[[-1., -2., -1.], 
+                                 [ 0.,  0.,  0.], 
+                                 [ 1.,  2.,  1.]]], dtype=torch.float32)
+        
+        self.register_buffer("sobel_x", sobel_x.repeat(3, 1, 1, 1))
+        self.register_buffer("sobel_y", sobel_y.repeat(3, 1, 1, 1))
+        
+        # Grid cache to prevent memory allocator thrashing
+        self.cached_grid_shape = None
+        self.cached_u = None
+        self.cached_v = None
+
+    def _get_coordinate_grid(self, H: int, W: int, device: torch.device, dtype: torch.dtype):
+        """Fetches or generates the pixel coordinate grid."""
+        if self.cached_grid_shape != (H, W):
+            v, u = torch.meshgrid(
+                torch.arange(H, dtype=dtype, device=device),
+                torch.arange(W, dtype=dtype, device=device),
+                indexing='ij'
+            )
+            self.cached_u = u.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
+            self.cached_v = v.unsqueeze(0).unsqueeze(0)
+            self.cached_grid_shape = (H, W)
+        # Ensure cached grids match the requested dtype
+        if self.cached_u.dtype != dtype:
+            self.cached_u = self.cached_u.to(dtype)
+            self.cached_v = self.cached_v.to(dtype)
+        return self.cached_u, self.cached_v
+
+    def depth_to_normals(self, depth: torch.Tensor, fx: float, fy: float, cx: float, cy: float) -> torch.Tensor:
+        """Unprojects metric depth to 3D points and extracts unit normal vectors."""
+        logger.debug(f"Depth Tensor Shape: {depth.shape}, Camera Intrinsics: fx={fx}, fy={fy}, cx={cx}, cy={cy}")
+        B, C, H, W = depth.shape
+        u, v = self._get_coordinate_grid(H, W, depth.device, depth.dtype)
+
+        # Unproject to 3D Points (ensure camera params match depth dtype)
+        fx_t = torch.tensor(fx, dtype=depth.dtype, device=depth.device)
+        fy_t = torch.tensor(fy, dtype=depth.dtype, device=depth.device)
+        cx_t = torch.tensor(cx, dtype=depth.dtype, device=depth.device)
+        cy_t = torch.tensor(cy, dtype=depth.dtype, device=depth.device)
+        
+        X = (u - cx_t) * depth / fx_t
+        Y = (v - cy_t) * depth / fy_t
+        points3D = torch.cat([X, Y, depth], dim=1) # [1, 3, H, W]
+
+        # Calculate Tangent Vectors via Sobel
+        V_x = F.conv2d(points3D, self.sobel_x, padding=1, groups=3)
+        V_y = F.conv2d(points3D, self.sobel_y, padding=1, groups=3)
+
+        # Cross Product
+        V_x = V_x.permute(0, 2, 3, 1) # [1, H, W, 3]
+        V_y = V_y.permute(0, 2, 3, 1)
+        normals = torch.linalg.cross(V_x, V_y, dim=-1)
+        
+        # Normalize to unit vectors
+        normals = F.normalize(normals, p=2, dim=-1, eps=1e-6)
+        
+        # Permute back to PyTorch standard [B, C, H, W]
+        normals = normals.permute(0, 3, 1, 2)
+        
+        # Orient normals to face the camera
+        normals = normals * torch.sign(-normals[:, 2:3, :, :])
+        
+        return normals
+
+    def forward(self, render_depth: torch.Tensor, gt_depth: torch.Tensor, 
+                mask: torch.Tensor, cam_data: CameraData) -> torch.Tensor:
+        """
+        Args:
+            render_depth: Rendered metric depth (Z) [B, 1, H, W]
+            gt_depth: Ground truth metric depth (Z) [B, 1, H, W]
+            mask: Valid geometry mask [B, 1, H, W]
+        """
+        if mask.sum() < 100:
+            return torch.tensor(0.0, device=render_depth.device, requires_grad=True)
+
+        # 1. Calculate normals for the entire image FIRST.
+        N_ren = self.depth_to_normals(render_depth, cam_data.fx, cam_data.fy, cam_data.cx, cam_data.cy)
+        N_gt = self.depth_to_normals(gt_depth, cam_data.fx, cam_data.fy, cam_data.cx, cam_data.cy)
+
+        # 2. Erode the mask
+        # We must erode by 1 pixel because the 3x3 Sobel kernel grabs invalid/zero 
+        # depth values at the edges of the mask, creating fake cliff gradients.
+        mask_float = mask.float()
+        eroded_invalid = F.max_pool2d(1.0 - mask_float, kernel_size=3, stride=1, padding=1)
+        eroded_mask_bool = (1.0 - eroded_invalid) > 0.5
+        
+        # 3. Apply 1D Boolean Extraction
+        # Broadcast the mask to all 3 channels (X, Y, Z) to extract only valid normals
+        eroded_mask_3c = eroded_mask_bool.repeat(1, 3, 1, 1)
+        
+        valid_N_ren = N_ren[eroded_mask_3c].view(3, -1).t() # [Num_Valid_Pixels, 3]
+        valid_N_gt = N_gt[eroded_mask_3c].view(3, -1).t()
+        
+        if valid_N_ren.shape[0] < 100:
+            return torch.tensor(0.0, device=render_depth.device, requires_grad=True)
+
+        # 4. Cosine Distance Loss
+        cos_sim = F.cosine_similarity(valid_N_ren, valid_N_gt, dim=-1)
+        loss = (1.0 - cos_sim).mean()
+
+        return self.lambda_weight * loss

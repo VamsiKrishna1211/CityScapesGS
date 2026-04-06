@@ -2,12 +2,13 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Sequence, Union
 
 import cv2
 import imageio.v2 as imageio
 import numpy as np
 import torch
+from plyfile import PlyData
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -39,35 +40,41 @@ class CameraData:
     width: int
     height: int
     image_path: str
+    uid: int  # Camera index for appearance embeddings (must be unique per camera)
+    depth_dir: Optional[str] = None
+    depth_scale: float = 1.0
 
     def __getitem__(self, key: str):
         return getattr(self, key)
+    
+    @property
+    def camera_center(self) -> torch.Tensor:
+        """
+        Compute camera center (camera position in world coordinates).
+        The view matrix transforms world -> camera: [R|T]
+        Camera center is at -R^T @ T in world coordinates.
+        """
+        return -self.R.T @ self.T
 
 
 class BaseReconstructionDataset(Dataset):
     def __init__(
         self,
         image_dir: Union[str, Path],
+        depth_dir: Optional[Union[str, Path]] = None,
         device: torch.device = torch.device("cuda"),
         use_dataloader: bool = True,
-        train_semantics: bool = False,
-        semantics_dim: int = 3,
-        semantics_path: Optional[Path] = None,
-        semantics_resolution: Optional[Union[tuple[int, int], int]] = None,
         image_scale: int = 2,
         require_depth: bool = True,
     ):
         """
-        Base dataset that handles common image/depth/semantics loading behavior.
+        Base dataset that handles common image/depth loading behavior.
 
         Args:
             - image_dir: Directory containing images
+            - depth_dir: Optional explicit depth directory. If provided, this takes precedence over predefined scale-based depth folder names.
             - device: torch.device to load tensors onto (default: 'cuda')
             - use_dataloader: If True, workers keep data on CPU and __getitem__ moves to device
-            - train_semantics: If True, also loads semantic features for each image (if available) and includes them in the dataset items.
-            - semantics_dim: Dimensionality of semantic features (e.g., 3 for RGB-based semantics, 128 for CLIP-based features).
-            - semantics_path: Optional path to semantic features directory (should contain .npy files named after images).
-            - semantics_resolution: Optional resolution to which semantic features should be resized (if they are image-based). If None assumes semantic features are already in the correct format and dimension.
             - image_scale: Downscale factor used for training images. If image_dir points to `images`, this resolves to `images_<image_scale>` for scale > 1.
             - require_depth: If True, missing depth directory raises an error
         """
@@ -75,11 +82,7 @@ class BaseReconstructionDataset(Dataset):
         self.use_dataloader = use_dataloader
         self._preloaded_images = None
         self._preloaded_depths = None
-        self.train_semantics = train_semantics
         self.require_depth = require_depth
-        self.semantics_path: Optional[Path] = None
-        self.semantics_dim: int = semantics_dim
-        self.semantics_resolution: Optional[Union[tuple[int, int], int]] = semantics_resolution
         self.cameras: list[CameraData] = []
 
         # Set by subclasses.
@@ -91,25 +94,20 @@ class BaseReconstructionDataset(Dataset):
             raise ValueError(f"image_scale must be >= 1, got {image_scale}")
         self.image_scale = int(image_scale)
         image_dir_path = self._resolve_image_dir(Path(image_dir), self.image_scale)
+        depth_dir_path = Path(depth_dir).expanduser().resolve() if depth_dir is not None else None
         logger.info(f"[cyan]Using image scale:[/cyan] {self.image_scale} (directory: {image_dir_path})")
         try:
-            self.depth_dir = self._resolve_depth_dir(image_dir_path, self.image_scale, require_depth=self.require_depth)
+            self.depth_dir = self._resolve_depth_dir(
+                image_dir=image_dir_path,
+                image_scale=self.image_scale,
+                depth_dir_override=depth_dir_path,
+                require_depth=self.require_depth,
+            )
             logger.info(f"[cyan]Using depth scale:[/cyan] {self.image_scale} (directory: {self.depth_dir})")
         except FileNotFoundError:
             self.depth_dir = None
 
         self.image_dir = image_dir_path
-
-        if train_semantics:
-            if semantics_path is None:
-                raise ValueError("train_semantics is True but semantics_path is not provided. Please provide a path to the semantic features directory.")
-            else:
-                self.semantics_path = Path(semantics_path)
-                self.semantics_dim = semantics_dim
-                if isinstance(semantics_resolution, int) and semantics_resolution > 0:
-                    semantics_resolution = (semantics_resolution, semantics_resolution)
-                self.semantics_resolution = semantics_resolution
-                logger.info(f"[cyan]Semantic features enabled:[/cyan] loading from {semantics_path}, dim={semantics_dim}, resolution={semantics_resolution}")
 
     @staticmethod
     def _compute_scene_extent(points_xyz: np.ndarray, scene_extent_margin: float) -> float:
@@ -175,6 +173,91 @@ class BaseReconstructionDataset(Dataset):
         self.init_colors = (rgb_normalized - 0.5) / sh_c0
 
     @staticmethod
+    def _estimate_camera_forward_z_distance(camera_centers: np.ndarray) -> float:
+        """Estimate a sensible forward projection distance from camera trajectory spacing."""
+        camera_centers = np.asarray(camera_centers, dtype=np.float32)
+        if camera_centers.ndim != 2 or camera_centers.shape[0] < 2:
+            return 5.0
+
+        step_dists = np.linalg.norm(camera_centers[1:] - camera_centers[:-1], axis=1)
+        valid = step_dists[np.isfinite(step_dists) & (step_dists > 1e-5)]
+        if valid.size == 0:
+            return 5.0
+
+        z_distance = float(np.median(valid) * 5.0)
+        return float(np.clip(z_distance, 1.0, 200.0))
+
+    @classmethod
+    def _synthesize_points_from_camera_rays(
+        cls,
+        cameras: Sequence[CameraData],
+        max_points: int,
+        z_distance: Optional[float] = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Create fallback initialization points along camera forward rays.
+
+        This avoids degeneracy from placing points exactly at camera centers.
+        """
+        if len(cameras) == 0:
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+
+        centers: list[np.ndarray] = []
+        for cam in cameras:
+            r_w2c = cam.R.detach().cpu().numpy().astype(np.float32)
+            t_w2c = cam.T.detach().cpu().numpy().astype(np.float32)
+            c2w_r = r_w2c.T
+            cam_center = -c2w_r @ t_w2c
+            centers.append(cam_center)
+
+        centers_np = np.stack(centers, axis=0)
+        z = float(z_distance) if z_distance is not None else cls._estimate_camera_forward_z_distance(centers_np)
+
+        ray_offsets = [
+            (0.0, 0.0),
+            (-0.35, -0.35),
+            (0.35, -0.35),
+            (-0.35, 0.35),
+            (0.35, 0.35),
+            (0.0, -0.45),
+            (0.0, 0.45),
+            (-0.45, 0.0),
+            (0.45, 0.0),
+        ]
+
+        points: list[np.ndarray] = []
+        for cam, cam_center in zip(cameras, centers_np):
+            r_w2c = cam.R.detach().cpu().numpy().astype(np.float32)
+            c2w_r = r_w2c.T
+
+            right = c2w_r[:, 0]
+            down = c2w_r[:, 1]
+            forward = c2w_r[:, 2]
+
+            for u, v in ray_offsets:
+                direction = forward + u * right + v * down
+                norm = float(np.linalg.norm(direction))
+                if norm < 1e-8:
+                    continue
+                direction = direction / norm
+                points.append(cam_center + direction * z)
+
+        if len(points) == 0:
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+
+        xyz = np.asarray(points, dtype=np.float32)
+        if max_points > 0 and xyz.shape[0] > max_points:
+            rng = np.random.default_rng(0)
+            idx = rng.choice(xyz.shape[0], size=max_points, replace=False)
+            xyz = xyz[idx]
+
+        rgb = np.full((xyz.shape[0], 3), 127.5, dtype=np.float32)
+        logger.info(
+            f"[cyan]Fallback init cloud:[/cyan] synthesized {xyz.shape[0]} points along camera rays "
+            f"at z={z:.3f}"
+        )
+        return xyz, rgb
+
+    @staticmethod
     def _resolve_image_dir(image_dir: Path, image_scale: int) -> Path:
         """Resolve the image directory for the requested scale using COLMAP-style folder names."""
         image_dir = image_dir.expanduser().resolve()
@@ -202,26 +285,103 @@ class BaseReconstructionDataset(Dataset):
         return target_dir
 
     @staticmethod
-    def _resolve_depth_dir(image_dir: Path, image_scale: int, require_depth: bool = True) -> Optional[Path]:
-        """Resolve depth directory using the same scale convention as images."""
-        scene_root = image_dir.parent
-        depth_dir = scene_root / "depths_npy"
-        if image_scale > 1:
-            depth_dir = scene_root / f"depths_npy_{image_scale}"
-
-        if not depth_dir.exists():
+    def _resolve_depth_dir(
+        image_dir: Path,
+        image_scale: int,
+        depth_dir_override: Optional[Path] = None,
+        require_depth: bool = True,
+    ) -> Optional[Path]:
+        """Resolve depth directory from explicit override or predefined scale convention."""
+        if depth_dir_override is not None:
+            if depth_dir_override.exists():
+                return depth_dir_override
             if not require_depth:
-                logger.warning(f"[yellow]Depth directory not found, depth supervision disabled:[/yellow] {depth_dir}")
+                logger.warning(
+                    f"[yellow]Depth directory override not found, depth supervision disabled:[/yellow] {depth_dir_override}"
+                )
                 return None
-            raise FileNotFoundError(
-                f"Requested depth scale {image_scale}, but directory not found: {depth_dir}. "
-                "Expected depth folders following image scale convention (e.g., depths_npy, depths_npy_2, depths_npy_4)."
-            )
+            raise FileNotFoundError(f"Provided depth directory does not exist: {depth_dir_override}")
 
-        return depth_dir
+        scene_root = image_dir.parent
+        candidate_dirs = [scene_root / "depths_npy"]
+        if image_scale > 1:
+            candidate_dirs.insert(0, scene_root / f"depths_npy_{image_scale}")
+
+        for depth_dir in candidate_dirs:
+            if depth_dir.exists():
+                return depth_dir
+
+        expected_str = ", ".join(str(d) for d in candidate_dirs)
+        if not require_depth:
+            logger.warning(
+                f"[yellow]Depth directory not found, depth supervision disabled:[/yellow] expected one of: {expected_str}"
+            )
+            return None
+        raise FileNotFoundError(
+            f"Requested depth scale {image_scale}, but no depth directory found. "
+            f"Checked: {expected_str}. "
+            "Expected depth folders following image scale convention (e.g., depths_npy, depths_npy_2, depths_npy_4)."
+        )
 
     def __len__(self):
         return len(self.cameras)
+
+    @staticmethod
+    def _try_read_exr_depth(depth_path: Path) -> Optional[np.ndarray]:
+        """Read EXR depth map via OpenCV first, then imageio as fallback."""
+        try:
+            exr_depth = cv2.imread(str(depth_path), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+            if exr_depth is not None:
+                if exr_depth.ndim == 3:
+                    exr_depth = exr_depth[..., 0]
+                return np.asarray(exr_depth, dtype=np.float32)
+        except Exception:
+            pass
+
+        try:
+            exr_depth = imageio.imread(depth_path)
+            if exr_depth is not None:
+                exr_depth = np.asarray(exr_depth, dtype=np.float32)
+                if exr_depth.ndim == 3:
+                    exr_depth = exr_depth[..., 0]
+                return exr_depth
+        except Exception:
+            pass
+
+        return None
+
+    @staticmethod
+    def _validate_depth_map(depth_map: np.ndarray, cam_data: CameraData) -> Optional[torch.Tensor]:
+        """Validate and sanitize depth map before converting to tensor."""
+        if depth_map.shape[:2] != (cam_data.height, cam_data.width):
+            return None
+
+        if not np.isfinite(depth_map).all():
+            invalid_mask = ~np.isfinite(depth_map)
+            if invalid_mask.all():
+                return None
+            depth_map = depth_map.copy()
+            depth_map[invalid_mask] = np.median(depth_map[~invalid_mask])
+
+        d_min, d_max = float(depth_map.min()), float(depth_map.max())
+        d_range = d_max - d_min
+        if d_range < 1e-8:
+            return None
+
+        return torch.from_numpy(np.asarray(depth_map, dtype=np.float32)).float()
+
+    @staticmethod
+    def _resolve_depth_path(depth_dir: Path, image_stem: str) -> Optional[Path]:
+        """Resolve depth file path, preferring .npy then .exr."""
+        candidates = [
+            depth_dir / f"{image_stem}.npy",
+            depth_dir / f"{image_stem}.exr",
+            depth_dir / f"{image_stem}.EXR",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
 
     @staticmethod
     def _image_to_rgb_tensor(img: np.ndarray) -> torch.Tensor:
@@ -234,7 +394,7 @@ class BaseReconstructionDataset(Dataset):
             img = np.repeat(img, 3, axis=-1)
         return torch.from_numpy(img).float() / 255.0
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         cam_data = self.cameras[idx]
 
         img_path = Path(cam_data.image_path)
@@ -250,60 +410,37 @@ class BaseReconstructionDataset(Dataset):
             depth_tensor = self._load_depth(img_path, cam_data)
         depth_tensor = depth_tensor.to(self.device) if depth_tensor is not None else None
 
-        semantics_output = (None, None)
-        if self.train_semantics:
-            semantics_output = self._load_semantics(img_path, img_tensor.detach().cpu())
-        return cam_data, img_tensor.to(self.device), depth_tensor, semantics_output
-
-    @torch.no_grad()
-    def _load_semantics(self, img_path: Path, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Load semantic features for the given image if available."""
-        sem_path = self.semantics_path
-        if sem_path is None:
-            raise RuntimeError("Semantic loading requested but semantics_path is not configured.")
-
-        logger.debug(f"Attempting to load semantic features for {img_path.name} from {sem_path}")
-        semantics_file = sem_path / f"{img_path.stem}_s.npy"
-        if not semantics_file.exists():
-            raise FileNotFoundError(f"Semantic features file not found for {img_path.name} at expected location: {semantics_file}")
-        
-        try:
-            semantics = torch.tensor(np.load(semantics_file))
-            semantics_image = np.asarray(image.cpu())
-            semantics_image = cv2.resize(semantics_image, semantics.shape[1:], interpolation=cv2.INTER_CUBIC)
-            return semantics.float(), torch.tensor(semantics_image)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load semantic features for {img_path.name} from {semantics_file}: {e}")
+        return cam_data, img_tensor.to(self.device), depth_tensor
 
     def _load_depth(self, img_path: Path, cam_data: CameraData) -> Optional[torch.Tensor]:
         """Load and validate depth map."""
-        depth_dir = self.depth_dir
+        depth_dir = Path(cam_data.depth_dir).expanduser().resolve() if cam_data.depth_dir else self.depth_dir
         if depth_dir is None:
             return None
 
-        depth_path = depth_dir / f"{img_path.stem}.npy"
-        if not depth_path.exists():
+        depth_path = self._resolve_depth_path(depth_dir, img_path.stem)
+        if depth_path is None:
             return None
 
         try:
-            depth_map = np.load(depth_path)
-
-            if depth_map.shape[:2] != (cam_data.height, cam_data.width):
-                return None
-
-            if not np.isfinite(depth_map).all():
-                invalid_mask = ~np.isfinite(depth_map)
-                if invalid_mask.all():
+            if depth_path.suffix.lower() == ".npy":
+                depth_map = np.load(depth_path)
+            elif depth_path.suffix.lower() == ".exr":
+                depth_map = self._try_read_exr_depth(depth_path)
+                if depth_map is None:
                     return None
-                depth_map[invalid_mask] = np.median(depth_map[~invalid_mask])
-
-            d_min, d_max = depth_map.min(), depth_map.max()
-            d_range = d_max - d_min
-
-            if d_range < 1e-8:
+                # MatrixCity float16 EXR may contain saturated invalid values.
+                invalid_exr_mask = depth_map >= 65504.0
+                if invalid_exr_mask.any():
+                    depth_map = depth_map.astype(np.float32, copy=True)
+                    depth_map[invalid_exr_mask] = np.nan
+            else:
                 return None
 
-            return torch.from_numpy(depth_map).float()
+            if cam_data.depth_scale != 1.0:
+                depth_map = np.asarray(depth_map, dtype=np.float32) * float(cam_data.depth_scale)
+
+            return self._validate_depth_map(depth_map, cam_data)
 
         except Exception as e:
             logger.debug(f"Depth load failed for {img_path.name}: {e}")
@@ -363,25 +500,19 @@ class ColmapDataset(BaseReconstructionDataset):
         self,
         colmap_path,
         image_dir,
+        depth_dir: Optional[Union[str, Path]] = None,
         device: torch.device = torch.device("cuda"),
         use_dataloader=True,
         point_cloud_extent_ratio: Optional[float] = None,
-        train_semantics=False,
-        semantics_dim=3,
-        semantics_path: Optional[Path] = None,
-        semantics_resolution: Optional[Union[tuple[int, int], int]] = None,
         scene_extent_margin: float = 2.0,
         image_scale: int = 2,
         require_depth: bool = True,
     ):
         super().__init__(
             image_dir=image_dir,
+            depth_dir=depth_dir,
             device=device,
             use_dataloader=use_dataloader,
-            train_semantics=train_semantics,
-            semantics_dim=semantics_dim,
-            semantics_path=semantics_path,
-            semantics_resolution=semantics_resolution,
             image_scale=image_scale,
             require_depth=require_depth,
         )
@@ -450,6 +581,7 @@ class ColmapDataset(BaseReconstructionDataset):
                     width=max(1, int(round(float(cam.width) * scale_factor))),
                     height=max(1, int(round(float(cam.height) * scale_factor))),
                     image_path=str(img_path),
+                    uid=len(self.cameras),  # Assign sequential camera ID
                 )
             )
 
@@ -459,214 +591,322 @@ class InstantNGPDataset(BaseReconstructionDataset):
         self,
         transforms_path: Union[str, Path],
         image_dir: Optional[Union[str, Path]] = None,
-        device: torch.device = torch.device("cuda"),
-        use_dataloader=True,
-        point_cloud_extent_ratio: Optional[float] = None,
-        train_semantics=False,
-        semantics_dim=3,
-        semantics_path: Optional[Path] = None,
-        semantics_resolution: Optional[Union[tuple[int, int], int]] = None,
-        scene_extent_margin: float = 2.0,
-        image_scale: int = 2,
-        require_depth: bool = False,
+        depth_dir: Optional[Union[str, Path]] = None,
         point_cloud_path: Optional[Union[str, Path]] = None,
-        fallback_init_points: int = 20000,
+        device: torch.device = torch.device("cuda"),
+        use_dataloader: bool = True,
+        point_cloud_extent_ratio: Optional[float] = None,
+        scene_extent_margin: float = 2.0,
+        image_scale: int = 1,
+        require_depth: bool = True,
     ):
-        self.transforms_path = self._resolve_transforms_path(transforms_path)
-        resolved_image_dir = self._resolve_image_root(image_dir=image_dir, transforms_path=self.transforms_path)
+        self.transforms_path = self._resolve_transforms_path(Path(transforms_path))
+        resolved_image_dir = (
+            Path(image_dir).expanduser().resolve()
+            if image_dir is not None
+            else self._default_image_dir_from_transforms(self.transforms_path)
+        )
+        self.point_cloud_path = Path(point_cloud_path).expanduser().resolve() if point_cloud_path else None
+
         super().__init__(
             image_dir=resolved_image_dir,
+            depth_dir=depth_dir,
             device=device,
             use_dataloader=use_dataloader,
-            train_semantics=train_semantics,
-            semantics_dim=semantics_dim,
-            semantics_path=semantics_path,
-            semantics_resolution=semantics_resolution,
             image_scale=image_scale,
             require_depth=require_depth,
         )
-        self._load_instant_ngp(
+
+        self._load_nerf_transforms(
+            transforms_file=self.transforms_path,
+            depth_dir_override=self.depth_dir,
             point_cloud_extent_ratio=point_cloud_extent_ratio,
             scene_extent_margin=scene_extent_margin,
-            point_cloud_path=point_cloud_path,
-            fallback_init_points=fallback_init_points,
         )
 
     @staticmethod
-    def _resolve_transforms_path(transforms_path: Union[str, Path]) -> Path:
-        path = Path(transforms_path).expanduser().resolve()
-        if path.is_dir():
-            candidates = [path / "transform.json", path / "transforms.json"]
-            for candidate in candidates:
+    def _resolve_transforms_path(transforms_path: Path) -> Path:
+        transforms_path = transforms_path.expanduser().resolve()
+        if transforms_path.is_file():
+            return transforms_path
+        if transforms_path.is_dir():
+            for name in ("transforms.json", "transform.json", "transforms_train.json"):
+                candidate = transforms_path / name
                 if candidate.exists():
                     return candidate
-            raise FileNotFoundError(
-                f"No Instant-NGP transform file found in directory {path}. "
-                "Expected one of: transform.json, transforms.json"
-            )
-
-        if not path.exists():
-            raise FileNotFoundError(f"Instant-NGP transforms file not found: {path}")
-        return path
+        raise FileNotFoundError(
+            f"Could not resolve transforms file from: {transforms_path}. "
+            "Expected a JSON file or directory containing transforms.json/transform.json/transforms_train.json"
+        )
 
     @staticmethod
-    def _resolve_image_root(image_dir: Optional[Union[str, Path]], transforms_path: Path) -> Path:
-        if image_dir is not None:
-            return Path(image_dir).expanduser().resolve()
-
-        parent = transforms_path.parent
-        images_dir = parent / "images"
-        if images_dir.exists():
-            return images_dir
-        return parent
-
-    @staticmethod
-    def _resolve_frame_image_path(image_root: Path, transforms_root: Path, file_path_str: str) -> Path:
-        candidate = Path(file_path_str)
-        if candidate.is_absolute():
-            return candidate
-
-        if candidate.suffix == "":
-            candidate = candidate.with_suffix(".png")
-
-        for root in [image_root, transforms_root]:
-            test_path = (root / candidate).resolve()
-            if test_path.exists():
-                return test_path
-
-        return (image_root / candidate).resolve()
-
-    @staticmethod
-    def _focal_from_fov(width: int, fov_radians: Optional[float]) -> float:
-        if fov_radians is None:
-            raise ValueError(
-                "Instant-NGP intrinsics are missing. Provide fl_x/fl_y (or camera_angle_x/camera_angle_y) "
-                "in transforms.json or per-frame metadata."
-            )
-        return 0.5 * float(width) / np.tan(0.5 * float(fov_radians))
-
-    @staticmethod
-    def _sanitize_extrinsics_w2c(extrinsic: np.ndarray) -> np.ndarray:
-        """Project the 3x3 block to the closest valid rotation for robust rasterization."""
-        rot = extrinsic[:3, :3]
-        u, _, vt = np.linalg.svd(rot)
-        rot_ortho = u @ vt
-        if np.linalg.det(rot_ortho) < 0:
-            u[:, -1] *= -1
-            rot_ortho = u @ vt
-        extrinsic_fixed = extrinsic.copy()
-        extrinsic_fixed[:3, :3] = rot_ortho.astype(np.float32)
-        return extrinsic_fixed
-
-    @staticmethod
-    def _resolve_frame_image_path_from_index(image_root: Path, frame_index: int) -> Optional[Path]:
-        # Common names: 0000.png, 0001.png, ... and 1-based frame_index in metadata.
+    def _default_image_dir_from_transforms(transforms_file: Path) -> Path:
+        parent = transforms_file.parent
         candidates = [
-            image_root / f"{frame_index:04d}.png",
-            image_root / f"{frame_index - 1:04d}.png",
-            image_root / f"{frame_index:05d}.png",
-            image_root / f"{frame_index - 1:05d}.png",
+            parent / "images",
+            parent,
         ]
-        for path in candidates:
-            if path.exists():
-                return path.resolve()
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        raise FileNotFoundError(f"Could not infer image directory from transforms file: {transforms_file}")
+
+    @staticmethod
+    def _normalize_rotation_matrix(rot: np.ndarray) -> np.ndarray:
+        rot = np.asarray(rot, dtype=np.float64)
+        col_norms = np.linalg.norm(rot, axis=0)
+        valid = col_norms > 1e-8
+        if valid.any():
+            scale = float(np.median(col_norms[valid]))
+            if scale > 1e-8:
+                rot = rot / scale
+
+        u, _, vh = np.linalg.svd(rot)
+        rot_ortho = u @ vh
+        if np.linalg.det(rot_ortho) < 0:
+            u[:, -1] *= -1.0
+            rot_ortho = u @ vh
+        return rot_ortho.astype(np.float32)
+
+    @classmethod
+    def _nerf_c2w_to_w2c(cls, c2w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        c2w = np.asarray(c2w, dtype=np.float64).copy()
+        c2w[:3, :3] = cls._normalize_rotation_matrix(c2w[:3, :3])
+
+        # NeRF/Blender camera coordinates -> COLMAP/OpenCV camera coordinates.
+        c2w[:3, 1:3] *= -1.0
+
+        w2c = np.linalg.inv(c2w)
+        r = w2c[:3, :3].astype(np.float32)
+        t = w2c[:3, 3].astype(np.float32)
+        return r, t
+
+    @staticmethod
+    def _frame_index_to_stem(frame: dict[str, Any]) -> Optional[str]:
+        if "frame_index" in frame:
+            return f"{int(frame['frame_index']):04d}"
+        if "file_path" in frame:
+            return Path(str(frame["file_path"])).stem
         return None
 
-    def _load_instant_ngp(
+    @staticmethod
+    def _try_image_candidates(base_paths: Sequence[Path], stem_or_path: str) -> Optional[Path]:
+        candidate_paths: list[Path] = []
+        suffixes = ("", ".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG")
+
+        as_path = Path(stem_or_path)
+        if as_path.is_absolute():
+            for sfx in suffixes:
+                candidate_paths.append(as_path if sfx == "" else as_path.with_suffix(sfx))
+        else:
+            for base in base_paths:
+                for sfx in suffixes:
+                    if sfx == "":
+                        candidate_paths.append(base / as_path)
+                    else:
+                        candidate_paths.append(base / f"{stem_or_path}{sfx}" if as_path.suffix == "" else (base / as_path).with_suffix(sfx))
+
+        for candidate in candidate_paths:
+            if candidate.exists() and candidate.is_file():
+                return candidate.resolve()
+        return None
+
+    @classmethod
+    def _resolve_frame_image_path(
+        cls,
+        frame: dict[str, Any],
+        transforms_parent: Path,
+        image_root: Path,
+    ) -> Optional[Path]:
+        base_paths = [
+            image_root,
+            image_root / "images",
+            image_root / "rgb",
+            transforms_parent,
+            transforms_parent / "images",
+            transforms_parent / "rgb",
+            image_root.parent,
+            image_root.parent.parent,
+        ]
+
+        if "file_path" in frame:
+            file_path = str(frame["file_path"])
+            resolved = cls._try_image_candidates(base_paths, file_path)
+            if resolved is not None:
+                return resolved
+
+        stem = cls._frame_index_to_stem(frame)
+        if stem is None:
+            return None
+        return cls._try_image_candidates(base_paths, stem)
+
+    @staticmethod
+    def _image_size(path: Path) -> tuple[int, int]:
+        img = imageio.imread(path)
+        h, w = img.shape[:2]
+        return int(w), int(h)
+
+    @staticmethod
+    def _intrinsics_from_meta(meta: dict[str, Any], width: int, height: int) -> tuple[float, float, float, float]:
+        if "fl_x" in meta or "fl_y" in meta:
+            fx_raw = meta.get("fl_x", meta.get("fl_y"))
+            fy_raw = meta.get("fl_y", meta.get("fl_x"))
+            if fx_raw is None or fy_raw is None:
+                raise ValueError("Invalid fl_x/fl_y values in transforms metadata")
+            fx = float(fx_raw)
+            fy = float(fy_raw)
+        elif "camera_angle_x" in meta:
+            fx = float(0.5 * width / np.tan(0.5 * float(meta["camera_angle_x"])))
+            if "camera_angle_y" in meta:
+                fy = float(0.5 * height / np.tan(0.5 * float(meta["camera_angle_y"])))
+            else:
+                fy = fx
+        else:
+            raise ValueError("Missing intrinsics. Expected fl_x/fl_y or camera_angle_x in transforms metadata.")
+
+        cx = float(meta.get("cx", width * 0.5))
+        cy = float(meta.get("cy", height * 0.5))
+        return fx, fy, cx, cy
+
+    @staticmethod
+    def _load_ply_points(path: Path) -> tuple[np.ndarray, np.ndarray]:
+        ply = PlyData.read(path)
+        vertex = ply["vertex"]
+        xyz = np.stack(
+            [
+                np.asarray(vertex["x"], dtype=np.float32),
+                np.asarray(vertex["y"], dtype=np.float32),
+                np.asarray(vertex["z"], dtype=np.float32),
+            ],
+            axis=1,
+        )
+
+        color_fields = ("red", "green", "blue")
+        if all(field in vertex.data.dtype.names for field in color_fields):
+            rgb = np.stack(
+                [
+                    np.asarray(vertex["red"], dtype=np.float32),
+                    np.asarray(vertex["green"], dtype=np.float32),
+                    np.asarray(vertex["blue"], dtype=np.float32),
+                ],
+                axis=1,
+            )
+        else:
+            rgb = np.full((xyz.shape[0], 3), 127.5, dtype=np.float32)
+        return xyz, rgb
+
+    @classmethod
+    def _load_point_cloud(cls, point_cloud_path: Optional[Path]) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        if point_cloud_path is None or not point_cloud_path.exists():
+            return None
+
+        suffix = point_cloud_path.suffix.lower()
+        if suffix == ".ply":
+            return cls._load_ply_points(point_cloud_path)
+
+        if suffix == ".npy":
+            arr = np.load(point_cloud_path)
+            arr = np.asarray(arr)
+            if arr.ndim != 2 or arr.shape[1] < 3:
+                raise ValueError(f"Unsupported .npy point cloud shape: {arr.shape}")
+            xyz = arr[:, :3].astype(np.float32)
+            if arr.shape[1] >= 6:
+                rgb = arr[:, 3:6].astype(np.float32)
+                if rgb.max() <= 1.0:
+                    rgb *= 255.0
+            else:
+                rgb = np.full((xyz.shape[0], 3), 127.5, dtype=np.float32)
+            return xyz, rgb
+
+        if suffix in {".pt", ".pth"}:
+            payload = torch.load(point_cloud_path, map_location="cpu")
+            if isinstance(payload, dict) and "xyz" in payload:
+                xyz = np.asarray(payload["xyz"], dtype=np.float32)
+                if "rgb" in payload:
+                    rgb = np.asarray(payload["rgb"], dtype=np.float32)
+                    if rgb.max() <= 1.0:
+                        rgb *= 255.0
+                else:
+                    rgb = np.full((xyz.shape[0], 3), 127.5, dtype=np.float32)
+                return xyz, rgb
+            raise ValueError(f"Unsupported checkpoint point cloud format: {point_cloud_path}")
+
+        raise ValueError(f"Unsupported point cloud format: {point_cloud_path}")
+
+    def _load_nerf_transforms(
         self,
+        transforms_file: Path,
+        depth_dir_override: Optional[Path],
         point_cloud_extent_ratio: Optional[float],
         scene_extent_margin: float,
-        point_cloud_path: Optional[Union[str, Path]],
-        fallback_init_points: int,
-    ):
-        with open(self.transforms_path, "r", encoding="utf-8") as f:
+    ) -> None:
+        with transforms_file.open("r", encoding="utf-8") as f:
             meta = json.load(f)
 
         frames = meta.get("frames", [])
-        if len(frames) == 0:
-            raise ValueError(f"No frames found in Instant-NGP transforms file: {self.transforms_path}")
+        if not frames:
+            raise ValueError(f"No frames found in transforms file: {transforms_file}")
 
-        scale_factor = 1.0 / float(self.image_scale)
-        camera_centers = []
-
+        first_img = None
         for frame in frames:
-            file_path = frame.get("file_path")
-            frame_index = frame.get("frame_index")
-            img_path = None
-            if file_path is not None:
-                img_path = self._resolve_frame_image_path(self.image_dir, self.transforms_path.parent, file_path)
-            elif frame_index is not None:
-                img_path = self._resolve_frame_image_path_from_index(self.image_dir, int(frame_index))
+            first_img = self._resolve_frame_image_path(frame, transforms_file.parent, self.image_dir)
+            if first_img is not None:
+                break
+        if first_img is None:
+            raise FileNotFoundError(f"Could not resolve any image referenced by: {transforms_file}")
 
+        width = int(meta.get("w", 0))
+        height = int(meta.get("h", 0))
+        if width <= 0 or height <= 0:
+            width, height = self._image_size(first_img)
+
+        fx, fy, cx, cy = self._intrinsics_from_meta(meta, width, height)
+        scale_factor = 1.0 / float(self.image_scale)
+
+        camera_centers: list[np.ndarray] = []
+        for frame in frames:
+            img_path = self._resolve_frame_image_path(frame, transforms_file.parent, self.image_dir)
             if img_path is None:
-                continue
-            if not img_path.exists():
                 continue
 
             if "transform_matrix" in frame:
                 c2w = np.asarray(frame["transform_matrix"], dtype=np.float32)
-                if c2w.shape != (4, 4):
-                    raise ValueError(f"Invalid transform_matrix shape for frame {file_path}: {c2w.shape}")
-                w2c = np.linalg.inv(c2w)
             elif "rot_mat" in frame:
-                w2c = np.asarray(frame["rot_mat"], dtype=np.float32)
-                if w2c.shape != (4, 4):
-                    frame_name = file_path if file_path is not None else f"frame_index={frame_index}"
-                    raise ValueError(f"Invalid rot_mat shape for frame {frame_name}: {w2c.shape}")
-                w2c = self._sanitize_extrinsics_w2c(w2c)
-                c2w = np.linalg.inv(w2c)
+                c2w = np.asarray(frame["rot_mat"], dtype=np.float32)
             else:
                 continue
 
-            r_tensor = torch.tensor(w2c[:3, :3], dtype=torch.float32)
-            t_tensor = torch.tensor(w2c[:3, 3], dtype=torch.float32)
-            camera_centers.append(c2w[:3, 3])
-
-            width = int(frame.get("w", meta.get("w", 0)))
-            height = int(frame.get("h", meta.get("h", 0)))
-            if width <= 0 or height <= 0:
-                img_hw = imageio.imread(img_path).shape[:2]
-                height, width = int(img_hw[0]), int(img_hw[1])
-
-            fx = frame.get("fl_x", meta.get("fl_x", None))
-            fy = frame.get("fl_y", meta.get("fl_y", None))
-            cx = frame.get("cx", meta.get("cx", None))
-            cy = frame.get("cy", meta.get("cy", None))
-
-            if fx is None:
-                fx = self._focal_from_fov(width, frame.get("camera_angle_x", meta.get("camera_angle_x", None)))
-            if fy is None:
-                if "camera_angle_y" in frame or "camera_angle_y" in meta:
-                    fy = self._focal_from_fov(height, frame.get("camera_angle_y", meta.get("camera_angle_y")))
-                else:
-                    fy = fx
-            if cx is None:
-                cx = float(width) / 2.0
-            if cy is None:
-                cy = float(height) / 2.0
-
+            r, t = self._nerf_c2w_to_w2c(c2w)
             self.cameras.append(
                 CameraData(
-                    R=r_tensor,
-                    T=t_tensor,
+                    R=torch.tensor(r, dtype=torch.float32),
+                    T=torch.tensor(t, dtype=torch.float32),
                     fx=float(fx) * scale_factor,
                     fy=float(fy) * scale_factor,
                     cx=float(cx) * scale_factor,
                     cy=float(cy) * scale_factor,
-                    width=max(1, int(round(float(width) * scale_factor))),
-                    height=max(1, int(round(float(height) * scale_factor))),
+                    width=max(1, int(round(width * scale_factor))),
+                    height=max(1, int(round(height * scale_factor))),
                     image_path=str(img_path),
+                    uid=len(self.cameras),  # Assign sequential camera ID
+                    depth_dir=str(depth_dir_override) if depth_dir_override is not None else (str(self.depth_dir) if self.depth_dir is not None else None),
                 )
             )
+            camera_centers.append(np.asarray(c2w[:3, 3], dtype=np.float32))
 
-        if len(self.cameras) == 0:
-            raise RuntimeError(f"No valid frames with existing images were found in {self.transforms_path}")
+        if not self.cameras:
+            raise RuntimeError(f"No valid camera frames loaded from: {transforms_file}")
 
-        xyz, rgb = self._load_or_generate_init_cloud(
-            point_cloud_path=point_cloud_path,
-            camera_centers=np.asarray(camera_centers, dtype=np.float32),
-            fallback_init_points=fallback_init_points,
-        )
+        loaded_cloud = self._load_point_cloud(self.point_cloud_path)
+        if loaded_cloud is not None:
+            xyz, rgb = loaded_cloud
+        else:
+            fallback_max_points = max(5000, min(200000, len(self.cameras) * 9))
+            xyz, rgb = self._synthesize_points_from_camera_rays(
+                cameras=self.cameras,
+                max_points=fallback_max_points,
+            )
+
         self._set_init_points_and_colors(
             xyz=xyz,
             rgb_uint8=rgb,
@@ -674,113 +914,351 @@ class InstantNGPDataset(BaseReconstructionDataset):
             point_cloud_extent_ratio=point_cloud_extent_ratio,
         )
 
-    def _load_or_generate_init_cloud(
+
+class MatrixCityDataset(BaseReconstructionDataset):
+    def __init__(
         self,
-        point_cloud_path: Optional[Union[str, Path]],
-        camera_centers: np.ndarray,
-        fallback_init_points: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        if point_cloud_path is not None:
-            cloud_path = Path(point_cloud_path).expanduser().resolve()
-            if not cloud_path.exists():
-                raise FileNotFoundError(f"point_cloud_path does not exist: {cloud_path}")
+        matrixcity_paths: Sequence[Union[str, Path]],
+        matrixcity_depth_paths: Optional[Sequence[Union[str, Path]]] = None,
+        matrixcity_pointcloud_paths: Optional[Sequence[Union[str, Path]]] = None,
+        matrixcity_max_init_points: int = 300000,
+        device: torch.device = torch.device("cuda"),
+        use_dataloader: bool = True,
+        point_cloud_extent_ratio: Optional[float] = None,
+        scene_extent_margin: float = 2.0,
+        image_scale: int = 1,
+        require_depth: bool = True,
+    ):
+        if not matrixcity_paths:
+            raise ValueError("matrixcity_paths must contain at least one block path")
 
-            xyz, rgb = self._load_point_cloud_file(cloud_path)
-            return xyz, rgb
+        block_paths = [Path(p).expanduser().resolve() for p in matrixcity_paths]
+        for block_path in block_paths:
+            if not block_path.exists():
+                raise FileNotFoundError(f"MatrixCity block path not found: {block_path}")
 
-        center = camera_centers.mean(axis=0) if len(camera_centers) > 0 else np.zeros(3, dtype=np.float32)
-        if len(camera_centers) > 1:
-            radius = np.linalg.norm(camera_centers - center, axis=1).mean()
+        self.block_paths = block_paths
+        self.matrixcity_max_init_points = int(matrixcity_max_init_points)
+        self.matrixcity_pointcloud_paths = [
+            Path(p).expanduser().resolve() for p in (matrixcity_pointcloud_paths or [])
+        ]
+
+        depth_paths: list[Optional[Path]] = []
+        if matrixcity_depth_paths is not None:
+            if len(matrixcity_depth_paths) != len(block_paths):
+                raise ValueError(
+                    "matrixcity_depth_paths must either be omitted or have exactly one entry per matrixcity_paths"
+                )
+            for p in matrixcity_depth_paths:
+                d = Path(p).expanduser().resolve()
+                if not d.exists() and require_depth:
+                    raise FileNotFoundError(f"MatrixCity depth path not found: {d}")
+                depth_paths.append(d if d.exists() else None)
         else:
-            radius = 1.0
+            for block_path in block_paths:
+                depth_paths.append(self._infer_block_depth_path(block_path))
 
-        radius = max(float(radius), 0.1)
-        xyz = center[None, :] + np.random.normal(0.0, radius * 0.3, size=(int(fallback_init_points), 3)).astype(np.float32)
-        rgb = np.full((int(fallback_init_points), 3), 127.5, dtype=np.float32)
-        logger.warning(
-            "[yellow]Instant-NGP init cloud fallback:[/yellow] generated synthetic initialization "
-            f"with {fallback_init_points} points near camera centers."
+        self._block_depth_paths = depth_paths
+
+        super().__init__(
+            image_dir=block_paths[0],
+            depth_dir=None,
+            device=device,
+            use_dataloader=use_dataloader,
+            image_scale=image_scale,
+            require_depth=False,
         )
-        return xyz, rgb
+
+        self._load_matrixcity_blocks(
+            point_cloud_extent_ratio=point_cloud_extent_ratio,
+            scene_extent_margin=scene_extent_margin,
+            require_depth=require_depth,
+        )
 
     @staticmethod
-    def _normalize_point_cloud_arrays(
-        xyz: np.ndarray,
-        rgb: Optional[np.ndarray] = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        xyz = np.asarray(xyz, dtype=np.float32)
-        if xyz.ndim != 2 or xyz.shape[1] != 3:
-            raise ValueError(f"Expected xyz with shape [N, 3], got {xyz.shape}")
+    def _infer_block_depth_path(block_path: Path) -> Optional[Path]:
+        candidates = [
+            block_path / "depth",
+            block_path / "depths",
+            block_path / "depth_exr",
+            block_path.parent / f"{block_path.name}_depth",
+            block_path.parent / f"{block_path.name}_depths",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+        return None
 
-        if rgb is None:
-            rgb_out = np.full((xyz.shape[0], 3), 127.5, dtype=np.float32)
-        else:
-            rgb_arr = np.asarray(rgb, dtype=np.float32)
-            if rgb_arr.ndim != 2 or rgb_arr.shape[1] != 3 or rgb_arr.shape[0] != xyz.shape[0]:
-                raise ValueError(
-                    "Expected rgb with shape [N, 3] matching xyz; "
-                    f"got rgb={rgb_arr.shape}, xyz={xyz.shape}"
-                )
-            rgb_out = np.clip(rgb_arr, 0.0, 255.0)
-
-        return xyz, rgb_out
+    @staticmethod
+    def _resolve_matrixcity_transforms(block_path: Path) -> Path:
+        for name in ("transforms.json", "transforms_origin.json", "transform.json", "transforms_train.json"):
+            candidate = block_path / name
+            if candidate.exists():
+                return candidate
+        raise FileNotFoundError(
+            f"No MatrixCity transform file found under: {block_path}. "
+            "Expected transforms.json/transforms_origin.json/transform.json/transforms_train.json"
+        )
 
     @classmethod
-    def _load_point_cloud_file(cls, cloud_path: Path) -> tuple[np.ndarray, np.ndarray]:
-        suffix = cloud_path.suffix.lower()
+    def _matrixcity_rotmat_to_c2w(cls, rot_mat: Any) -> np.ndarray:
+        c2w = np.asarray(rot_mat, dtype=np.float32).copy()
+        if c2w.shape != (4, 4):
+            raise ValueError(f"Expected rot_mat shape [4,4], got {c2w.shape}")
+        c2w[3, :] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        c2w[:3, :3] = InstantNGPDataset._normalize_rotation_matrix(c2w[:3, :3])
+        return c2w
 
-        if suffix == ".npy":
-            cloud = np.load(cloud_path)
-            if cloud.ndim != 2 or cloud.shape[1] not in [3, 6]:
-                raise ValueError(
-                    "Instant-NGP point cloud npy must have shape [N, 3] (xyz) or [N, 6] (xyzrgb)."
-                )
-            xyz = cloud[:, :3]
-            rgb = cloud[:, 3:6] if cloud.shape[1] == 6 else None
-            return cls._normalize_point_cloud_arrays(xyz=xyz, rgb=rgb)
+    def _load_matrixcity_point_clouds(self) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        merged_xyz: list[np.ndarray] = []
+        merged_rgb: list[np.ndarray] = []
+        for pc_path in self.matrixcity_pointcloud_paths:
+            if not pc_path.exists():
+                logger.warning(f"[yellow]Skipping missing point cloud:[/yellow] {pc_path}")
+                continue
+            xyz_rgb = InstantNGPDataset._load_point_cloud(pc_path)
+            if xyz_rgb is None:
+                continue
+            xyz, rgb = xyz_rgb
+            if xyz.shape[0] == 0:
+                continue
+            merged_xyz.append(xyz)
+            merged_rgb.append(rgb)
 
-        if suffix in {".pth", ".pt"}:
-            payload = torch.load(cloud_path, map_location="cpu")
+        if not merged_xyz:
+            return None
 
-            if isinstance(payload, dict):
-                if "xyz" not in payload:
-                    raise ValueError(
-                        "Point cloud .pth dict must contain key 'xyz'. Optional key: 'rgb'."
+        xyz = np.concatenate(merged_xyz, axis=0)
+        rgb = np.concatenate(merged_rgb, axis=0)
+
+        if self.matrixcity_max_init_points > 0 and xyz.shape[0] > self.matrixcity_max_init_points:
+            rng = np.random.default_rng(0)
+            idx = rng.choice(xyz.shape[0], size=self.matrixcity_max_init_points, replace=False)
+            xyz = xyz[idx]
+            rgb = rgb[idx]
+
+        return xyz, rgb
+
+    def _synthesize_points_from_matrixcity_depth(self, max_points: int) -> tuple[np.ndarray, np.ndarray]:
+        """Synthesize initialization points by backprojecting MatrixCity depth into world space."""
+        if len(self.cameras) == 0:
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+
+        max_points = int(max_points)
+        if max_points <= 0:
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+
+        rng = np.random.default_rng(0)
+        cam_indices = np.arange(len(self.cameras), dtype=np.int32)
+        rng.shuffle(cam_indices)
+
+        # Limit number of contributing cameras for very large datasets.
+        max_cameras = min(len(cam_indices), 256)
+        selected_cam_indices = cam_indices[:max_cameras]
+        samples_per_cam = max(64, max_points // max(1, len(selected_cam_indices)))
+
+        all_xyz: list[np.ndarray] = []
+        all_rgb: list[np.ndarray] = []
+
+        for cam_idx in selected_cam_indices:
+            cam = self.cameras[int(cam_idx)]
+            depth_dir = Path(cam.depth_dir).expanduser().resolve() if cam.depth_dir else None
+            if depth_dir is None:
+                continue
+
+            img_path = Path(cam.image_path)
+            depth_path = self._resolve_depth_path(depth_dir, img_path.stem)
+            if depth_path is None:
+                continue
+
+            try:
+                if depth_path.suffix.lower() == ".npy":
+                    depth_map = np.load(depth_path)
+                elif depth_path.suffix.lower() == ".exr":
+                    depth_map = self._try_read_exr_depth(depth_path)
+                    if depth_map is None:
+                        continue
+                    invalid_exr_mask = depth_map >= 65504.0
+                    if invalid_exr_mask.any():
+                        depth_map = depth_map.astype(np.float32, copy=True)
+                        depth_map[invalid_exr_mask] = np.nan
+                else:
+                    continue
+
+                if cam.depth_scale != 1.0:
+                    depth_map = np.asarray(depth_map, dtype=np.float32) * float(cam.depth_scale)
+
+                if depth_map.shape[:2] != (cam.height, cam.width):
+                    continue
+
+                valid = np.isfinite(depth_map) & (depth_map > 1e-4)
+                valid_idx = np.flatnonzero(valid.reshape(-1))
+                if valid_idx.size == 0:
+                    continue
+
+                take = min(samples_per_cam, valid_idx.size)
+                chosen = rng.choice(valid_idx, size=take, replace=False)
+
+                ys = chosen // cam.width
+                xs = chosen % cam.width
+                z = depth_map.reshape(-1)[chosen].astype(np.float32)
+
+                x_cam = ((xs.astype(np.float32) - float(cam.cx)) / float(cam.fx)) * z
+                y_cam = ((ys.astype(np.float32) - float(cam.cy)) / float(cam.fy)) * z
+                pts_cam = np.stack([x_cam, y_cam, z], axis=1)
+
+                r_w2c = cam.R.detach().cpu().numpy().astype(np.float32)
+                t_w2c = cam.T.detach().cpu().numpy().astype(np.float32)
+                pts_world = (r_w2c.T @ (pts_cam - t_w2c).T).T
+                all_xyz.append(pts_world.astype(np.float32))
+
+                try:
+                    img_raw = np.asarray(imageio.imread(img_path))
+                    if img_raw.ndim == 2:
+                        img_rgb = np.repeat(img_raw[..., None], 3, axis=-1)
+                    elif img_raw.ndim == 3 and img_raw.shape[2] == 4:
+                        img_rgb = img_raw[..., :3]
+                    elif img_raw.ndim == 3 and img_raw.shape[2] == 1:
+                        img_rgb = np.repeat(img_raw, 3, axis=-1)
+                    else:
+                        img_rgb = img_raw
+                    colors = np.asarray(img_rgb[ys, xs], dtype=np.float32)
+                except Exception:
+                    colors = np.full((take, 3), 127.5, dtype=np.float32)
+
+                all_rgb.append(colors)
+            except Exception as exc:
+                logger.debug(f"Depth point synthesis failed for {img_path.name}: {exc}")
+                continue
+
+        if len(all_xyz) == 0:
+            logger.warning("[yellow]Depth-based MatrixCity init failed:[/yellow] no valid depth points synthesized")
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+
+        xyz = np.concatenate(all_xyz, axis=0)
+        rgb = np.concatenate(all_rgb, axis=0)
+
+        if xyz.shape[0] > max_points:
+            keep = rng.choice(xyz.shape[0], size=max_points, replace=False)
+            xyz = xyz[keep]
+            rgb = rgb[keep]
+
+        logger.info(
+            f"[cyan]Depth-based MatrixCity init cloud:[/cyan] synthesized {xyz.shape[0]} points from depth maps"
+        )
+        return xyz.astype(np.float32), rgb.astype(np.float32)
+
+    def _load_matrixcity_blocks(
+        self,
+        point_cloud_extent_ratio: Optional[float],
+        scene_extent_margin: float,
+        require_depth: bool,
+    ) -> None:
+        camera_centers: list[np.ndarray] = []
+        missing_depth_dirs = 0
+
+        for block_idx, block_path in enumerate(self.block_paths):
+            transforms_file = self._resolve_matrixcity_transforms(block_path)
+            with transforms_file.open("r", encoding="utf-8") as f:
+                meta = json.load(f)
+
+            frames = meta.get("frames", [])
+            if not frames:
+                logger.warning(f"[yellow]No frames found in block:[/yellow] {block_path}")
+                continue
+
+            first_img = None
+            for frame in frames:
+                first_img = InstantNGPDataset._resolve_frame_image_path(frame, transforms_file.parent, block_path)
+                if first_img is not None:
+                    break
+            if first_img is None:
+                logger.warning(f"[yellow]No valid image found for block:[/yellow] {block_path}")
+                continue
+
+            width = int(meta.get("w", 0))
+            height = int(meta.get("h", 0))
+            if width <= 0 or height <= 0:
+                width, height = InstantNGPDataset._image_size(first_img)
+
+            fx, fy, cx, cy = InstantNGPDataset._intrinsics_from_meta(meta, width, height)
+            scale_factor = 1.0 / float(self.image_scale)
+
+            depth_dir = self._block_depth_paths[block_idx]
+            if depth_dir is None:
+                missing_depth_dirs += 1
+
+            for frame in frames:
+                img_path = InstantNGPDataset._resolve_frame_image_path(frame, transforms_file.parent, block_path)
+                if img_path is None:
+                    continue
+
+                if "rot_mat" in frame:
+                    c2w = self._matrixcity_rotmat_to_c2w(frame["rot_mat"])
+                elif "transform_matrix" in frame:
+                    c2w = np.asarray(frame["transform_matrix"], dtype=np.float32)
+                    c2w[3, :] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+                    c2w[:3, :3] = InstantNGPDataset._normalize_rotation_matrix(c2w[:3, :3])
+                else:
+                    continue
+
+                r, t = InstantNGPDataset._nerf_c2w_to_w2c(c2w)
+                self.cameras.append(
+                    CameraData(
+                        R=torch.tensor(r, dtype=torch.float32),
+                        T=torch.tensor(t, dtype=torch.float32),
+                        fx=float(fx) * scale_factor,
+                        fy=float(fy) * scale_factor,
+                        cx=float(cx) * scale_factor,
+                        cy=float(cy) * scale_factor,
+                        width=max(1, int(round(width * scale_factor))),
+                        height=max(1, int(round(height * scale_factor))),
+                        image_path=str(img_path),
+                        uid=len(self.cameras),  # Assign sequential camera ID
+                        depth_dir=str(depth_dir) if depth_dir is not None else None,
+                        # MatrixCity depth is exported in centimeters.
+                        depth_scale=0.01,
                     )
-                xyz_raw = payload["xyz"]
-                rgb_raw = payload.get("rgb", None)
-            elif isinstance(payload, torch.Tensor) or isinstance(payload, np.ndarray):
-                arr = payload.detach().cpu().numpy() if isinstance(payload, torch.Tensor) else np.asarray(payload)
-                if arr.ndim != 2 or arr.shape[1] not in [3, 6]:
-                    raise ValueError(
-                        "Point cloud tensor/array in .pth must have shape [N, 3] or [N, 6]."
-                    )
-                xyz_raw = arr[:, :3]
-                rgb_raw = arr[:, 3:6] if arr.shape[1] == 6 else None
-            else:
-                raise ValueError(
-                    "Unsupported .pth payload type. Use dict {'xyz': [N,3], 'rgb': [N,3]} "
-                    "or a tensor/array with shape [N,3] or [N,6]."
+                )
+                camera_centers.append(np.asarray(c2w[:3, 3], dtype=np.float32))
+
+        if not self.cameras:
+            raise RuntimeError("No valid MatrixCity frames were loaded from the provided block paths")
+
+        if require_depth and missing_depth_dirs > 0:
+            raise FileNotFoundError(
+                "Depth supervision is enabled, but one or more MatrixCity blocks have no depth directory. "
+                "Provide --matrixcity-depth-path once per --matrixcity-path or disable depth loss."
+            )
+
+        loaded_cloud = self._load_matrixcity_point_clouds()
+        if loaded_cloud is not None:
+            xyz, rgb = loaded_cloud
+        else:
+            xyz, rgb = self._synthesize_points_from_matrixcity_depth(
+                max_points=self.matrixcity_max_init_points,
+            )
+            if xyz.shape[0] == 0:
+                xyz, rgb = self._synthesize_points_from_camera_rays(
+                    cameras=self.cameras,
+                    max_points=self.matrixcity_max_init_points,
                 )
 
-            if isinstance(xyz_raw, torch.Tensor):
-                xyz_raw = xyz_raw.detach().cpu().numpy()
-            if isinstance(rgb_raw, torch.Tensor):
-                rgb_raw = rgb_raw.detach().cpu().numpy()
-
-            return cls._normalize_point_cloud_arrays(xyz=xyz_raw, rgb=rgb_raw)
-
-        raise ValueError(
-            f"Unsupported point cloud file type '{suffix}' for {cloud_path}. "
-            "Supported: .npy, .pth, .pt"
+        self._set_init_points_and_colors(
+            xyz=xyz,
+            rgb_uint8=rgb,
+            scene_extent_margin=scene_extent_margin,
+            point_cloud_extent_ratio=point_cloud_extent_ratio,
         )
 
 
-def create_dataset(dataset_type: str, **kwargs) -> BaseReconstructionDataset:
+def create_dataset(dataset_type: str, **kwargs) -> ColmapDataset | InstantNGPDataset | MatrixCityDataset:
     """Factory for reconstruction datasets."""
     dataset_type_norm = dataset_type.strip().lower().replace("_", "-")
     if dataset_type_norm in {"colmap"}:
         return ColmapDataset(**kwargs)
     if dataset_type_norm in {"instant-ngp", "instantngp", "ngp"}:
         return InstantNGPDataset(**kwargs)
-    raise ValueError(f"Unsupported dataset_type '{dataset_type}'. Supported: colmap, instant-ngp")
+    if dataset_type_norm in {"matrixcity", "matrix-city"}:
+        return MatrixCityDataset(**kwargs)
+    raise ValueError(f"Unsupported dataset_type '{dataset_type}'. Supported: colmap, instant-ngp, matrixcity")

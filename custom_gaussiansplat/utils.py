@@ -1,10 +1,31 @@
 """
 Utility functions for 3D Gaussian Splatting training.
 """
-import torch
+import os
+import random
+
 import numpy as np
-from rich.table import Table
+import torch
 from rich import box
+from rich.table import Table
+
+
+def seed_everything(seed=32):
+    # 1. Python built-in random module
+    random.seed(seed)
+    
+    # 2. Python hash seed 
+    # (Forces dictionary and set operations to be reproducible)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    # 3. NumPy
+    np.random.seed(seed)
+    
+    # 4. PyTorch
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # For multi-GPU environments
+
 
 
 class ShuffledCameraSampler:
@@ -81,10 +102,10 @@ def create_metrics_table(iteration, loss_val, l1_val, ssim_val, lpips_val, psnr_
     return table
 
 
-def format_phase_description(step, phase, current_loss, current_l1, current_ssim, current_lpips, current_psnr, current_scale_loss, num_gaussians):
+def format_phase_description(step, phase, current_loss, current_l1, current_ssim, current_lpips, current_psnr, current_scale_loss, num_gaussians, count_label: str = "GS"):
     """
     Format a compact phase description for progress bar.
-    
+
     Args:
         step: Current training step
         phase: Training phase string
@@ -94,8 +115,9 @@ def format_phase_description(step, phase, current_loss, current_l1, current_ssim
         current_lpips: Current LPIPS loss
         current_psnr: Current PSNR value
         current_scale_loss: Current scale regularization loss
-        num_gaussians: Current number of Gaussians
-    
+        num_gaussians: Current count (Gaussians for 3DGS, anchors for Scaffold-GS)
+        count_label: Label for the count column (e.g. "GS" or "Anchors")
+
     Returns:
         Formatted string
     """
@@ -108,7 +130,7 @@ def format_phase_description(step, phase, current_loss, current_l1, current_ssim
         # f"LPIPS: {current_lpips:.6f} │ "
         f"PSNR: {current_psnr:.2f} dB │ "
         # f"Scale Reg: {current_scale_loss:.6f} │ "
-        f"GS: [green]{num_gaussians:,}[/green]"
+        f"{count_label}: [green]{num_gaussians:,}[/green]"
     )
 
 

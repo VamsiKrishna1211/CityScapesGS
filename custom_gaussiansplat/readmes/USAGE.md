@@ -60,7 +60,7 @@ python train.py \
     --densify-from-iter 500 \
     --densify-until-iter 18000 \
     --densify-interval 100 \
-    --grad-threshold 0.0002 \
+    --grow-grad2d 0.0002 \
     --max-screen-size 5000 \
     --opacity-reset-interval 3000 \
     --opacity-reset-value 0.01 \
@@ -105,7 +105,7 @@ python train.py \
 | `--densify-from-iter` | `500` | Start densification iteration |
 | `--densify-until-iter` | `15000` | Stop densification iteration |
 | `--densify-interval` | `100` | Densify every N iterations |
-| `--grad-threshold` | `0.0002` | Gradient threshold for densification |
+| `--grow-grad2d` | `0.0001` | 2D gradient threshold for densification growth |
 | `--max-screen-size` | `5000` | Max screen size (pixels) for pruning |
 | `--opacity-reset-interval` | `3000` | Reset opacity every N iterations |
 | `--opacity-reset-value` | `0.01` | Opacity reset value |
@@ -189,7 +189,7 @@ python train.py \
     --colmap-path data/scene/sparse/0 \
     --images-path data/scene/images \
     --output-dir outputs/conservative \
-    --grad-threshold 0.0005 \
+    --grow-grad2d 0.0005 \
     --densify-interval 200 \
     --max-screen-size 2000
 ```
@@ -201,7 +201,7 @@ python train.py \
     --colmap-path data/scene/sparse/0 \
     --images-path data/scene/images \
     --output-dir outputs/aggressive \
-    --grad-threshold 0.0001 \
+    --grow-grad2d 0.0001 \
     --densify-interval 50 \
     --max-screen-size 8000
 ```
@@ -219,7 +219,7 @@ subprocess.run([
     "--images-path", "data/boston/images",
     "--output-dir", "outputs/my_run",
     "--iterations", "10000",
-    "--grad-threshold", "0.0003",
+    "--grow-grad2d", "0.0003",
     "--lr-means", "0.0002",
 ], check=True)
 ```
@@ -230,5 +230,5 @@ subprocess.run([
 2. **Adjust iterations**: Use 7000 for quick results, 15000-30000 for quality
 3. **Monitor Gaussian count**: Should grow from hundreds to tens of thousands
 4. **Use --export-ply**: Essential for visualizing results in viewers
-5. **Adjust grad-threshold**: Lower = more aggressive densification
+5. **Adjust grow-grad2d**: Lower = more aggressive densification
 6. **Check GPU memory**: Densification increases memory usage over time

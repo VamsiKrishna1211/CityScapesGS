@@ -10,6 +10,11 @@ class RequiredConfig:
     colmap_path: Optional[str]
     transforms_path: Optional[str]
     images_path: Optional[str]
+    depths_path: Optional[str]
+    matrixcity_paths: Optional[list[str]]
+    matrixcity_depth_paths: Optional[list[str]]
+    matrixcity_pointcloud_paths: Optional[list[str]]
+    matrixcity_max_init_points: int
     point_cloud_path: Optional[str]
     scale: int
 
@@ -28,7 +33,25 @@ class TrainingConfig:
     preload: bool
     enable_lpips_loss: bool
     lpips_loss_weight: float
+    use_low_vram: bool
     lpips_model: str = "vgg"  # Could be made configurable if desired, but VGG is a good default for perceptual similarity
+
+
+@dataclass
+class ModelConfig:
+    model_type: str  # "gaussian" or "scaffold"
+    # Scaffold-GS specific
+    feat_dim: int
+    n_offsets: int
+    voxel_size: float
+    update_depth: int
+    update_init_factor: int
+    update_hierachy_factor: int
+    use_feat_bank: bool
+    appearance_dim: int
+    add_opacity_dist: bool
+    add_cov_dist: bool
+    add_color_dist: bool
 
 
 @dataclass
@@ -46,6 +69,7 @@ class DensificationConfig:
     max_screen_size: int
     opacity_reset_interval: int
     opacity_reset_value: float
+    absgrad: bool
 
 
 @dataclass
@@ -85,16 +109,23 @@ class DepthConfig:
     depth_loss_weight: float
     depth_loss_start_iter: int
     sam_loss_weight: float
+    enable_affine_invariant_depth_loss: bool
     affine_invariant_depth_loss_weight: float
+    enable_pearson_correlation_loss: bool
     pearson_correlation_loss_weight: float
+    enable_silog_loss: bool
     silog_loss_weight: float
+    enable_ordinal_depth_loss: bool
     ordinal_depth_loss_weight: float
+    enable_affine_aligned_gradient_matching_loss: bool
     affine_aligned_gradient_matching_loss_weight: float
     enable_depth_smoothness_loss: bool
     depth_smoothness_start_alpha: float
     depth_smoothness_end_alpha: float
     depth_smoothness_max_steps: int # If not used, then it will default to total iterations
     depth_smoothness_loss_weight: float
+    enable_metric_depth_normal_loss: bool
+    metric_depth_normal_loss_weight: float
 
 
 @dataclass
@@ -128,6 +159,12 @@ class ViewerConfig:
     viewer_port: int
     viewer_refresh_interval: int = 100  # How often to refresh viewer with latest model params (in iterations)
     rerun_viewer: bool = False
+    viewer_backend: str = "ns-replica"  # ns-replica | nerfview
+    viewer_image_policy: str = "lazy"  # lazy | preload
+    viewer_image_cache_size: int = 256
+    viewer_max_thumbnail_size: int = 128
+    viewer_add_training_cameras: bool = True
+    viewer_camera_frustum_scale: float = 0.3
 
 
 @dataclass
@@ -138,13 +175,21 @@ class TensorBoardConfig:
 
 
 @dataclass
+class LODConfig:
+    num_levels: int
+    reduction_factor: int
+
+
+@dataclass
 class TrainConfig:
     raw: argparse.Namespace
     required: RequiredConfig
     output: OutputConfig
+    model: ModelConfig
     training: TrainingConfig
     densification: DensificationConfig
     floater_prevention: FloaterPreventionConfig
+    lod: LODConfig
     sh: SHConfig
     semantics: SemanticsConfig
     depth: DepthConfig
@@ -258,9 +303,30 @@ def _normalize_semantics_values(values: Dict[str, Any]) -> Dict[str, Any]:
 
 def _normalize_required_values(values: Dict[str, Any]) -> Dict[str, Any]:
     dataset_type = str(values.get("dataset_type", "colmap")).strip().lower().replace("_", "-")
-    if dataset_type not in {"colmap", "instant-ngp"}:
-        raise ValueError(f"Unsupported --dataset-type '{dataset_type}'. Supported: colmap, instant-ngp")
+    if dataset_type not in {"colmap", "instant-ngp", "matrixcity"}:
+        raise ValueError(f"Unsupported --dataset-type '{dataset_type}'. Supported: colmap, instant-ngp, matrixcity")
     values["dataset_type"] = dataset_type
+
+    matrixcity_paths = values.get("matrixcity_paths")
+    matrixcity_depth_paths = values.get("matrixcity_depth_paths")
+
+    if matrixcity_paths is not None:
+        values["matrixcity_paths"] = [str(path) for path in matrixcity_paths]
+    if matrixcity_depth_paths is not None:
+        values["matrixcity_depth_paths"] = [str(path) for path in matrixcity_depth_paths]
+
+    if dataset_type == "matrixcity":
+        if not values.get("matrixcity_paths"):
+            raise ValueError(
+                "--matrixcity-path must be provided at least once when --dataset-type=matrixcity"
+            )
+        if values.get("matrixcity_depth_paths") and (
+            len(values["matrixcity_depth_paths"]) != len(values["matrixcity_paths"])
+        ):
+            raise ValueError(
+                "--matrixcity-depth-path must be provided either zero times or exactly "
+                "once per --matrixcity-path"
+            )
 
     # Backward compatibility: allow using --colmap-path as transforms input for instant-ngp.
     if dataset_type == "instant-ngp" and values.get("transforms_path") is None and values.get("colmap_path") is not None:
@@ -280,7 +346,7 @@ REQUIRED_GROUP = ArgGroupDef(
             dest="dataset_type",
             arg_type=str,
             default="colmap",
-            choices=("colmap", "instant-ngp"),
+            choices=("colmap", "instant-ngp", "matrixcity"),
             help="Dataset format to load",
         ),
         ArgSpec(
@@ -298,6 +364,13 @@ REQUIRED_GROUP = ArgGroupDef(
             help="Path to Instant-NGP transform file or scene directory containing transform.json/transforms.json (required for --dataset-type instant-ngp)",
         ),
         ArgSpec(
+            flags=("--matrixcity-path",),
+            dest="matrixcity_paths",
+            action="append",
+            required=False,
+            help="MatrixCity block root path. Repeat this flag for multiple blocks (for example: .../aerial/train/block_1 --matrixcity-path .../aerial/train/block_2).",
+        ),
+        ArgSpec(
             flags=("--images-path",),
             dest="images_path",
             arg_type=str,
@@ -305,11 +378,39 @@ REQUIRED_GROUP = ArgGroupDef(
             help="Path to training images directory (required for colmap, optional for instant-ngp if transforms folder has images/)",
         ),
         ArgSpec(
+            flags=("--depths-path",),
+            dest="depths_path",
+            arg_type=str,
+            default=None,
+            help="Optional explicit depth directory override. Supports .npy and .exr depth maps.",
+        ),
+        ArgSpec(
+            flags=("--matrixcity-depth-path",),
+            dest="matrixcity_depth_paths",
+            action="append",
+            required=False,
+            help="Optional MatrixCity depth root per block. Repeat in the same order as --matrixcity-path, or omit to auto-resolve per block.",
+        ),
+        ArgSpec(
+            flags=("--matrixcity-pointcloud-path",),
+            dest="matrixcity_pointcloud_paths",
+            action="append",
+            required=False,
+            help="Optional MatrixCity point cloud root, and the cound need not match the number of blocks. If provided, the point cloud will be used",
+        ),
+        ArgSpec(
+            flags=("--matrixcity-max-init-points",),
+            dest="matrixcity_max_init_points",
+            arg_type=int,
+            default=300000,
+            help="Maximum number of initialization points used from MatrixCity point clouds after merge (default: 300000).",
+        ),
+        ArgSpec(
             flags=("--point-cloud-path",),
             dest="point_cloud_path",
             arg_type=str,
             default=None,
-            help="Optional point cloud for instant-ngp init (.npy/.pth/.pt). Shapes: [N,3] xyz or [N,6] xyzrgb, or .pth dict {'xyz','rgb'}.",
+            help="Optional point cloud for instant-ngp init (.npy/.pth/.pt/.ply). Shapes: [N,3] xyz or [N,6] xyzrgb, .pth dict {'xyz','rgb'}, or PLY vertex x/y/z with optional RGB.",
         ),
         ArgSpec(
             flags=("-s", "--scale"),
@@ -336,6 +437,26 @@ OUTPUT_GROUP = ArgGroupDef(
     ),
 )
 
+MODEL_GROUP = ArgGroupDef(
+    key="model",
+    title="Model Options",
+    config_cls=ModelConfig,
+    specs=(
+        ArgSpec(flags=("--model-type",), dest="model_type", arg_type=str, default="gaussian", choices=("gaussian", "scaffold"), help="Model architecture to use"),
+        ArgSpec(flags=("--feat-dim",), dest="feat_dim", arg_type=int, default=32, help="Scaffold-GS: anchor feature dimension"),
+        ArgSpec(flags=("--n-offsets",), dest="n_offsets", arg_type=int, default=10, help="Scaffold-GS: number of Gaussians per anchor"),
+        ArgSpec(flags=("--voxel-size",), dest="voxel_size", arg_type=float, default=0.01, help="Scaffold-GS: initial voxel size for anchors"),
+        ArgSpec(flags=("--update-depth",), dest="update_depth", arg_type=int, default=3, help="Scaffold-GS: anchor growing depth"),
+        ArgSpec(flags=("--update-init-factor",), dest="update_init_factor", arg_type=int, default=100, help="Scaffold-GS: anchor growing factor"),
+        ArgSpec(flags=("--update-hierachy-factor",), dest="update_hierachy_factor", arg_type=int, default=4, help="Scaffold-GS: anchor growing hierarchy factor"),
+        ArgSpec(flags=("--use-feat-bank",), dest="use_feat_bank", action="store_true", help="Scaffold-GS: use feature bank for view-dependency"),
+        ArgSpec(flags=("--appearance-dim",), dest="appearance_dim", arg_type=int, default=32, help="Scaffold-GS: appearance embedding dimension"),
+        ArgSpec(flags=("--add-opacity-dist",), dest="add_opacity_dist", action="store_true", help="Scaffold-GS: include distance in opacity MLP"),
+        ArgSpec(flags=("--add-cov-dist",), dest="add_cov_dist", action="store_true", help="Scaffold-GS: include distance in covariance MLP"),
+        ArgSpec(flags=("--add-color-dist",), dest="add_color_dist", action="store_true", help="Scaffold-GS: include distance in color MLP"),
+    ),
+)
+
 TRAINING_GROUP = ArgGroupDef(
     key="training",
     title="Training Parameters",
@@ -346,6 +467,7 @@ TRAINING_GROUP = ArgGroupDef(
         ArgSpec(flags=("--log-interval",), dest="log_interval", arg_type=int, default=1, help="Log progress every N iterations"),
         ArgSpec(flags=("--num-workers",), dest="num_workers", arg_type=int, default=0, help="Number of worker threads for data loading"),
         ArgSpec(flags=("--preload",), dest="preload", action="store_true", help="Preload all images into RAM before training (can speed up training but requires more memory)"),
+        ArgSpec(flags=("--use-low-vram",), dest="use_low_vram", action="store_true", default=False, help="Enable low VRAM optimizations: mixed precision training (FP16/AMP), aggressive cache clearing, and gradient scaling. Reduces memory usage by ~30-40%% with minimal impact on quality. Consider disabling --enable-lpips-loss for additional savings."),
         ArgSpec(flags=("--enable-lpips-loss",), dest="enable_lpips_loss", action="store_true", help="Enable LPIPS loss for perceptual similarity (requires additional dependencies and GPU memory)"),
         ArgSpec(flags=("--lpips-loss-weight",), dest="lpips_loss_weight", arg_type=float, default=0.2, help="Weight for LPIPS loss (0.01-0.4 recommended if enabled), default: 0.2"),
         ArgSpec(flags=("--lpips-model",), dest="lpips_model", arg_type=str, default="vgg", choices=("vgg", "alex", "squeeze"), help="Model to use for LPIPS loss (default: vgg)"),
@@ -370,6 +492,7 @@ DENSIFICATION_GROUP = ArgGroupDef(
         ArgSpec(flags=("--max-screen-size",), dest="max_screen_size", arg_type=int, default=5000, help="Maximum screen size in pixels for pruning (increase for large scenes, e.g., 100-200)"),
         ArgSpec(flags=("--opacity-reset-interval",), dest="opacity_reset_interval", arg_type=int, default=3000, help="Reset opacity every N iterations"),
         ArgSpec(flags=("--opacity-reset-value",), dest="opacity_reset_value", arg_type=float, default=0.01, help="Opacity value to reset to (0.01-0.1, lower = more aggressive floater removal)"),
+        ArgSpec(flags=("--absgrad",), dest="absgrad", action="store_true", default=False, help="Use absolute gradients for densification decisions (standard Gaussian model only)"),
     ),
 )
 
@@ -424,19 +547,26 @@ DEPTH_GROUP = ArgGroupDef(
     config_cls=DepthConfig,
     specs=(
         ArgSpec(flags=("--enable-depth-loss",), dest="enable_depth_loss", action="store_true", help="Enable depth supervision from Depth Anything V2 depth maps"),
-        ArgSpec(flags=("--depth-loss-weight",), dest="depth_loss_weight", arg_type=float, default=0.1, help="Weight for depth loss (0.05-0.2 recommended)"),
+        ArgSpec(flags=("--depth-loss-weight",), dest="depth_loss_weight", arg_type=float, default=0.0, help="Weight for depth loss (0.05-0.2 recommended)"),
         ArgSpec(flags=("--depth-loss-start-iter",), dest="depth_loss_start_iter", arg_type=int, default=1000, help="Start applying depth loss after this many iterations"),
         ArgSpec(flags=("--sam-loss-weight",), dest="sam_loss_weight", arg_type=float, default=0.0, help="Weight for sharpness-aware minimization loss in gradient space (0.0 disables)"),
+        ArgSpec(flags=("--enable-affine-invariant-depth-loss",), dest="enable_affine_invariant_depth_loss", action="store_true", help="Enable affine-invariant depth loss"),
         ArgSpec(flags=("--affine-invariant-depth-loss-weight",), dest="affine_invariant_depth_loss_weight", arg_type=float, default=0.0, help="Weight for AffineInvariantDepthLoss (0.0 disables)"),
+        ArgSpec(flags=("--enable-pearson-correlation-loss",), dest="enable_pearson_correlation_loss", action="store_true", help="Enable Pearson correlation depth loss"),
         ArgSpec(flags=("--pearson-correlation-loss-weight",), dest="pearson_correlation_loss_weight", arg_type=float, default=0.0, help="Weight for PearsonCorrelationLoss module (0.0 disables)"),
+        ArgSpec(flags=("--enable-silog-loss",), dest="enable_silog_loss", action="store_true", help="Enable scale-invariant log depth loss"),
         ArgSpec(flags=("--silog-loss-weight",), dest="silog_loss_weight", arg_type=float, default=0.0, help="Weight for SILogLoss (0.0 disables)"),
+        ArgSpec(flags=("--enable-ordinal-depth-loss",), dest="enable_ordinal_depth_loss", action="store_true", help="Enable ordinal depth ranking loss"),
         ArgSpec(flags=("--ordinal-depth-loss-weight",), dest="ordinal_depth_loss_weight", arg_type=float, default=0.0, help="Weight for OrdinalDepthLoss (0.0 disables)"),
+        ArgSpec(flags=("--enable-affine-aligned-gradient-matching-loss",), dest="enable_affine_aligned_gradient_matching_loss", action="store_true", help="Enable affine-aligned gradient matching loss"),
         ArgSpec(flags=("--affine-aligned-gradient-matching-loss-weight",), dest="affine_aligned_gradient_matching_loss_weight", arg_type=float, default=0.0, help="Weight for AffineAlignedGradientMatchingLoss (0.0 disables)"),
         ArgSpec(flags=("--enable-depth-smoothness-loss",), dest="enable_depth_smoothness_loss", action="store_true", help="Enable edge-aware depth smoothness loss to regularize depth maps and reduce noise"),
         ArgSpec(flags=("--depth-smoothness-start-alpha",), dest="depth_smoothness_start_alpha", arg_type=float, default=0.5, help="Starting alpha value for edge-aware depth smoothness loss (lower = more edge-sensitive)"),
         ArgSpec(flags=("--depth-smoothness-end-alpha",), dest="depth_smoothness_end_alpha", arg_type=float, default=2.5, help="Ending alpha value for edge-aware depth smoothness loss (higher = less edge-sensitive)"),
         ArgSpec(flags=("--depth-smoothness-max-steps",), dest="depth_smoothness_max_steps", arg_type=int, default=None, help="Number of steps over which to schedule alpha for depth smoothness loss (defaults to total iterations if not set)"),
-        ArgSpec(flags=("--depth-smoothness-loss-weight",), dest="depth_smoothness_loss_weight", arg_type=float, default=0.1, help="Weight for depth smoothness loss (0.01-0.1 recommended)")
+        ArgSpec(flags=("--depth-smoothness-loss-weight",), dest="depth_smoothness_loss_weight", arg_type=float, default=0.0, help="Weight for depth smoothness loss (0.01-0.1 recommended)"),
+        ArgSpec(flags=("--enable-metric-depth-normal-loss",), dest="enable_metric_depth_normal_loss", action="store_true", help="Enable metric depth normal loss"),
+        ArgSpec(flags=("--metric-depth-normal-loss-weight",), dest="metric_depth_normal_loss_weight", arg_type=float, default=0.1, help="Weight for metric depth normal loss (0.01-0.1 recommended)"),
     ),
 )
 
@@ -490,6 +620,23 @@ VIEWER_GROUP = ArgGroupDef(
         ArgSpec(flags=("--viewer-port",), dest="viewer_port", arg_type=int, default=8080, help="Port for the viewer server"),
         ArgSpec(flags=("--viewer-refresh-interval",), dest="viewer_refresh_interval", arg_type=int, default=100, help="How often to refresh viewer with latest model params (in iterations)"),
         ArgSpec(flags=("--rerun-viewer",), dest="rerun_viewer", action="store_true", help="Enable Rerun viewer during training"),
+        ArgSpec(flags=("--viewer-backend",), dest="viewer_backend", arg_type=str, default="ns-replica", choices=("ns-replica", "nerfview"), help="Viewer backend implementation"),
+        ArgSpec(flags=("--viewer-image-policy",), dest="viewer_image_policy", arg_type=str, default="lazy", choices=("lazy", "preload"), help="How viewer camera thumbnails are loaded"),
+        ArgSpec(flags=("--viewer-image-cache-size",), dest="viewer_image_cache_size", arg_type=int, default=256, help="LRU cache size for lazy thumbnail loading"),
+        ArgSpec(flags=("--viewer-max-thumbnail-size",), dest="viewer_max_thumbnail_size", arg_type=int, default=128, help="Max dimension for camera thumbnail images"),
+        ArgSpec(flags=("--viewer-add-training-cameras",), dest="viewer_add_training_cameras", action="store_true", default=True, help="Display training cameras as frustums in viewer"),
+        ArgSpec(flags=("--no-viewer-add-training-cameras",), dest="viewer_add_training_cameras", action="store_false", help="Disable training camera frustums in viewer"),
+        ArgSpec(flags=("--viewer-camera-frustum-scale",), dest="viewer_camera_frustum_scale", arg_type=float, default=0.3, help="Scale factor for training camera frustums"),
+    ),
+)
+
+LOD_GROUP = ArgGroupDef(
+    key="lod",
+    title="Level of Detail (LoD) Options",
+    config_cls=LODConfig,
+    specs=(
+        ArgSpec(flags=("--num-lod-levels",), dest="num_levels", arg_type=int, default=1, help="Number of Level of Detail (LoD) levels to compute (1 = all, >1 enables LoD)"),
+        ArgSpec(flags=("--lod-reduction-factor",), dest="reduction_factor", arg_type=int, default=4, help="Reduction factor between LoD levels (e.g., 4 means 4x fewer Gaussians per level)"),
     ),
 )
 
@@ -508,9 +655,11 @@ TENSORBOARD_GROUP = ArgGroupDef(
 ARG_GROUP_DEFS: Tuple[ArgGroupDef[Any], ...] = (
     REQUIRED_GROUP,
     OUTPUT_GROUP,
+    MODEL_GROUP,
     TRAINING_GROUP,
     DENSIFICATION_GROUP,
     FLOATER_PREVENTION_GROUP,
+    LOD_GROUP,
     SH_GROUP,
     SEMANTICS_GROUP,
     DEPTH_GROUP,
@@ -526,7 +675,7 @@ ARG_GROUP_DEFS: Tuple[ArgGroupDef[Any], ...] = (
 def parse_args() -> TrainConfig:
     """Parse command line arguments and return strongly typed grouped config."""
     parser = argparse.ArgumentParser(
-        description="Train a 3D Gaussian Splatting model from COLMAP or Instant-NGP style datasets",
+        description="Train a 3D Gaussian Splatting model from COLMAP, Instant-NGP, or MatrixCity style datasets",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     for group_def in ARG_GROUP_DEFS:
@@ -543,14 +692,26 @@ def parse_args() -> TrainConfig:
     elif required_cfg.dataset_type == "instant-ngp":
         if not required_cfg.transforms_path:
             parser.error("--transforms-path is required when --dataset-type=instant-ngp")
+    elif required_cfg.dataset_type == "matrixcity":
+        if not required_cfg.matrixcity_paths:
+            parser.error("--matrixcity-path is required when --dataset-type=matrixcity")
+        if required_cfg.matrixcity_depth_paths and (
+            len(required_cfg.matrixcity_depth_paths) != len(required_cfg.matrixcity_paths)
+        ):
+            parser.error(
+                "--matrixcity-depth-path must be provided either zero times or exactly "
+                "once per --matrixcity-path"
+            )
 
     return TrainConfig(
         raw=flat_args,
         required=required_cfg,
         output=_build_group_config(flat_args, OUTPUT_GROUP),
+        model=_build_group_config(flat_args, MODEL_GROUP),
         training=_build_group_config(flat_args, TRAINING_GROUP),
         densification=_build_group_config(flat_args, DENSIFICATION_GROUP),
         floater_prevention=_build_group_config(flat_args, FLOATER_PREVENTION_GROUP),
+        lod=_build_group_config(flat_args, LOD_GROUP),
         sh=_build_group_config(flat_args, SH_GROUP),
         semantics=_build_group_config(flat_args, SEMANTICS_GROUP),
         depth=_build_group_config(flat_args, DEPTH_GROUP),

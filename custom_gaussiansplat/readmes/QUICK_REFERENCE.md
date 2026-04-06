@@ -187,7 +187,7 @@ python custom_gaussiansplat/train.py \
     --iterations 10000 \
     --densify-from-iter 500 \
     --densify-until-iter 15000 \
-    --grad-threshold 0.0002 \
+    --grow-grad2d 0.0002 \
     --max-screen-size 50 \
     \
     # Floater prevention (NEW)

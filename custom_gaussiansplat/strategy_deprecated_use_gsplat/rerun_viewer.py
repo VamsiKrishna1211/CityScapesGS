@@ -41,10 +41,10 @@ class RerunViewer:
         means = self.model.means.detach().cpu().numpy()
         # Scale is exponentiated in GaussianModel if log-scale is used
         scales = self.model.scales.detach().cpu().numpy()
-        opacities = self.model.opacities.squeeze(-1).detach().cpu().numpy()
+        opacities = (self.model.opacities if hasattr(self.model, 'opacities') else getattr(self.model, '_opacities')).squeeze(-1).detach().cpu().numpy()
 
         colors = (
-            self.model.features_dc.squeeze(1)
+            self.model._features_dc.squeeze(1)
             if self.disable_sh_rendering
             else self.model.sh
         )

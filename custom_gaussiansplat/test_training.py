@@ -3,7 +3,7 @@ Example script to test the custom Gaussian Splatting implementation
 """
 import torch
 from train import train_pipeline
-from model import GaussianModel
+from models import GaussianModel
 
 def test_basic_training():
     """Test basic training pipeline with a small dataset"""

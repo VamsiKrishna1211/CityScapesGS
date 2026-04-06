@@ -29,7 +29,7 @@
                 "--lr-quats", "0.00002",
                 "--lr-scales", "0.001",
                 "--lr-sh", "0.002",
-                "--grad-threshold", "0.0002",
+                // "--grad-threshold", "0.0002",
                 "--enable-scale-reg",
                 "--scale-reg-weight", "0.01",
                 "--enable-opacity-reg",
@@ -40,7 +40,9 @@
                 "--grow-scale2d", "0.01",
                 "--prune-scale3d", "0.02",
                 "--prune-scale2d", "0.2",
-                "--affine-invariant-depth-loss-weight", "0.1"
+                // "--affine-invariant-depth-loss-weight", "0.1"
+                "--preload",
+                "-s", "8"
 
     //             --grow-grad2d 0.0001 --grow-scale3d 0.02 --grow-scale2d 0.01 --prune-scale3d 0.02 --prune-scale2d 0.2 \
     // --affine-invariant-depth-loss-weight 0.1
@@ -48,6 +50,87 @@
                 // "--semantics-dim", "4",
                 // "--semantic-start-iter=0",
                 // "--semantics-path", "/home/exouser/CityScapesGS/data/Mip-NeRF-360/bicycle/language_features_dim3"
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Train Custom GaussianSplat - Matrix City",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/custom_gaussiansplat/train.py",
+            "console": "integratedTerminal",
+            "env": {
+                "BASE_PATH": "/home/exouser/CityScapesGS/data/Matrix-City/small_city/small_city/aerial/train/block_1"
+            },
+            "args": [
+                "--save-interval", "5000",
+                "--images-path", "/home/exouser/CityScapesGS/data/Matrix-City/small_city/small_city/aerial/train/block_1/images",
+                "--output-dir", "/home/exouser/CityScapesGS/data/Matrix-City/small_city/small_city/aerial/train/block_1/cust_gs_outputs_test1",
+                "--transforms-path", "/home/exouser/CityScapesGS/data/Matrix-City/small_city/small_city/aerial/train/block_1/transforms.json",
+                // "--point-cloud-path", "/home/exouser/CityScapesGS/data/Matrix-City/small_city/small_city/aerial/train/block_1/hloc_outputs/sfm/points3D.ply",
+                "--log-interval", "10",
+                "--densify-from-iter", "1000",
+                "--densify-interval", "100",
+                "--densify-until-iter", "50000",
+                "--tb-image-interval", "100",
+                "--viewer",
+                "--iterations", "70000",
+                "--sh-degree", "3",
+                "--lr-means", "0.0002",
+                "--lr-quats", "0.002",
+                "--lr-scales", "0.001",
+                "--lr-sh", "0.002",
+                "--grad-threshold", "0.0002",
+                "--verbosity", "3",
+                "--grow-grad2d", "0.0002",
+                "--grow-scale3d", "0.1",
+                "--grow-scale2d", "0.005",
+                "--prune-scale3d", "0.1",
+                "--prune-scale2d", "0.15",
+                "--enable-opacity-entropy-reg",
+                "--opacity-entropy-reg-weight", "0.1",
+                "--opacity-entropy-reg-start-iter", "40000",
+                "--opacity-entropy-reg-end-iter", "50000",
+                "--preload",
+                "--tensorboard",
+                "--dataset-type", "instant-ngp",
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Run HLOC",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/tools/run_hloc.py",
+            "console": "integratedTerminal",
+            "env": {
+                "BASE_PATH": "/home/exouser/CityScapesGS/data/Matrix-City/small_city/small_city/aerial/train/block_1"
+            },
+            "args": [
+                "--base_path", "/home/exouser/CityScapesGS/data/Matrix-City/small_city/small_city/aerial/train/block_1",
+                "--images_suffix", "images",
+                "--outputs_suffix", "hloc_outputs",
+                "--camera_mode", "SINGLE",
+                "--image_options", "camera_model", "PINHOLE",
+                "--image_options", "camera_params", "",
+                "--num_matched", "100",
+                "--use_dense_matcher",
+                "--dense_matcher_config", "loftr_superpoint",
+                "--matcher_config", "superpoint+lightglue",
+                "--mapper_options", "init_min_num_inliers", "80",
+                "--mapper_options", "init_max_error", "3.0",
+                "--mapper_options", "init_min_tri_angle", "6.0",
+                "--mapper_options", "init_max_forward_motion", "0.90",
+                "--mapper_options", "init_max_reg_trials", "8",
+                "--mapper_options", "abs_pose_max_error", "8.0",
+                "--mapper_options", "abs_pose_min_num_inliers", "20",
+                "--mapper_options", "abs_pose_min_inlier_ratio", "0.20",
+                "--mapper_options", "ba_local_num_images", "12",
+                "--mapper_options", "ba_local_min_tri_angle", "3.0",
+                "--mapper_options", "ba_global_max_num_iterations", "30",
+                "--mapper_options", "filter_max_reproj_error", "2.0",
+                "--mapper_options", "filter_min_tri_angle", "2.0",
+                "--mapper_options", "min_focal_length_ratio", "0.4"
             ],
             "justMyCode": false
         }

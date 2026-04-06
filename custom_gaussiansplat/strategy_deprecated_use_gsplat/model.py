@@ -1,9 +1,10 @@
-import torch.nn as nn
-from gsplat import spherical_harmonics
-import torch
 import logging
-from gs_types import Parameters, GSOptimizers
-from typing import Optional, Dict, Tuple
+from typing import Dict, Optional, Tuple
+
+import torch
+import torch.nn as nn
+from gs_types import GSOptimizers, Parameters
+from gsplat import spherical_harmonics
 
 # Module-level logger
 logger = logging.getLogger("cityscape_gs.model")
@@ -12,6 +13,7 @@ logger = logging.getLogger("cityscape_gs.model")
 from dataclasses import dataclass
 
 from simple_knn._C import distCUDA2
+
 
 @dataclass
 class ViewportInfo:
@@ -24,6 +26,8 @@ def inverse_sigmoid(x):
     return torch.log(x / (1 - x))
 
 class GaussianModel(nn.Module):
+    SH_C0 = 0.28209479177387814
+
     def __init__(self, init_points: torch.Tensor, 
                  init_colors: torch.Tensor, 
                  sh_degree=3,
@@ -51,6 +55,7 @@ class GaussianModel(nn.Module):
             # distances per point. Take sqrt to get distance and clamp small values.
             dist_to_nearest = torch.sqrt(distCUDA2(init_points.contiguous()))
             torch.zeros(1, device=init_points.device)  # Warm up CUDA context to prevent first-iteration lag
+            logger.debug(f"Distance to nearest neighbor stats: min={dist_to_nearest.min().item():.6f}, max={dist_to_nearest.max().item():.6f}, mean={dist_to_nearest.mean().item():.6f}")
 
             dist_to_nearest[dist_to_nearest < 1e-5] = 1e-5  # Avoid zero distances
         
@@ -81,9 +86,21 @@ class GaussianModel(nn.Module):
         # Visibility tracking buffer for multi-view consistency (floater prevention)
         self.register_buffer('view_count', torch.zeros(num_points, device=init_points.device))
 
+        # LoD info
+        self.lod_offsets = [num_points] # Default to single level (all points)
+
+    @property
+    def point_name(self) -> str:
+        return "Gaussians"
+
+    @property
+    def count_label(self) -> str:
+        """Short label used in the training progress bar."""
+        return "GS"
+
     @property
     def means(self): return self._means
-    
+
     @property
     def scales(self): return torch.exp(self._scales)
     
@@ -94,7 +111,23 @@ class GaussianModel(nn.Module):
     def opacities(self): return torch.sigmoid(self._opacities)
     
     @property
+    def features_dc(self): return self._features_dc
+
+    @property
+    def features_rest(self): return self._features_rest
+
+    @property
     def sh(self): return torch.cat([self._features_dc, self._features_rest], dim=1)
+
+    @staticmethod
+    def sh_dc_to_rgb(features_dc: torch.Tensor) -> torch.Tensor:
+        """Convert SH DC coefficient(s) to RGB space used by non-SH rendering."""
+        return features_dc * GaussianModel.SH_C0 + 0.5
+
+    @property
+    def dc_rgb(self) -> torch.Tensor:
+        """Return per-Gaussian RGB from stored SH DC coefficients."""
+        return self.sh_dc_to_rgb(self._features_dc)
 
     @property
     def semantics(self):
@@ -114,6 +147,147 @@ class GaussianModel(nn.Module):
         """
         visible_mask = alpha_contributions > threshold
         self.view_count[visible_mask] += 1
+
+    def compute_lods(self, num_levels: int = 3, factor: int = 4, optimizers: Optional[GSOptimizers] = None):
+        """
+        Organize Gaussians into nested Level of Detail (LoD) levels.
+        Coarser levels are a prefix of finer levels.
+        
+        Args:
+            num_levels: Total number of LoD levels to create.
+            factor: Reduction factor between levels (e.g., 4 means 4x fewer Gaussians per level).
+            optimizers: Optional GSOptimizers to reorder their internal state.
+        """
+        num_points = self._means.shape[0]
+        if num_points == 0:
+            return
+
+        # Determine indices for each level
+        # We want coarser levels first.
+        # Level num_levels-1 (coarsest): first N / (factor^(num_levels-1)) points
+        # Level 0 (finest): all N points
+        
+        indices = torch.randperm(num_points, device=self._means.device)
+        
+        level_counts = []
+        curr_count = num_points
+        for i in range(num_levels):
+            level_counts.append(curr_count)
+            curr_count = max(1, curr_count // factor)
+        
+        # Reverse so level_counts[0] is coarsest count
+        level_counts = level_counts[::-1]
+        self.lod_offsets = level_counts
+        
+        # The reordering is already implicit in the random permutation if we just 
+        # take the first K indices for coarser levels.
+        self.reorder_gaussians(indices, optimizers)
+        
+        logger.info(f"[green]✓ Computed {num_levels} LoD levels:[/green] {self.lod_offsets}")
+
+    def reorder_gaussians(self, indices: torch.Tensor, optimizers: Optional[GSOptimizers] = None):
+        """
+        Reorder all Gaussian parameters and buffers according to provided indices.
+        Also reorders optimizer states if provided.
+        """
+        self._means.data = self._means.data[indices]
+        self._scales.data = self._scales.data[indices]
+        self._quats.data = self._quats.data[indices]
+        self._opacities.data = self._opacities.data[indices]
+        self._features_dc.data = self._features_dc.data[indices]
+        self._features_rest.data = self._features_rest.data[indices]
+        
+        if hasattr(self, '_features_semantics'):
+            self._features_semantics.data = self._features_semantics.data[indices]
+            
+        self.view_count.data = self.view_count.data[indices]
+        
+        if optimizers is not None:
+            for opt_name, opt in optimizers.__dict__.items():
+                if opt is None:
+                    continue
+                for group in opt.param_groups:
+                    for i, param in enumerate(group['params']):
+                        if param in opt.state:
+                            state = opt.state[param]
+                            for state_key, state_val in state.items():
+                                if isinstance(state_val, torch.Tensor) and len(state_val.shape) > 0 and state_val.shape[0] == len(indices):
+                                    state[state_key] = state_val[indices]
+
+    def get_lod_params(self, level: Optional[int] = None) -> Parameters:
+        """
+        Get parameter slices for a specific LoD level.
+        
+        Args:
+            level: LoD level index (0 to num_levels-1). 
+                   If None, returns all Gaussians.
+                   Higher level index = coarser detail (fewer Gaussians).
+        
+        Returns:
+            Parameters object with sliced tensors.
+        """
+        total_points = self._means.shape[0]
+        
+        if level is None or level < 0 or level >= len(self.lod_offsets):
+            end_idx = total_points
+        else:
+            # We stored offsets such that level 0 is coarsest, but usually
+            # users think of level 0 as finest.
+            # Let's adopt standard convention: Level 0 = finest, Level N = coarsest.
+            # Wait, my compute_lods did Level 0 = coarsest. Let's swap it for consistency.
+            # Finest (0) -> Coarsest (num_levels-1)
+            # self.lod_offsets is [coarsest_count, ..., finest_count]
+            # So if level=0 (finest), we want finest_count (last element)
+            # if level=last (coarsest), we want coarsest_count (first element)
+            
+            # Re-evaluating: Let's use internal level mapping:
+            # self.lod_offsets[0] is coarsest, self.lod_offsets[-1] is finest.
+            # User level 0 -> self.lod_offsets[-1]
+            # User level max -> self.lod_offsets[0]
+            
+            idx = len(self.lod_offsets) - 1 - level
+            end_idx = self.lod_offsets[idx]
+
+        sliced_scales = self.scales[:end_idx]
+
+        import math
+        if level is not None and level > 0 and end_idx < total_points:
+            density_drop = total_points / max(1, end_idx)
+            scale_multiplier = math.sqrt(density_drop)
+            sliced_scales = sliced_scales * scale_multiplier
+
+        return Parameters(
+            means=self._means[:end_idx],
+            scales=sliced_scales,
+            quats=self.quats[:end_idx],
+            opacities=self.opacities[:end_idx],
+            features_dc=self._features_dc[:end_idx],
+            features_rest=self._features_rest[:end_idx]
+        )
+
+    def get_render_params(self, cam, sh_cfg, is_training: bool = True, lod: Optional[int] = None) -> dict:
+        """Return rasterization-ready tensors for this view.
+
+        Returns a dict with the same keys as ScaffoldModel.get_render_params so
+        that Rasterizer.render() can call one unified method on both model types.
+        """
+        params = self.get_lod_params(lod)
+
+        if not sh_cfg.disable_sh_rendering:
+            colors = torch.cat([params.features_dc, params.features_rest], dim=1)
+            sh_degree = self.sh_degree
+        else:
+            colors = self.sh_dc_to_rgb(params.features_dc).squeeze(1)
+            sh_degree = None
+
+        return {
+            "means": params.means,
+            "colors": colors,
+            "opacities": params.opacities,
+            "scales": params.scales,
+            "quats": params.quats,
+            "sh_degree": sh_degree,
+        }
 
     def get_params_dict(self) -> Dict[str, nn.Parameter]:
         """Get model parameters as dictionary for strategy interface.
@@ -376,8 +550,8 @@ class GaussianModel(nn.Module):
             A populated GaussianModel instance.
         """
         import numpy as np
-        from plyfile import PlyData
         import torch.nn as nn
+        from plyfile import PlyData
 
         plydata = PlyData.read(path)
         el = plydata.elements[0]
@@ -624,6 +798,9 @@ class GaussianModel(nn.Module):
 
         model.load_state_dict(state_dict, strict=strict)
         model.view_count = torch.zeros(len(model._means), device=device)
+
+        if 'lod_offsets' in checkpoint:
+            model.lod_offsets = checkpoint['lod_offsets']
 
         logger.info(f"[green]✓ Loaded model from[/green] {checkpoint_path}")
         if 'iteration' in checkpoint:
