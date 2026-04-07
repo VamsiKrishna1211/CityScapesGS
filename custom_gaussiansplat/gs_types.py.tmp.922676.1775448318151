@@ -71,10 +71,10 @@ class Parameters:
 class GSOptimizers:
     means: torch.optim.Optimizer
     scales: torch.optim.Optimizer
+    quats: Optional[torch.optim.Optimizer]
     opacities: torch.optim.Optimizer
     features_dc: torch.optim.Optimizer
     features_rest: torch.optim.Optimizer
-    quats: Optional[torch.optim.Optimizer] = None
     features_semantics: torch.optim.Optimizer | None = None
 
     def all_optimizers(self) -> Iterator[Tuple[str, "torch.optim.Optimizer"]]:

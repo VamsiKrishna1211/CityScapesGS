@@ -4,10 +4,10 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from gs_types import GSOptimizers, Parameters, RenderParams
 from simple_knn._C import distCUDA2
 
 from .base import BaseTrainableModel
-from gs_types import GSOptimizers, Parameters, RenderParams
 
 # Module-level logger
 logger = logging.getLogger("cityscape_gs.models.gaussian")

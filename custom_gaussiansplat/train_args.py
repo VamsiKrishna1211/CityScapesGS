@@ -1,7 +1,19 @@
 import argparse
 from dataclasses import dataclass
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
-from typing import Any, Callable, Dict, Generic, Optional, Tuple, Type, TypeVar, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
 
 
 @dataclass
@@ -22,6 +34,7 @@ class RequiredConfig:
 @dataclass
 class OutputConfig:
     output_dir: str
+    experiment_name: Optional[str]
 
 
 @dataclass
@@ -38,20 +51,39 @@ class TrainingConfig:
 
 
 @dataclass
+class ScaffoldConfig:
+    """All hyperparameters specific to ScaffoldModel.
+
+    Bundled separately so ModelConfig stays clean as new model types are added.
+    Scaffold-specific LRs live here (not LearningRateConfig) because they're
+    model constructor arguments, consumed when create_optimizers() runs.
+    """
+    # Architecture
+    feat_dim: int = 32
+    n_offsets: int = 10
+    voxel_size: float = 0.01
+    update_depth: int = 3
+    update_init_factor: int = 16
+    update_hierachy_factor: int = 4
+    use_feat_bank: bool = False
+    appearance_dim: int = 0
+    add_opacity_dist: bool = False
+    add_cov_dist: bool = False
+    add_color_dist: bool = False
+    fourier_freqs: int = 32
+    fourier_scale: float = 6.05
+    # Scaffold-specific learning rates (not in shared LearningRateConfig)
+    lr_offset: float = 0.01
+    lr_mlp_opacity: float = 0.002
+    lr_mlp_cov: float = 0.004
+    lr_mlp_color: float = 0.008
+    lr_appearance: float = 0.05
+
+
+@dataclass
 class ModelConfig:
-    model_type: str  # "gaussian" or "scaffold"
-    # Scaffold-GS specific
-    feat_dim: int
-    n_offsets: int
-    voxel_size: float
-    update_depth: int
-    update_init_factor: int
-    update_hierachy_factor: int
-    use_feat_bank: bool
-    appearance_dim: int
-    add_opacity_dist: bool
-    add_cov_dist: bool
-    add_color_dist: bool
+    model_type: Literal["gaussian", "scaffold"]
+    scaffold: ScaffoldConfig
 
 
 @dataclass
@@ -126,10 +158,17 @@ class DepthConfig:
     depth_smoothness_loss_weight: float
     enable_metric_depth_normal_loss: bool
     metric_depth_normal_loss_weight: float
+    enable_dn_splatter_normal_loss: bool
+    dn_splatter_normal_loss_weight: float
+    dn_splatter_normal_tv_weight: float
 
 
 @dataclass
 class LearningRateConfig:
+    """Model-agnostic learning rates shared by all model types.
+
+    Scaffold-specific LRs (lr_offset, lr_mlp_*) live in ScaffoldConfig.
+    """
     lr_means: float
     lr_scales: float
     lr_quats: float
@@ -244,7 +283,7 @@ class ArgGroupDef(Generic[T]):
     title: str
     config_cls: Type[T]
     specs: Tuple[ArgSpec, ...]
-    transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
+    transform: Optional[Callable[..., Dict[str, Any]]] = None
 
 
 def _add_group_to_parser(parser: argparse.ArgumentParser, group_def: ArgGroupDef[Any]) -> None:
@@ -254,14 +293,38 @@ def _add_group_to_parser(parser: argparse.ArgumentParser, group_def: ArgGroupDef
 
 
 def _build_group_config(flat_args: argparse.Namespace, group_def: ArgGroupDef[T]) -> T:
-    dataclass_fields = getattr(group_def.config_cls, "__dataclass_fields__", {})
+    cfg_fields = getattr(group_def.config_cls, "__dataclass_fields__", {})
     values: Dict[str, Any] = {
-        field_name: getattr(flat_args, field_name)
-        for field_name in dataclass_fields.keys()
+        field_name: getattr(flat_args, field_name, None)
+        for field_name in cfg_fields.keys()
     }
     if group_def.transform is not None:
-        values = group_def.transform(values)
+        # Transforms may accept (values, flat_args) to reach fields not in the
+        # config dataclass (e.g. nested sub-configs built from flat CLI args).
+        import inspect
+        n_params = len(inspect.signature(group_def.transform).parameters)
+        values = group_def.transform(values, flat_args) if n_params >= 2 else group_def.transform(values)
     return group_def.config_cls(**values)
+
+
+# Field names that belong to ScaffoldConfig (derived once at module load).
+_SCAFFOLD_FIELD_NAMES: frozenset = frozenset(f.name for f in dataclass_fields(ScaffoldConfig))
+
+
+def _build_model_config(values: Dict[str, Any], flat_args: argparse.Namespace) -> Dict[str, Any]:
+    """Build nested ModelConfig from the flat argparse namespace.
+
+    All ScaffoldConfig fields are extracted directly from flat_args (they are not
+    present in the ModelConfig dataclass fields, so _build_group_config puts None
+    for 'scaffold' — we replace that here).
+    """
+    scaffold_kwargs = {
+        name: getattr(flat_args, name)
+        for name in _SCAFFOLD_FIELD_NAMES
+        if hasattr(flat_args, name)
+    }
+    values["scaffold"] = ScaffoldConfig(**scaffold_kwargs)
+    return values
 
 
 def _normalize_semantics_values(values: Dict[str, Any]) -> Dict[str, Any]:
@@ -434,6 +497,13 @@ OUTPUT_GROUP = ArgGroupDef(
             default="./output",
             help="Output directory for checkpoints and results",
         ),
+        ArgSpec(
+            flags=("--experiment-name",),
+            dest="experiment_name",
+            arg_type=str,
+            default=None,
+            help="Optional experiment name for TensorBoard run (auto-generates if not provided)",
+        ),
     ),
 )
 
@@ -441,19 +511,28 @@ MODEL_GROUP = ArgGroupDef(
     key="model",
     title="Model Options",
     config_cls=ModelConfig,
+    transform=_build_model_config,
     specs=(
         ArgSpec(flags=("--model-type",), dest="model_type", arg_type=str, default="gaussian", choices=("gaussian", "scaffold"), help="Model architecture to use"),
+        # ── Scaffold-GS architecture ──────────────────────────────────────────
         ArgSpec(flags=("--feat-dim",), dest="feat_dim", arg_type=int, default=32, help="Scaffold-GS: anchor feature dimension"),
         ArgSpec(flags=("--n-offsets",), dest="n_offsets", arg_type=int, default=10, help="Scaffold-GS: number of Gaussians per anchor"),
         ArgSpec(flags=("--voxel-size",), dest="voxel_size", arg_type=float, default=0.01, help="Scaffold-GS: initial voxel size for anchors"),
         ArgSpec(flags=("--update-depth",), dest="update_depth", arg_type=int, default=3, help="Scaffold-GS: anchor growing depth"),
-        ArgSpec(flags=("--update-init-factor",), dest="update_init_factor", arg_type=int, default=100, help="Scaffold-GS: anchor growing factor"),
+        ArgSpec(flags=("--update-init-factor",), dest="update_init_factor", arg_type=int, default=16, help="Scaffold-GS: anchor growing factor (official outdoor default: 16)"),
         ArgSpec(flags=("--update-hierachy-factor",), dest="update_hierachy_factor", arg_type=int, default=4, help="Scaffold-GS: anchor growing hierarchy factor"),
         ArgSpec(flags=("--use-feat-bank",), dest="use_feat_bank", action="store_true", help="Scaffold-GS: use feature bank for view-dependency"),
-        ArgSpec(flags=("--appearance-dim",), dest="appearance_dim", arg_type=int, default=32, help="Scaffold-GS: appearance embedding dimension"),
+        ArgSpec(flags=("--appearance-dim",), dest="appearance_dim", arg_type=int, default=0, help="Scaffold-GS: appearance embedding dimension (0=disabled, official outdoor default; use 32 for multi-illumination scenes)"),
         ArgSpec(flags=("--add-opacity-dist",), dest="add_opacity_dist", action="store_true", help="Scaffold-GS: include distance in opacity MLP"),
         ArgSpec(flags=("--add-cov-dist",), dest="add_cov_dist", action="store_true", help="Scaffold-GS: include distance in covariance MLP"),
         ArgSpec(flags=("--add-color-dist",), dest="add_color_dist", action="store_true", help="Scaffold-GS: include distance in color MLP"),
+        ArgSpec(flags=("--fourier-freqs",), dest="fourier_freqs", arg_type=int, default=32, help="Scaffold-GS: number of Fourier feature frequencies for view encoding"),
+        ArgSpec(flags=("--fourier-scale",), dest="fourier_scale", arg_type=float, default=6.05, help="Scaffold-GS: scale for Fourier feature encoding"),
+        # ── Scaffold-GS learning rates (model-specific, not in LearningRateConfig) ─
+        ArgSpec(flags=("--lr-offset",), dest="lr_offset", arg_type=float, default=0.01, help="Scaffold-GS: learning rate for anchor offsets (official: 0.01)"),
+        ArgSpec(flags=("--lr-mlp-opacity",), dest="lr_mlp_opacity", arg_type=float, default=0.002, help="Scaffold-GS: learning rate for the opacity MLP head (official: 0.002)"),
+        ArgSpec(flags=("--lr-mlp-cov",), dest="lr_mlp_cov", arg_type=float, default=0.004, help="Scaffold-GS: learning rate for the covariance MLP head (official: 0.004)"),
+        ArgSpec(flags=("--lr-mlp-color",), dest="lr_mlp_color", arg_type=float, default=0.008, help="Scaffold-GS: learning rate for the color MLP head (official: 0.008)"),
     ),
 )
 
@@ -567,6 +646,9 @@ DEPTH_GROUP = ArgGroupDef(
         ArgSpec(flags=("--depth-smoothness-loss-weight",), dest="depth_smoothness_loss_weight", arg_type=float, default=0.0, help="Weight for depth smoothness loss (0.01-0.1 recommended)"),
         ArgSpec(flags=("--enable-metric-depth-normal-loss",), dest="enable_metric_depth_normal_loss", action="store_true", help="Enable metric depth normal loss"),
         ArgSpec(flags=("--metric-depth-normal-loss-weight",), dest="metric_depth_normal_loss_weight", arg_type=float, default=0.1, help="Weight for metric depth normal loss (0.01-0.1 recommended)"),
+        ArgSpec(flags=("--enable-dn-splatter-normal-loss",), dest="enable_dn_splatter_normal_loss", action="store_true", help="Enable DN-Splatter normal loss (L1 + TV smoothness on depth-derived surface normals)"),
+        ArgSpec(flags=("--dn-splatter-normal-loss-weight",), dest="dn_splatter_normal_loss_weight", arg_type=float, default=0.1, help="L1 weight for DN-Splatter normal loss"),
+        ArgSpec(flags=("--dn-splatter-normal-tv-weight",), dest="dn_splatter_normal_tv_weight", arg_type=float, default=0.01, help="TV smoothness weight for DN-Splatter normal loss"),
     ),
 )
 
@@ -575,11 +657,11 @@ LEARNING_RATE_GROUP = ArgGroupDef(
     title="Learning Rates",
     config_cls=LearningRateConfig,
     specs=(
-        ArgSpec(flags=("--lr-means",), dest="lr_means", arg_type=float, default=0.00016, help="Base learning rate for Gaussian positions (multiplied by 5.0)"),
-        ArgSpec(flags=("--lr-scales",), dest="lr_scales", arg_type=float, default=0.005, help="Learning rate for Gaussian scales"),
-        ArgSpec(flags=("--lr-quats",), dest="lr_quats", arg_type=float, default=0.001, help="Learning rate for Gaussian rotations"),
-        ArgSpec(flags=("--lr-opacities",), dest="lr_opacities", arg_type=float, default=0.05, help="Learning rate for Gaussian opacities"),
-        ArgSpec(flags=("--lr-sh",), dest="lr_sh", arg_type=float, default=0.0025, help="Learning rate for spherical harmonics"),
+        ArgSpec(flags=("--lr-means",), dest="lr_means", arg_type=float, default=0.00016, help="Base learning rate for anchor/Gaussian positions (multiplied by 5.0 internally). Scaffold official is 0.0 (fixed anchors); small non-zero allows drift."),
+        ArgSpec(flags=("--lr-scales",), dest="lr_scales", arg_type=float, default=0.007, help="Learning rate for anchor/Gaussian scales. Scaffold official: 0.007. Standard 3DGS: 0.005."),
+        ArgSpec(flags=("--lr-quats",), dest="lr_quats", arg_type=float, default=0.002, help="Learning rate for anchor/Gaussian rotations. Scaffold official: 0.002. Standard 3DGS: 0.001."),
+        ArgSpec(flags=("--lr-opacities",), dest="lr_opacities", arg_type=float, default=0.02, help="Learning rate for opacities. Scaffold official: 0.02 (anchor opacity is MLP input, not final opacity). Standard 3DGS: 0.05."),
+        ArgSpec(flags=("--lr-sh",), dest="lr_sh", arg_type=float, default=0.0075, help="Learning rate for SH features / Scaffold anchor features (_anchor_feat). Scaffold official: 0.0075. Standard 3DGS: 0.0025."),
         ArgSpec(flags=("--lr-semantics",), dest="lr_semantics", arg_type=float, default=None, help="Learning rate for semantic Gaussian features (defaults to --lr-sh)"),
     ),
 )

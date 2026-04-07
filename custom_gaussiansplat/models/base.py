@@ -2,13 +2,18 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, Iterator, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 if TYPE_CHECKING:
-    from gs_types import GSOptimizers, GS_LR_Schedulers, NeuralGaussianOutput, RenderParams
+    from gs_types import (
+        GS_LR_Schedulers,
+        GSOptimizers,
+        NeuralGaussianOutput,
+        RenderParams,
+    )
 
 logger = logging.getLogger("cityscape_gs.models.base")
 
@@ -114,7 +119,7 @@ class BaseTrainableModel(nn.Module, ABC):
 
     @property
     @abstractmethod
-    def quats(self) -> torch.Tensor:
+    def quats(self) -> torch.Tensor | None:
         """Gaussian rotations as quaternions. Shape: [N, 4], normalized."""
         ...
 
@@ -212,10 +217,10 @@ class BaseTrainableModel(nn.Module, ABC):
     def create_optimizers(
         self,
         lr_means: float = 0.00016,
-        lr_scales: float = 0.005,
-        lr_quats: float = 0.001,
-        lr_opacities: float = 0.05,
-        lr_sh: float = 0.0025,
+        lr_scales: float = 0.007,
+        lr_quats: float = 0.002,
+        lr_opacities: float = 0.02,
+        lr_sh: float = 0.0075,
         lr_semantics: Optional[float] = None,
         means_lr_multiplier: float = 5.0,
     ) -> "GSOptimizers":
@@ -242,8 +247,7 @@ class BaseTrainableModel(nn.Module, ABC):
     def create_schedulers(self, optimizers: "GSOptimizers", iterations: int) -> "GS_LR_Schedulers":
         """Create learning rate schedulers for optimizers.
 
-        Default: CosineAnnealingLR on means only. Scaffold-GS MLPs are auto-included
-        via GS_LR_Schedulers.create_schedulers's extra-dict handling.
+        Default: CosineAnnealingLR on means only.
 
         Args:
             optimizers: GSOptimizers dataclass
@@ -261,6 +265,32 @@ class BaseTrainableModel(nn.Module, ABC):
             step_size=iterations,
             gamma=0.1,
         )
+
+    def set_appearance(self, num_cameras: int) -> None:
+        """Optional hook for models with per-camera appearance embeddings.
+
+        Default: no-op for models that do not use appearance embeddings.
+        """
+        _ = num_cameras
+
+    def iter_extra_optimizers(self) -> Iterator[Tuple[str, torch.optim.Optimizer]]:
+        """Iterate model-owned non-geometric optimizers (MLPs, embeddings, etc.)."""
+        return iter(())
+
+    def iter_extra_schedulers(self) -> Iterator[Tuple[str, torch.optim.lr_scheduler.LRScheduler]]:
+        """Iterate model-owned non-geometric schedulers."""
+        return iter(())
+
+    def get_extra_optimizer_states(self) -> Dict[str, dict]:
+        """Return checkpoint state for model-owned non-geometric optimizers."""
+        return {}
+
+    def load_extra_optimizer_states(self, checkpoint: Dict[str, object]) -> None:
+        """Restore model-owned non-geometric optimizer states from checkpoint.
+
+        Default: no-op for models that only use geometric optimizers.
+        """
+        _ = checkpoint
 
     def compute_lods(
         self, num_levels: int = 1, factor: int = 4, optimizers: Optional["GSOptimizers"] = None
