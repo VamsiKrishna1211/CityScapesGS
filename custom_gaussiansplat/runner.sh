@@ -210,3 +210,123 @@ python custom_gaussiansplat/train.py \
   --tensorboard \
   --num-lod-levels 3 \
   --lod-reduction-factor 4
+
+
+# Scaffold GS:
+
+python custom_gaussiansplat/train.py \
+    --output-dir "$BASE_PATH/cust_scaffold_gs" \
+    --log-interval 10 \
+    --save-interval 5000 \
+    --iterations 50000 \
+    --dataset-type matrixcity \
+    --matrixcity-path "$BASE_PATH/small_city/aerial/train/block_1" \
+    --matrixcity-path $BASE_PATH/small_city/aerial/train/block_2 \
+    --matrixcity-path $BASE_PATH/small_city/aerial/train/block_3 \
+    --matrixcity-path $BASE_PATH/small_city/aerial/train/block_4 \
+    --matrixcity-path $BASE_PATH/small_city/aerial/train/block_5 \
+    --matrixcity-depth-path "$BASE_PATH/small_city_depth_float32/aerial/train/block_1_depth" \
+    --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_2_depth \
+    --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_3_depth \
+    --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_4_depth \
+    --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_5_depth \
+    --matrixcity-max-init-points 300000 \
+    --verbosity 1 \
+    --viewer \
+    --tensorboard \
+    --tb-image-interval 100 \
+    --enable-opacity-entropy-reg \
+    --opacity-entropy-reg-weight 0.0005 \
+    --opacity-entropy-reg-start-iter 1000 \
+    --opacity-entropy-reg-end-iter 30000 \
+    --disable-sh-rendering \
+    --sh-degree 0 \
+    --enable-metric-depth-normal-loss \
+    --metric-depth-normal-loss-weight 0.1 \
+    --model-type scaffold \
+    --viewer-camera-frustum-scale 4.0 \
+    --feat-dim 32 \
+    --fourier-freqs 32 \
+    --lr-means 0.0 \
+    --lr-scales 0.005 \
+    --lr-quats 0.0015 \
+    --lr-opacities 0.015 \
+    --lr-sh 0.0055 \
+    --lr-offset 0.006 \
+    --lr-mlp-opacity 0.0015 \
+    --lr-mlp-cov 0.003 \
+    --lr-mlp-color 0.006 \
+    --grow-grad2d 0.0002 \
+    --grow-scale3d 0.035 \
+    --grow-scale2d 0.002 \
+    --prune-scale3d 0.015 \
+    --prune-scale2d 0.12 \
+    --densify-from-iter 1500 \
+    --densify-interval 300 \
+    --densify-until-iter 26000 \
+    --opacity-reset-interval 2000 \
+    --opacity-reset-value 0.008
+
+
+python custom_gaussiansplat/train.py \
+      --output-dir "$BASE_PATH/cust_scaffold_gs" \
+      --log-interval 10 \
+      --save-interval 5000 \
+      --iterations 50000 \
+      --dataset-type matrixcity \
+      --matrixcity-path "$BASE_PATH/small_city/aerial/train/block_1" \
+      --matrixcity-path $BASE_PATH/small_city/aerial/train/block_2 \
+      --matrixcity-path $BASE_PATH/small_city/aerial/train/block_3 \
+      --matrixcity-path $BASE_PATH/small_city/aerial/train/block_4 \
+      --matrixcity-path $BASE_PATH/small_city/aerial/train/block_5 \
+      --matrixcity-path $BASE_PATH/small_city/aerial/train/block_6 \
+      --matrixcity-path $BASE_PATH/small_city/aerial/train/block_7 \
+      --matrixcity-path $BASE_PATH/small_city/aerial/train/block_8 \
+      --matrixcity-path $BASE_PATH/small_city/aerial/train/block_9 \
+      --matrixcity-path $BASE_PATH/small_city/aerial/train/block_10 \
+      --matrixcity-depth-path "$BASE_PATH/small_city_depth_float32/aerial/train/block_1_depth" \
+      --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_2_depth \
+      --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_3_depth \
+      --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_4_depth \
+      --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_5_depth \
+      --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_6_depth \
+      --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_7_depth \
+      --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_8_depth \
+      --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_9_depth \
+      --matrixcity-depth-path $BASE_PATH/small_city_depth_float32/aerial/train/block_10_depth \
+      --matrixcity-max-init-points 500000 \
+      --verbosity 1 \
+      --viewer \
+      --tensorboard \
+      --tb-image-interval 100 \
+      --enable-opacity-entropy-reg \
+      --opacity-entropy-reg-weight 0.0005 \
+      --opacity-entropy-reg-start-iter 1000 \
+      --opacity-entropy-reg-end-iter 30000 \
+      --disable-sh-rendering \
+      --sh-degree 0 \
+      --enable-metric-depth-normal-loss \
+      --metric-depth-normal-loss-weight 0.1 \
+      --model-type scaffold \
+      --viewer-camera-frustum-scale 4.0 \
+      --feat-dim 32 \
+      --fourier-freqs 32 \
+      --lr-means 0.0 \
+      --lr-scales 0.005 \
+      --lr-quats 0.0015 \
+      --lr-opacities 0.015 \
+      --lr-sh 0.0055 \
+      --lr-offset 0.006 \
+      --lr-mlp-opacity 0.0015 \
+      --lr-mlp-cov 0.003 \
+      --lr-mlp-color 0.006 \
+      --grow-grad2d 0.00008 \
+      --grow-scale3d 0.012 \
+      --grow-scale2d 0.005 \
+      --prune-scale3d 0.008 \
+      --prune-scale2d 0.15 \
+      --densify-from-iter 1000 \
+      --densify-interval 150 \
+      --densify-until-iter 35000 \
+      --opacity-reset-interval 3000 \
+      --opacity-reset-value 0.008

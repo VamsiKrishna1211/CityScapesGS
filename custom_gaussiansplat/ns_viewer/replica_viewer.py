@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
+import nerfview
 import numpy as np
 from scipy.spatial.transform import Rotation as ScipyRotation
 
 from .image_loader import ImagePolicy, ThumbnailStore
+
+logger = logging.getLogger("cityscape_gs.ns_viewer.replica_viewer")
 
 
 @dataclass(frozen=True)
@@ -34,7 +38,6 @@ class NSReplicaViewer:
         dataset,
         config: NSReplicaViewerConfig,
     ) -> None:
-        import nerfview
 
         self._server = server
         self._dataset = dataset
@@ -44,10 +47,10 @@ class NSReplicaViewer:
         self._training_cameras_created = False
         self._show_training_cameras = None
 
-        if getattr(dataset, "cameras", None):
-            self._install_training_camera_toggle_gui()
-            if self._cfg.add_training_cameras:
-                self._add_training_cameras()
+        # if getattr(dataset, "cameras", None):
+        #     self._install_training_camera_toggle_gui()
+        #     if self._cfg.add_training_cameras:
+        #         self._add_training_cameras()
 
     @property
     def lock(self):

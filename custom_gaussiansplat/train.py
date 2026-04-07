@@ -7,9 +7,9 @@ import os
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Tuple, cast
 
 
 def _prepend_env_path(var_name: str, path_value: str) -> None:
@@ -64,12 +64,10 @@ from torchmetrics.image import (
     PeakSignalNoiseRatio,
 )
 
-try:
-    import nerfview  # type: ignore[import-untyped]
-    import viser  # type: ignore[import-untyped]
-    VIEWER_AVAILABLE = True
-except ImportError:
-    VIEWER_AVAILABLE = False
+VIEWER_AVAILABLE = (
+    importlib.util.find_spec("nerfview") is not None
+    and importlib.util.find_spec("viser") is not None
+)
 
 import numpy as np
 
@@ -89,9 +87,7 @@ from logger import GaussianSplattingLogger, configure_app_logger
 from model_factory import ModelFactory
 from models import (
     BaseTrainableModel,
-    GaussianModel,
     NeuralRenderingMixin,
-    ScaffoldModel,
 )
 from ns_viewer import NSReplicaViewer, NSReplicaViewerConfig
 from rich import box
@@ -419,6 +415,10 @@ class LossComputer:
         self.ordinal_depth_loss = losses.OrdinalDepthLoss().to(device)
         self.affine_aligned_gradient_matching_loss = losses.AffineAlignedGradientMatchingLoss().to(device)
         self.metric_depth_normal_loss = losses.MetricNormalLoss().to(device)
+        self.dn_splatter_normal_loss = losses.DNSplatterNormalLoss(
+            lambda_weight=depth_cfg.dn_splatter_normal_loss_weight,
+            tv_weight=depth_cfg.dn_splatter_normal_tv_weight,
+        ).to(device)
 
     # -- internal helpers ---------------------------------------------------
 
@@ -472,7 +472,9 @@ class LossComputer:
              dcfg.affine_aligned_gradient_matching_loss_weight,
              self.affine_aligned_gradient_matching_loss),
             ("metric_depth_normal_loss", dcfg.enable_metric_depth_normal_loss, dcfg.metric_depth_normal_loss_weight,
-             self.metric_depth_normal_loss)
+             self.metric_depth_normal_loss),
+            ("dn_splatter_normal_loss", dcfg.enable_dn_splatter_normal_loss, 1.0,
+             self.dn_splatter_normal_loss),
         ]
 
         for name, enabled, weight, module in depth_loss_items:
@@ -489,7 +491,7 @@ class LossComputer:
         return acc, m
 
     def _compute_regularization(
-        self, model: GaussianModel | ScaffoldModel, step: int,
+        self, model: BaseTrainableModel, step: int,
     ) -> Tuple[torch.Tensor, dict]:
         """Compute floater-prevention regularization losses."""
         fcfg = self.floater_cfg
@@ -534,7 +536,7 @@ class LossComputer:
         render_out: RenderOutput,
         gt_image: torch.Tensor,
         depth_tensor: Optional[torch.Tensor],
-        model: GaussianModel | ScaffoldModel,
+        model: BaseTrainableModel,
         cam_data: CameraData,
         step: int,
     ) -> LossResult:
@@ -701,13 +703,15 @@ class TrainingLogger:
             "opacity_reg_loss": metrics["opacity_reg_loss"],
             "opacity_entropy_reg_loss": metrics["opacity_entropy_reg_loss"],
         }
-        # Only include optional depth keys when active
+        # Only include optional depth keys when active (non-zero).
+        # dn_splatter_normal_loss is always forwarded when present so TensorBoard
+        # shows 0.0 during early training rather than an absent series.
         optional_keys = [
             "depth_loss", "depth_corr", "depth_smoothness_loss",
             "affine_invariant_depth_loss", "pearson_correlation_loss",
             "silog_loss", "ordinal_depth_loss",
             "affine_aligned_gradient_matching_loss", "metric_depth_normal_loss",
-            "sam_loss",
+            "sam_loss", "dn_splatter_normal_loss",
         ]
         for k in optional_keys:
             if k in metrics and metrics[k] != 0.0:
@@ -718,7 +722,7 @@ class TrainingLogger:
         self,
         step: int,
         loss_result: LossResult,
-        model: Union[GaussianModel, ScaffoldModel],
+        model: BaseTrainableModel,
         render_out: RenderOutput,
         gt_image: torch.Tensor,
         depth_tensor: Optional[torch.Tensor],
@@ -795,9 +799,9 @@ class TrainingLogger:
         if self.tensorboard_enabled:
             self.tb_logger.log_densification_event(before, after, step=step)
 
-    def log_learning_rates(self, optimizers: GSOptimizers, step: int) -> None:
+    def log_learning_rates(self, optimizers: GSOptimizers, step: int, extra_optimizers=None) -> None:
         if self.tensorboard_enabled and step % self.log_interval == 0:
-            self.tb_logger.log_learning_rates(optimizers, step=step)
+            self.tb_logger.log_learning_rates(optimizers, step=step, extra_optimizers=extra_optimizers)
 
     def finalize(self, final_metrics: dict) -> None:
         """Stop progress bar, shutdown executor, close TensorBoard."""
@@ -878,10 +882,10 @@ class GaussianSplatTrainer:
 
         # Low VRAM optimizations: Initialize gradient scaler for mixed precision training
         # Note: TF32 is already enabled globally at module level (lines 107-110)
-        self.scaler = torch.amp.GradScaler(device=self.device, enabled=self.training_cfg.use_low_vram)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.training_cfg.use_low_vram)
 
         # Will be initialized in setup methods
-        self.model: Optional[Union[GaussianModel, ScaffoldModel]] = None
+        self.model: Optional[BaseTrainableModel] = None
         self.dataset: Optional[ColmapDataset | InstantNGPDataset | MatrixCityDataset] = None
         self.logger: Optional[logging.Logger] = None
         self.tb_logger: Optional[GaussianSplattingLogger] = None
@@ -984,26 +988,16 @@ class GaussianSplatTrainer:
                 raise FileNotFoundError(f"Checkpoint file does not exist: {checkpoint_path}")
             self.logger.info(f"[cyan]📂 Loading checkpoint:[/cyan] {checkpoint_path.name}")
 
+            scaffold_kwargs = asdict(self.config.model.scaffold) if self.config.model.model_type == "scaffold" else {}
             self.model, checkpoint = ModelFactory.resume(
                 model_type=self.config.model.model_type,
                 checkpoint_path=checkpoint_path,
                 device=self.device,
                 sh_degree=self.sh_cfg.sh_degree,
-                feat_dim=self.config.model.feat_dim,
-                n_offsets=self.config.model.n_offsets,
-                voxel_size=self.config.model.voxel_size,
-                update_depth=self.config.model.update_depth,
-                update_init_factor=self.config.model.update_init_factor,
-                update_hierachy_factor=self.config.model.update_hierachy_factor,
-                use_feat_bank=self.config.model.use_feat_bank,
-                appearance_dim=self.config.model.appearance_dim,
-                add_opacity_dist=self.config.model.add_opacity_dist,
-                add_cov_dist=self.config.model.add_cov_dist,
-                add_color_dist=self.config.model.add_color_dist,
                 console=self.console,
+                **scaffold_kwargs,
             )
-            if self.config.model.model_type == "scaffold":
-                self.model.set_appearance(len(self.dataset))
+            self.model.set_appearance(len(self.dataset))
 
             self.model.to(self.device)
             self.start_iteration = checkpoint.get("iteration", 0) + 1
@@ -1015,39 +1009,62 @@ class GaussianSplatTrainer:
                 self.logger.info(f"[green]✓ Loaded model with {num_pts:,} {self.model.point_name}[/green]")
                 self.logger.info(f"[green]  Resuming from iteration {checkpoint['iteration']:,}[/green]")
         else:
+            scaffold_kwargs = asdict(self.config.model.scaffold) if self.config.model.model_type == "scaffold" else {}
             self.model = ModelFactory.create(
                 model_type=self.config.model.model_type,
                 init_points=self.dataset.init_points,
                 init_colors=self.dataset.init_colors,
                 sh_degree=self.sh_cfg.sh_degree,
                 console=self.console,
-                feat_dim=self.config.model.feat_dim,
-                n_offsets=self.config.model.n_offsets,
-                voxel_size=self.config.model.voxel_size,
-                update_depth=self.config.model.update_depth,
-                update_init_factor=self.config.model.update_init_factor,
-                update_hierachy_factor=self.config.model.update_hierachy_factor,
-                use_feat_bank=self.config.model.use_feat_bank,
-                appearance_dim=self.config.model.appearance_dim,
-                add_opacity_dist=self.config.model.add_opacity_dist,
-                add_cov_dist=self.config.model.add_cov_dist,
-                add_color_dist=self.config.model.add_color_dist,
+                **scaffold_kwargs,
             ).to(self.device)
-            if self.config.model.model_type == "scaffold":
-                self.model.set_appearance(len(self.dataset))
+            self.model.set_appearance(len(self.dataset))
 
         self._checkpoint = checkpoint
 
-        # TensorBoard logger
+        # Determine experiment name
+        experiment_name = self.output_cfg.experiment_name
+        if experiment_name is None and tb_resume_run_name is not None:
+            # Use the checkpoint's run name if resuming and no explicit name
+            experiment_name = tb_resume_run_name
+        elif experiment_name is not None and tb_resume_run_name is not None:
+            # Both provided: CLI takes precedence (warn if different)
+            if experiment_name != tb_resume_run_name:
+                if self.VERBOSITY >= 1:
+                    self.logger.warning(
+                        f"[yellow]⚡ Experiment name mismatch:[/yellow] "
+                        f"CLI specifies '{experiment_name}' but checkpoint has '{tb_resume_run_name}'. "
+                        f"Using CLI value."
+                    )
+
+        # Check for existing experiment directory
         output_path = Path(self.output_cfg.output_dir)
+        tensorboard_dir = output_path / "tensorboard"
+
+        if experiment_name is not None:
+            experiment_dir = tensorboard_dir / experiment_name
+            if experiment_dir.exists():
+                if self.checkpoint_cfg.resume_from is None:
+                    # Not resuming, but experiment exists → error
+                    raise ValueError(
+                        f"Experiment '{experiment_name}' already exists at {experiment_dir}. "
+                        f"Use --resume-from to continue training, or choose a different experiment name."
+                    )
+                # Resuming: allow continuation (TensorBoard purge_step will handle it)
+                if self.VERBOSITY >= 1:
+                    self.logger.info(
+                        f"[cyan]📂 Resuming existing experiment:[/cyan] {experiment_name}"
+                    )
+
+        # TensorBoard logger
         self.tb_logger = GaussianSplattingLogger(
             log_dir=str(output_path / "tensorboard"),
             enabled=self.tensorboard_cfg.tensorboard,
-            run_name=tb_resume_run_name,
+            run_name=experiment_name,
             purge_step=tb_purge_step,
         )
         if self.tensorboard_cfg.tensorboard and self.VERBOSITY >= 1:
-            if tb_resume_run_name is not None:
+            if experiment_name is not None:
                 self.logger.info(
                     f"[green]📊 TensorBoard:[/green] Resuming run [cyan]{self.tb_logger.run_name}[/cyan] "
                     f"from step [yellow]{self.start_iteration:,}[/yellow]"
@@ -1066,7 +1083,7 @@ class GaussianSplatTrainer:
             raise RuntimeError("Dataset must be initialized before strategy setup")
 
         # Use isinstance() for type-safe capability detection instead of string checks
-        if isinstance(self.model, ScaffoldModel):
+        if isinstance(self.model, NeuralRenderingMixin):
             from strategy_scaffold import ScaffoldStrategy
             self.strategy = ScaffoldStrategy(
                 model=self.model,
@@ -1078,7 +1095,7 @@ class GaussianSplatTrainer:
                 verbose=(self.VERBOSITY >= 2),
             )
             self.strategy_state = self.strategy.initialize_state()
-            if self.VERBOSITY >= 1:
+            if self.VERBOSITY >= 1 and self.logger is not None:
                 self.logger.info("[cyan]🏗️ Scaffold-GS:[/cyan] Using ScaffoldStrategy for anchor-based densification")
         else:
             self.strategy = DefaultStrategy(
@@ -1156,7 +1173,8 @@ class GaussianSplatTrainer:
         self.optimizers = self.model.create_optimizers(
             lr_means=lr.lr_means, lr_scales=lr.lr_scales,
             lr_quats=lr.lr_quats, lr_opacities=lr.lr_opacities,
-            lr_sh=lr.lr_sh, means_lr_multiplier=5.0,
+            lr_sh=lr.lr_sh, lr_semantics=lr.lr_semantics,
+            means_lr_multiplier=5.0,
         )
         self.schedulers = self.model.create_schedulers(
             self.optimizers,
@@ -1177,6 +1195,7 @@ class GaussianSplatTrainer:
             for name, opt in self.optimizers.all_optimizers():
                 if name in saved_states:
                     opt.load_state_dict(saved_states[name])
+            self.model.load_extra_optimizer_states(self._checkpoint)
             if self.VERBOSITY >= 1:
                 self.logger.info("[green]✓ Restored optimizer states[/green]")
 
@@ -1249,17 +1268,22 @@ class GaussianSplatTrainer:
         if not VIEWER_AVAILABLE:
             self.logger.warning("[yellow]⚠ Warning:[/yellow] nerfview not available.")
             return
+        nerfview_mod = importlib.import_module("nerfview")
+        viser_mod = importlib.import_module("viser")
         if self.dataset is None:
             raise RuntimeError("Dataset must be initialized before viewer setup")
+        model = self.model
         self.viewer_param_sync = ViewerParamSync(
-            model=self.model, device=self.device,
+            model=model, device=self.device,
             disable_sh_rendering=self.sh_cfg.disable_sh_rendering,
             refresh_interval=self.viewer_cfg.viewer_refresh_interval,
         )
-        self.server = viser.ViserServer(port=self.viewer_cfg.viewer_port, verbose=False)
+        self.server = viser_mod.ViserServer(port=self.viewer_cfg.viewer_port, verbose=False)
+        server = self.server
+        assert server is not None
         if self.viewer_cfg.viewer_backend == "nerfview":
-            self.viewer = nerfview.Viewer(
-                server=self.server,
+            self.viewer = nerfview_mod.Viewer(
+                server=server,
                 render_fn=self.viewer_param_sync.render_fn,
                 mode="training",
             )
@@ -1272,28 +1296,30 @@ class GaussianSplatTrainer:
                 max_thumbnail_size=self.viewer_cfg.viewer_max_thumbnail_size,
             )
             self.viewer = NSReplicaViewer(
-                server=self.server,
+                server=server,
                 render_fn=self.viewer_param_sync.render_fn,
                 dataset=self.dataset,
                 config=replica_cfg,
             )
         
         # Add LoD slider if levels > 1
-        if len(self.model.lod_offsets) > 1:
-            self.lod_slider = self.server.gui.add_slider(
+        lod_offsets = cast(list[int], model.lod_offsets)
+        if len(lod_offsets) > 1:
+            self.lod_slider = server.gui.add_slider(
                 "Display LoD",
                 min=0,
-                max=len(self.model.lod_offsets) - 1,
+                max=len(lod_offsets) - 1,
                 step=1,
                 initial_value=0,
             )
             @self.lod_slider.on_update
             def _(_) -> None:
-                self.viewer.render_tab_state.lod = self.lod_slider.value
+                if self.viewer is not None:
+                    self.viewer.render_tab_state.lod = self.lod_slider.value
 
         # Add anchor point cloud toggle for Scaffold-GS models
-        if isinstance(self.model, NeuralRenderingMixin):
-            self.show_anchors_checkbox = self.server.gui.add_checkbox(
+        if isinstance(model, NeuralRenderingMixin):
+            self.show_anchors_checkbox = server.gui.add_checkbox(
                 "Show Anchors",
                 initial_value=False,
             )
@@ -1301,14 +1327,16 @@ class GaussianSplatTrainer:
 
             @self.show_anchors_checkbox.on_update
             def _(event) -> None:
+                if self.viewer_param_sync is None or self.server is None:
+                    return
                 enabled = self.show_anchors_checkbox.value
                 self.viewer_param_sync.show_anchors = enabled
                 if enabled:
                     # Create point cloud visualization of anchors
-                    pts = self.model.anchors.detach().cpu().numpy().astype(np.float32)
+                    pts = model.means.detach().cpu().numpy().astype(np.float32)
                     # Use light gray color for anchors
                     gray = np.full((len(pts), 3), 180, dtype=np.uint8)
-                    self._anchor_cloud_handle = self.server.scene.add_point_cloud(
+                    self._anchor_cloud_handle = server.scene.add_point_cloud(
                         name="/scaffold/anchors",
                         points=pts,
                         colors=gray,
@@ -1321,14 +1349,15 @@ class GaussianSplatTrainer:
                         self._anchor_cloud_handle = None
 
         # Add Gaussian visibility toggle
-        self.hide_gaussians_checkbox = self.server.gui.add_checkbox(
+        self.hide_gaussians_checkbox = server.gui.add_checkbox(
             "Hide Gaussians",
             initial_value=False,
         )
 
         @self.hide_gaussians_checkbox.on_update
         def _(event) -> None:
-            self.viewer_param_sync.hide_gaussians = self.hide_gaussians_checkbox.value
+            if self.viewer_param_sync is not None:
+                self.viewer_param_sync.hide_gaussians = self.hide_gaussians_checkbox.value
 
         if self.VERBOSITY >= 1:
             self.logger.info(
@@ -1476,7 +1505,7 @@ class GaussianSplatTrainer:
             )
 
         # Render and compute loss (with optional mixed precision)
-        with torch.amp.autocast(device_type=self.device.type, enabled=self.training_cfg.use_low_vram):
+        with torch.cuda.amp.autocast(enabled=self.training_cfg.use_low_vram):
             render_out = self.rasterizer.render(cam, gt_image, self.device)
 
             if self.sh_cfg.disable_sh_rendering and step == self.start_iteration and self.VERBOSITY >= 1:
@@ -1515,7 +1544,7 @@ class GaussianSplatTrainer:
             # Print ALL loss components for debugging
             self.logger.error("[red]═══ NaN Loss Debug Info ═══[/red]")
             self.logger.error(f"[red]Step: {step}[/red]")
-            self.logger.error(f"[red]All loss components:[/red]")
+            self.logger.error("[red]All loss components:[/red]")
             for key, value in sorted(m.items()):
                 is_finite = "✓" if isinstance(value, (int, float)) and torch.isfinite(torch.tensor(value)) else "✗ NaN/Inf"
                 dtype_info = ""
@@ -1578,6 +1607,11 @@ class GaussianSplatTrainer:
                     self.scaler.step(opt)
                     did_scaled_step = True
                 opt.zero_grad(set_to_none=True)
+            for _name, opt in self.model.iter_extra_optimizers():
+                if _optimizer_has_any_grad(opt):
+                    self.scaler.step(opt)
+                    did_scaled_step = True
+                opt.zero_grad(set_to_none=True)
 
             # Update scaler only if at least one scaled step happened.
             if did_scaled_step:
@@ -1586,17 +1620,22 @@ class GaussianSplatTrainer:
             for _name, opt in self.optimizers.all_optimizers():
                 opt.step()
                 opt.zero_grad(set_to_none=True)
+            for _name, opt in self.model.iter_extra_optimizers():
+                opt.step()
+                opt.zero_grad(set_to_none=True)
 
         # LR schedulers
         for _name, sched in self.schedulers.all_schedulers():
+            sched.step()
+        for _name, sched in self.model.iter_extra_schedulers():
             sched.step()
 
         # Update model parameters from strategy-modified dict (after optimizer step)
         # This must happen AFTER optimizer.step() to avoid in-place operation errors
         self.model.update_params_from_dict(params)
 
-        # Learning rate logging
-        self.training_logger.log_learning_rates(self.optimizers, step)
+        # Learning rate logging (includes MLP/extra optimizers for scaffold-type models)
+        self.training_logger.log_learning_rates(self.optimizers, step, extra_optimizers=self.model.iter_extra_optimizers())
 
         # Viewer update
         if self.viewer is not None:
@@ -1632,13 +1671,19 @@ class GaussianSplatTrainer:
         checkpoint_path = self.checkpoint_dir / f"checkpoint_{step}.pt"
         # Prepare optimizer state dict (flattened with all_optimizers)
         optimizers_state = {name: opt.state_dict() for name, opt in self.optimizers.all_optimizers()}
+        extra_optimizers_state = self.model.get_extra_optimizer_states()
+
+        # Convert TrainConfig to dict for serialization
+        train_config_dict = asdict(self.training_cfg)
 
         torch.save({
             "iteration": step,
             "model_state_dict": self.model.state_dict(),
             "optimizers_state_dict": optimizers_state,
+            "extra_optimizers_state_dict": extra_optimizers_state,
             "loss": loss,
             "tensorboard_run_name": tb_run_name,
+            "train_config": train_config_dict,
         }, checkpoint_path)
         if self.VERBOSITY >= 1:
             self.logger.info(f"[green]💾 Checkpoint saved:[/green] [dim]{checkpoint_path.name}[/dim]")
@@ -1718,6 +1763,9 @@ class GaussianSplatTrainer:
             )
 
         final_path = output_path / "model_final.pt"
+        # Convert TrainConfig to dict for serialization
+        train_config_dict = asdict(self.training_cfg)
+
         torch.save({
             "iteration": self.training_cfg.iterations,
             "model_state_dict": self.model.state_dict(),
@@ -1727,6 +1775,7 @@ class GaussianSplatTrainer:
             "tensorboard_run_name": (
                 self.tb_logger.run_name if (self.tensorboard_cfg.tensorboard and self.tb_logger is not None) else None
             ),
+            "train_config": train_config_dict,
         }, final_path)
 
         # Display summary

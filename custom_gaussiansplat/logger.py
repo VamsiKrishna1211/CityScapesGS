@@ -5,14 +5,14 @@ This module provides a clean interface for logging training metrics,
 losses, images, and model statistics to TensorBoard.
 """
 
-from torch.utils.tensorboard import SummaryWriter
-import torch
-from pathlib import Path
-from typing import Optional, Dict
-import random
-from datetime import datetime
-import warnings
 import logging
+import secrets
+import warnings
+from pathlib import Path
+from typing import Dict, Optional
+
+import torch
+from torch.utils.tensorboard import SummaryWriter
 
 logger = logging.getLogger("cityscape_gs.logger")
 
@@ -119,16 +119,18 @@ class GaussianSplattingLogger:
         """
         Generate a unique, memorable name for this training run.
         
-        Format: adjective-noun-MMDD-HHMM
-        Example: cosmic-phoenix-0212-1430
+        Format: adjective-noun-XXXX
+        Example: cosmic-phoenix-a1b2
         
         Returns:
             Unique run name string
         """
-        adjective = random.choice(GaussianSplattingLogger.ADJECTIVES)
-        noun = random.choice(GaussianSplattingLogger.NOUNS)
-        timestamp = datetime.now().strftime('%m%d-%H%M')
-        return f"{adjective}-{noun}-{timestamp}"
+        # Use OS entropy so run naming is unaffected by global random seeds
+        # used for deterministic training.
+        adjective = secrets.choice(GaussianSplattingLogger.ADJECTIVES)
+        noun = secrets.choice(GaussianSplattingLogger.NOUNS)
+        nonce = secrets.token_hex(2)
+        return f"{adjective}-{noun}-{nonce}"
     
     def __init__(self, log_dir: str, enabled: bool = True, run_name: Optional[str] = None, purge_step: Optional[int] = None):
         """
@@ -148,6 +150,10 @@ class GaussianSplattingLogger:
             
             # Create run-specific subdirectory
             self.log_dir = Path(log_dir) / self.run_name
+            if self.log_dir.exists() and run_name is None:
+                # Extremely rare, but avoid accidental writer reuse.
+                self.run_name = f"{self.run_name}-{secrets.token_hex(2)}"
+                self.log_dir = Path(log_dir) / self.run_name
             self.log_dir.mkdir(parents=True, exist_ok=True)
             
             self.writer = SummaryWriter(str(self.log_dir), purge_step=purge_step)
@@ -182,6 +188,7 @@ class GaussianSplattingLogger:
                    ordinal_depth_loss: Optional[float] = None,
                    affine_aligned_gradient_matching_loss: Optional[float] = None,
                    metric_depth_normal_loss: Optional[float] = None,
+                   dn_splatter_normal_loss: Optional[float] = None,
                    sam_loss: Optional[float] = None,
                    semantic_loss: Optional[float] = None,
                    step: int = 0):
@@ -205,6 +212,7 @@ class GaussianSplattingLogger:
             ordinal_depth_loss: Optional ordinal depth ranking loss
             affine_aligned_gradient_matching_loss: Optional affine-aligned gradient matching loss
             metric_depth_normal_loss: Optional metric depth normal loss
+            dn_splatter_normal_loss: Optional DN-Splatter normal loss
             sam_loss: Optional sharpness-aware minimization loss
             semantic_loss: Optional semantic reconstruction loss
             step: Current training step
@@ -241,6 +249,8 @@ class GaussianSplattingLogger:
             self.writer.add_scalar('Loss/AffineAlignedGradientMatching', affine_aligned_gradient_matching_loss, step)
         if metric_depth_normal_loss is not None and metric_depth_normal_loss > 0:
             self.writer.add_scalar('Loss/MetricDepthNormal', metric_depth_normal_loss, step)
+        if dn_splatter_normal_loss is not None:
+            self.writer.add_scalar('Loss/DNSplatterNormal', dn_splatter_normal_loss, step)
         if sam_loss is not None and sam_loss > 0:
             self.writer.add_scalar('Loss/SAM', sam_loss, step)
         if semantic_loss is not None and semantic_loss > 0:
@@ -391,38 +401,72 @@ class GaussianSplattingLogger:
     
     def log_gaussian_histograms(self, model, step: int):
         """
-        Log histograms of Gaussian parameters.
-        
+        Log histograms of Gaussian parameters and their gradients.
+
+        Gradient logging is model-agnostic: core params come from
+        model.get_params_dict() (BaseTrainableModel contract), and extra
+        params (MLPs, language features) come from model.iter_extra_optimizers().
+        Gradients are available here because logging runs after loss.backward()
+        but before optimizer.zero_grad().
+
         Args:
-            model: GaussianModel instance
+            model: Any BaseTrainableModel instance
             step: Current training iteration
         """
         if not self.enabled:
             return
-        
+
         # Log parameter distributions
         self.writer.add_histogram('Parameters/Scales', model.scales.detach().cpu().flatten(), step)
         self.writer.add_histogram('Parameters/Opacities', model.opacities.detach().cpu().flatten(), step)
         self.writer.add_histogram('Parameters/Positions', model.means.detach().cpu().flatten(), step)
-        
+
         # Log scale statistics per axis
         scales_cpu = model.scales.detach().cpu()
         for i, axis in enumerate(['X', 'Y', 'Z']):
             self.writer.add_histogram(f'Scales/{axis}', scales_cpu[:, i], step)
+
+        # --- Gradient histograms ---
+        # Core geometric/feature params (keys normalised across all model types)
+        for name, param in model.get_params_dict().items():
+            if param.grad is not None:
+                self.writer.add_histogram(
+                    f'Gradients/{name}', param.grad.detach().cpu().flatten(), step
+                )
+
+        # Extra params: MLPs, language features, etc. — aggregated per optimizer group
+        for name, opt in model.iter_extra_optimizers():
+            grads = [
+                p.grad.detach().cpu().flatten()
+                for group in opt.param_groups
+                for p in group['params']
+                if p.grad is not None
+            ]
+            if grads:
+                self.writer.add_histogram(
+                    f'Gradients/extra/{name}', torch.cat(grads), step
+                )
     
-    def log_learning_rates(self, optimizers, step: int):
+    def log_learning_rates(self, optimizers, step: int, extra_optimizers=None):
         """
         Log current learning rates for all optimizers.
-        
+
         Args:
             optimizers: GSOptimizers instance with all parameter optimizers
             step: Current training iteration
+            extra_optimizers: Optional iterator of (name, optimizer) tuples for
+                model-owned extras (e.g. MLP optimizers in ScaffoldModel). If None
+                or exhausted, it is silently skipped.
         """
         if not self.enabled:
             return
-        
-        for name, optimizer in optimizers.__dict__.items():
-            if optimizer is not None and hasattr(optimizer, 'param_groups'):
+
+        for name, optimizer in optimizers.all_optimizers():
+            lr = optimizer.param_groups[0]['lr']
+            self.writer.add_scalar(f'LearningRate/{name}', lr, step)
+
+        if extra_optimizers is not None:
+            for name, optimizer in extra_optimizers:
                 lr = optimizer.param_groups[0]['lr']
                 self.writer.add_scalar(f'LearningRate/{name}', lr, step)
     

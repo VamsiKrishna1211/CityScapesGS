@@ -6,7 +6,12 @@ from typing import Any, List, Optional
 import numpy as np
 import torch
 from gsplat import rasterization
-from models.base import BaseTrainableModel, NeuralRenderingMixin
+from models import (
+    BaseTrainableModel,
+    GaussianModel,
+    NeuralRenderingMixin,
+    ScaffoldModel,
+)
 
 
 @dataclass
@@ -25,12 +30,12 @@ class ViewerParamSync:
 
     def __init__(
         self,
-        model,
+        model: BaseTrainableModel | NeuralRenderingMixin | ScaffoldModel | GaussianModel,
         device: torch.device,
         disable_sh_rendering: bool,
         refresh_interval: int = 100,
     ) -> None:
-        self.model = model
+        self.model: BaseTrainableModel | NeuralRenderingMixin | ScaffoldModel | GaussianModel = model
         self.device = device
         self.disable_sh_rendering = disable_sh_rendering
         self.refresh_interval = max(1, int(refresh_interval))
@@ -44,6 +49,13 @@ class ViewerParamSync:
     @torch.no_grad()
     def refresh(self, step: int, force: bool = False) -> None:
         if not force and self._last_refresh_step >= 0 and (step - self._last_refresh_step) < self.refresh_interval:
+            return
+
+        if isinstance(self.model, NeuralRenderingMixin):
+            # Neural models (e.g. ScaffoldModel) generate Gaussians dynamically per
+            # camera — there are no stored quats/means to cache.  render_fn handles
+            # them by calling generate_neural_gaussians directly.
+            self._last_refresh_step = step
             return
 
         colors = (
@@ -68,7 +80,7 @@ class ViewerParamSync:
 
     @torch.no_grad()
     def render_fn(self, camera_state, render_tab_state):
-        if self._cache is None:
+        if self._cache is None and not isinstance(self.model, NeuralRenderingMixin):
             width = render_tab_state.render_width if render_tab_state.preview_render else render_tab_state.viewer_width
             height = render_tab_state.render_height if render_tab_state.preview_render else render_tab_state.viewer_height
             return np.zeros((height, width, 3), dtype=np.uint8)

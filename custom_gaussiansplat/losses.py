@@ -1532,3 +1532,174 @@ class MetricNormalLoss(nn.Module):
         loss = (1.0 - cos_sim).mean()
 
         return self.lambda_weight * loss
+
+
+class DNSplatterNormalLoss(nn.Module):
+    """Surface normal loss mirroring DN-Splatter's DNRegularization normal loss.
+
+    Differences from MetricNormalLoss (Sobel + cosine distance):
+      * Normal derivation: finite cross-product differences on backprojected 3D
+        points, matching dn-splatter's ``pcd_to_normal``.
+      * Primary loss: L1 between rendered and GT surface normals (not cosine distance).
+      * Smoothness: TV loss on rendered normals, mirroring dn-splatter's
+        ``NormalLoss(NormalLossType.Smooth)`` term that MetricNormalLoss omits.
+
+    Reference: dn-splatter/dn_splatter/regularization_strategy.py
+               ``DNRegularization.get_normal_loss``
+               dn-splatter/dn_splatter/utils/normal_utils.py ``pcd_to_normal``
+    """
+
+    def __init__(self, lambda_weight: float = 0.1, tv_weight: float = 0.01):
+        super().__init__()
+        self.lambda_weight = lambda_weight
+        self.tv_weight = tv_weight
+
+        # Cache pixel grid to avoid repeated allocations
+        self._cached_grid_shape: tuple | None = None
+        self._cached_u: torch.Tensor | None = None
+        self._cached_v: torch.Tensor | None = None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_coordinate_grid(
+        self, H: int, W: int, device: torch.device, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._cached_grid_shape != (H, W):
+            v, u = torch.meshgrid(
+                torch.arange(H, dtype=dtype, device=device),
+                torch.arange(W, dtype=dtype, device=device),
+                indexing="ij",
+            )
+            self._cached_u = u.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+            self._cached_v = v.unsqueeze(0).unsqueeze(0)
+            self._cached_grid_shape = (H, W)
+        if self._cached_u.dtype != dtype:  # type: ignore[union-attr]
+            self._cached_u = self._cached_u.to(dtype)  # type: ignore[union-attr]
+            self._cached_v = self._cached_v.to(dtype)  # type: ignore[union-attr]
+        return self._cached_u, self._cached_v  # type: ignore[return-value]
+
+    def _backproject(
+        self,
+        depth: torch.Tensor,
+        fx: float, fy: float, cx: float, cy: float,
+    ) -> torch.Tensor:
+        """Unproject metric depth to a 3D point cloud.
+
+        Args:
+            depth: ``[B, 1, H, W]`` metric Z-depth in camera space.
+        Returns:
+            ``[B, H, W, 3]`` XYZ point cloud.
+        """
+        _, _, H, W = depth.shape
+        u, v = self._get_coordinate_grid(H, W, depth.device, depth.dtype)
+
+        fx_t = torch.tensor(fx, dtype=depth.dtype, device=depth.device)
+        fy_t = torch.tensor(fy, dtype=depth.dtype, device=depth.device)
+        cx_t = torch.tensor(cx, dtype=depth.dtype, device=depth.device)
+        cy_t = torch.tensor(cy, dtype=depth.dtype, device=depth.device)
+
+        X = (u - cx_t) * depth / fx_t  # [B, 1, H, W]
+        Y = (v - cy_t) * depth / fy_t
+        # Stack XYZ → [B, 3, H, W] → [B, H, W, 3]
+        return torch.cat([X, Y, depth], dim=1).permute(0, 2, 3, 1)
+
+    @staticmethod
+    def _pcd_to_normal(xyz: torch.Tensor) -> torch.Tensor:
+        """Compute unit surface normals from a 3D point cloud.
+
+        Uses cross-product of 1-pixel finite differences — identical to
+        dn-splatter's ``pcd_to_normal``.  Border pixels are zero-padded.
+
+        Args:
+            xyz: ``[B, H, W, 3]``
+        Returns:
+            ``[B, H, W, 3]`` unit normals (border pixels = 0).
+        """
+        # Horizontal tangent: right − left  [B, H-2, W-2, 3]
+        left_to_right = xyz[:, 1:-1, 2:, :] - xyz[:, 1:-1, :-2, :]
+        # Vertical tangent: top − bottom (top = smaller row idx → smaller Y in cam space)
+        bottom_to_top = xyz[:, :-2, 1:-1, :] - xyz[:, 2:, 1:-1, :]
+
+        normals = torch.linalg.cross(left_to_right, bottom_to_top, dim=-1)
+        normals = F.normalize(normals, p=2, dim=-1, eps=1e-6)  # [B, H-2, W-2, 3]
+
+        # Pad border back to [B, H, W, 3]
+        normals = F.pad(
+            normals.permute(0, 3, 1, 2),  # [B, 3, H-2, W-2]
+            (1, 1, 1, 1),
+            mode="constant",
+            value=0.0,
+        ).permute(0, 2, 3, 1)
+
+        return normals
+
+    @staticmethod
+    def _tv_loss(normals: torch.Tensor) -> torch.Tensor:
+        """Total variation smoothness on ``[B, H, W, 3]`` normals.
+
+        Mirrors dn-splatter's ``TVLoss`` applied to predicted normals.
+        """
+        h_diff = normals[:, :, :-1, :] - normals[:, :, 1:, :]   # [B, H, W-1, 3]
+        w_diff = normals[:, :-1, :, :] - normals[:, 1:, :, :]   # [B, H-1, W, 3]
+        return torch.mean(torch.abs(h_diff)) + torch.mean(torch.abs(w_diff))
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(
+        self,
+        render_depth: torch.Tensor,
+        gt_depth: torch.Tensor,
+        mask: torch.Tensor,
+        cam_data: "CameraData",
+    ) -> torch.Tensor:
+        """
+        Args:
+            render_depth: ``[B, 1, H, W]`` rendered metric depth.
+            gt_depth:     ``[B, 1, H, W]`` GT / prior metric depth.
+            mask:         ``[B, 1, H, W]`` boolean valid-geometry mask.
+            cam_data:     Camera with ``fx, fy, cx, cy`` attributes.
+        Returns:
+            Scalar loss.
+        """
+        if mask.sum() < 100:
+            return torch.tensor(0.0, device=render_depth.device, requires_grad=True)
+
+        # 1. Backproject both depth maps to 3D point clouds
+        xyz_ren = self._backproject(render_depth, cam_data.fx, cam_data.fy, cam_data.cx, cam_data.cy)
+        xyz_gt  = self._backproject(gt_depth,     cam_data.fx, cam_data.fy, cam_data.cx, cam_data.cy)
+
+        # 2. Finite-difference surface normals  [B, H, W, 3]
+        N_ren = self._pcd_to_normal(xyz_ren)
+        N_gt  = self._pcd_to_normal(xyz_gt)
+
+        # 3. Erode the valid mask by 1 px to exclude Sobel-edge artifacts,
+        #    and also exclude the zero-padded border row/col from pcd_to_normal.
+        mask_f = mask.float()                                                       # [B, 1, H, W]
+        eroded = 1.0 - F.max_pool2d(1.0 - mask_f, kernel_size=3, stride=1, padding=1)
+        border = torch.ones_like(eroded)
+        border[:, :, 0, :] = 0.0
+        border[:, :, -1, :] = 0.0
+        border[:, :, :, 0] = 0.0
+        border[:, :, :, -1] = 0.0
+        valid = (eroded > 0.5) & (border > 0.5)  # [B, 1, H, W]
+
+        # Expand to [B, H, W, 3] for boolean indexing
+        valid_3c = valid.squeeze(1).unsqueeze(-1).expand_as(N_ren)
+
+        valid_N_ren = N_ren[valid_3c].view(-1, 3)
+        valid_N_gt  = N_gt[valid_3c].view(-1, 3)
+
+        if valid_N_ren.shape[0] < 100:
+            return torch.tensor(0.0, device=render_depth.device, requires_grad=True)
+
+        # 4. L1 loss between surface normals (mirrors dn-splatter NormalLoss(L1))
+        l1 = torch.abs(valid_N_ren - valid_N_gt).mean()
+
+        # 5. TV smoothness on rendered normals (mirrors dn-splatter normal_smooth_loss)
+        tv = self._tv_loss(N_ren)
+
+        return self.lambda_weight * l1 + self.tv_weight * tv
