@@ -6,18 +6,19 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from dataset import ColmapDataset
+from dataset import BaseReconstructionDataset
 
 
 class SemanticColmapDataset(Dataset):
-    """Semantic dataset that reuses ColmapDataset for camera/image/depth.
+    """Semantic dataset wrapper over any BaseReconstructionDataset.
 
-    This wrapper keeps semantic supervision fully decoupled from ColmapDataset.
+    Supports ColmapDataset, MatrixCityDataset, or any other dataset that
+    implements the BaseReconstructionDataset interface (returns cam, image, depth).
     """
 
     def __init__(
         self,
-        base_dataset: ColmapDataset,
+        base_dataset: BaseReconstructionDataset,
         semantics_path: Optional[Path] = None,
         semantics_resolution: Optional[tuple[int, int]] = None,
     ):

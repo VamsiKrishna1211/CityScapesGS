@@ -57,7 +57,7 @@ import time
 
 import torch
 import torch.nn.functional as F
-from gsplat import DefaultStrategy, rasterization  # type: ignore[import-untyped]
+from gsplat import DefaultStrategy  # type: ignore[import-untyped]
 from torch.utils.data import DataLoader
 from torchmetrics.image import (
     LearnedPerceptualImagePatchSimilarity,
@@ -74,6 +74,7 @@ import numpy as np
 RERUN_AVAILABLE = importlib.util.find_spec("rerun") is not None
 
 import losses
+from losses import LossComputer
 from dataset import (
     CameraData,
     ColmapDataset,
@@ -82,7 +83,18 @@ from dataset import (
     create_dataset,
 )
 from fused_ssim import fused_ssim  # type: ignore[import-untyped]
-from gs_types import GS_LR_Schedulers, GSOptimizers, RenderParams
+from gs_types import (
+    GS_LR_Schedulers,
+    GSOptimizers,
+    LossResult,
+    RenderOutput,
+    RenderParams,
+)
+from rasterizer import (
+    Rasterizer,
+    _prepare_depth_tensor,
+    _prepare_gt_image,
+)
 from logger import GaussianSplattingLogger, configure_app_logger
 from model_factory import ModelFactory
 from models import (
@@ -122,92 +134,6 @@ torch._dynamo.config.force_parameter_static_shapes = False
 ACTIVE_PROGRESS: Optional[Progress] = None
 
 
-# ---------------------------------------------------------------------------
-# Small utility helpers
-# ---------------------------------------------------------------------------
-
-
-def _build_viewmat(cam: dict, device: torch.device) -> torch.Tensor:
-    """Construct a [1, 4, 4] view matrix from a camera dict."""
-    viewmat = torch.eye(4, device=device, dtype=torch.float32)
-    viewmat[:3, :3] = cam["R"]
-    viewmat[:3, 3] = cam["T"]
-    return viewmat.unsqueeze(0)
-
-
-def _build_intrinsics(cam: dict, device: torch.device) -> torch.Tensor:
-    """Construct a [3, 3] intrinsics matrix from a camera dict."""
-    return torch.tensor(
-        [[cam["fx"], 0.0, cam["cx"]],
-         [0.0, cam["fy"], cam["cy"]],
-         [0.0, 0.0, 1.0]],
-        dtype=torch.float32, device=device,
-    )
-
-@torch.no_grad()
-def _prepare_gt_image(
-    gt_image: torch.Tensor,
-    device: torch.device,
-    target_h: Optional[int] = None,
-    target_w: Optional[int] = None,
-) -> torch.Tensor:
-    """Move gt_image to device, normalize shape, and optionally resize to target HW.
-
-    Returns tensor in [B, H, W, C] layout.
-    """
-    if not gt_image.is_cuda:
-        gt_image = gt_image.to(device)
-    if gt_image.dim() == 3:
-        gt_image = gt_image.unsqueeze(0)
-
-    if target_h is not None and target_w is not None:
-        h, w = gt_image.shape[1], gt_image.shape[2]
-        if h != target_h or w != target_w:
-            gt_bchw = gt_image.permute(0, 3, 1, 2)
-            gt_bchw = F.interpolate(
-                gt_bchw,
-                size=(target_h, target_w),
-                mode="bilinear",
-                align_corners=False,
-            )
-            gt_image = gt_bchw.permute(0, 2, 3, 1)
-    return gt_image
-
-@torch.no_grad()
-def _prepare_depth_tensor(
-    depth_tensor: Optional[torch.Tensor],
-    device: torch.device,
-    target_h: Optional[int] = None,
-    target_w: Optional[int] = None,
-) -> Optional[torch.Tensor]:
-    """Move depth tensor to device, normalize dims, and optionally resize to target HW.
-
-    Returns depth in [B, H, W] layout when available.
-    """
-    if depth_tensor is None:
-        return None
-    if not depth_tensor.is_cuda:
-        depth_tensor = depth_tensor.to(device)
-
-    if depth_tensor.dim() == 2:
-        depth_tensor = depth_tensor.unsqueeze(0)
-    elif depth_tensor.dim() == 4 and depth_tensor.shape[-1] == 1:
-        depth_tensor = depth_tensor[..., 0]
-
-    if target_h is not None and target_w is not None and depth_tensor.dim() == 3:
-        h, w = depth_tensor.shape[-2], depth_tensor.shape[-1]
-        if h != target_h or w != target_w:
-            depth_bchw = depth_tensor.unsqueeze(1)
-            depth_bchw = F.interpolate(
-                depth_bchw,
-                size=(target_h, target_w),
-                mode="nearest",
-            )
-            depth_tensor = depth_bchw[:, 0]
-
-    return depth_tensor
-
-
 def _optimizer_has_any_grad(optimizer: torch.optim.Optimizer) -> bool:
     """Return True when at least one parameter in this optimizer has a gradient.
 
@@ -245,387 +171,6 @@ def setup_logger(verbosity: int, output_dir: Path) -> logging.Logger:
         log_filename="training.log",
         logger_name="cityscape_gs.train",
     )
-
-
-# ---------------------------------------------------------------------------
-# Data containers
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class RenderOutput:
-    """Bundles all outputs from a single rasterization call."""
-    render: torch.Tensor           # [B, H, W, 3]
-    alpha: torch.Tensor            # [B, H, W, 1]
-    depth_map: torch.Tensor        # [B, H, W]
-    depth_mask: torch.Tensor       # [B, H, W]
-    depth_mask_bchw: torch.Tensor  # [B, 1, H, W]
-    depth_map_bchw: torch.Tensor   # [B, 1, H, W]
-    render_perm: torch.Tensor      # [B, C, H, W]
-    gt_perm: torch.Tensor          # [B, C, H, W]
-    meta: dict = field(default_factory=dict)
-
-
-@dataclass
-class LossResult:
-    """Bundles loss tensor and per-component metrics for logging."""
-    total_loss: torch.Tensor
-    metrics: dict  # str -> float, all individual loss/metric values
-    inv_rendered_depth: Optional[torch.Tensor] = None
-    inv_prior_depth: Optional[torch.Tensor] = None
-
-
-# ---------------------------------------------------------------------------
-# Rasterizer — encapsulates gsplat rasterization + depth extraction
-# ---------------------------------------------------------------------------
-
-
-class Rasterizer:
-    """Encapsulates gsplat rasterization and post-processing.
-
-    Handles the rasterization call, depth map extraction, alpha masking,
-    and tensor permutations for loss computation.
-    """
-
-    def __init__(
-        self,
-        model: BaseTrainableModel,
-        sh_cfg,
-        packed: bool = False,
-        absgrad: bool = False,
-    ) -> None:
-        self.model = model
-        self.sh_cfg = sh_cfg
-        self.packed = packed
-        self.absgrad = absgrad
-
-    def render(self, cam: dict[str, Any], gt_image: torch.Tensor,
-               device: torch.device, lod: Optional[int] = None) -> RenderOutput:
-        """Rasterize the scene for a single camera view.
-
-        Args:
-            cam: Camera dict with R, T, fx, fy, cx, cy, width, height.
-            gt_image: Ground-truth image [B, H, W, C] (already on device).
-            device: Target device.
-            lod: Optional LoD level to render.
-
-        Returns:
-            RenderOutput with all tensors needed for loss and logging.
-        """
-        viewmat = _build_viewmat(cam, device)
-        K = _build_intrinsics(cam, device)
-
-        rp: RenderParams = self.model.get_render_params(cam, self.sh_cfg, is_training=True, lod=lod)
-
-        render_output, render_alpha, render_meta = rasterization(
-            means=rp.means,
-            quats=rp.quats,
-            scales=rp.scales,
-            opacities=rp.opacities.squeeze(-1),
-            colors=rp.colors,
-            viewmats=viewmat,
-            Ks=K[None, ...],
-            width=cam["width"],
-            height=cam["height"],
-            sh_degree=rp.sh_degree,
-            packed=self.packed,
-            absgrad=self.absgrad,
-            render_mode="RGB+ED",
-            camera_model="pinhole"
-        )
-
-        # Forward any model-specific meta fields (e.g. Scaffold-GS neural_opacity).
-        if rp.neural_opacity is not None:
-            render_meta["neural_opacity"] = rp.neural_opacity
-        if rp.selection_mask is not None:
-            render_meta["selection_mask"] = rp.selection_mask
-
-        render = render_output[..., 0:3]             # [B, H, W, 3]
-        alpha = render_alpha                          # [B, H, W, 1]
-        render_depth_raw = render_output[..., 3]      # [B, H, W]
-
-        alpha_2d = alpha[..., 0] if alpha.dim() == 4 else alpha
-        depth_map = render_depth_raw / (alpha_2d + 1e-6)
-
-        depth_mask = (
-            (alpha_2d > 0.5)
-            & torch.isfinite(depth_map)
-            & (depth_map > 0)
-        )
-
-        render_perm = render.permute(0, 3, 1, 2)     # [B, C, H, W]
-        gt_perm = gt_image.permute(0, 3, 1, 2)
-
-        return RenderOutput(
-            render=render,
-            alpha=alpha,
-            depth_map=depth_map,
-            depth_mask=depth_mask,
-            depth_mask_bchw=depth_mask.unsqueeze(1),
-            depth_map_bchw=depth_map.unsqueeze(1),
-            render_perm=render_perm,
-            gt_perm=gt_perm,
-            meta=render_meta,
-        )
-
-
-# ---------------------------------------------------------------------------
-# LossComputer — consolidates all loss modules and per-step computation
-# ---------------------------------------------------------------------------
-
-
-class LossComputer:
-    """Consolidates all loss modules and their per-step computation.
-
-    Loss modules are created once at init rather than scattered as free
-    variables, and the conditional loss-accumulation logic is unified in
-    a single ``compute()`` method.
-    """
-
-    def __init__(self, training_cfg, depth_cfg: DepthConfig, floater_cfg: FloaterPreventionConfig, device: torch.device,
-                 verbosity: int = 1, logger: Optional[logging.Logger] = None) -> None:
-        self.training_cfg = training_cfg
-        self.depth_cfg = depth_cfg
-        self.floater_cfg = floater_cfg
-        self.device = device
-        self.logger = logger
-        self.scene_extent: float = 1.0
-
-        # Quality metric
-        self.psnr = PeakSignalNoiseRatio(data_range=(0, 1.0)).to(device)
-
-        # LPIPS loss (optional)
-        self.lpips = None
-        if training_cfg.enable_lpips_loss:
-            try:
-                self.lpips = LearnedPerceptualImagePatchSimilarity(
-                    net_type="vgg", normalize=True,
-                ).to(device)
-                if verbosity >= 1 and logger:
-                    logger.info("[green]✓ LPIPS loss enabled[/green]")
-            except Exception as e:
-                if logger:
-                    logger.error(f"[bold red]❌ Failed to initialize LPIPS:[/bold red] {e}")
-
-        # Depth loss modules (created unconditionally, only used when weights > 0)
-        self.depth_smoothness_loss = losses.FastPriorGradientMatchingLoss().to(device)
-        self.affine_invariant_depth_loss = losses.FastAffineInvariantDepthLoss().to(device)
-        self.pearson_correlation_loss = losses.PearsonCorrelationLoss().to(device)
-        self.silog_depth_loss = losses.SILogLoss().to(device)
-        self.ordinal_depth_loss = losses.OrdinalDepthLoss().to(device)
-        self.affine_aligned_gradient_matching_loss = losses.AffineAlignedGradientMatchingLoss().to(device)
-        self.metric_depth_normal_loss = losses.MetricNormalLoss().to(device)
-        self.dn_splatter_normal_loss = losses.DNSplatterNormalLoss(
-            lambda_weight=depth_cfg.dn_splatter_normal_loss_weight,
-            tv_weight=depth_cfg.dn_splatter_normal_tv_weight,
-        ).to(device)
-
-    # -- internal helpers ---------------------------------------------------
-
-    def _compute_lpips(self, render_perm: torch.Tensor,
-                       gt_perm: torch.Tensor) -> torch.Tensor:
-        """LPIPS with random-patch cropping for large images."""
-        if self.lpips is None:
-            return torch.tensor(0.0, device=self.device)
-
-        h, w = render_perm.shape[2:]
-        if h >= 1024 and w >= 1024:
-            ps = 1024
-            top = torch.randint(0, h - ps, (1,))
-            left = torch.randint(0, w - ps, (1,))
-            rp = render_perm[:, :, top:top + ps, left:left + ps].clamp(0.0, 1.0)
-            gp = gt_perm[:, :, top:top + ps, left:left + ps].clamp(0.0, 1.0)
-        else:
-            rp, gp = render_perm, gt_perm
-        return self.lpips(rp, gp)
-
-    def _compute_depth_losses(
-        self, depth_map_bchw: torch.Tensor,
-        depth_tensor: Optional[torch.Tensor],
-        depth_mask_bchw: torch.Tensor,
-        cam_data: Optional[CameraData] = None,
-    ) -> Tuple[torch.Tensor, dict]:
-        """Compute all active depth-related losses.
-
-        Returns:
-            (accumulated_loss, metrics_dict)
-        """
-        dcfg = self.depth_cfg
-        # Use zeros_like to inherit dtype from render output (important for mixed precision)
-        acc = torch.zeros(1, device=self.device, dtype=depth_map_bchw.dtype).squeeze()
-        m: dict = {}
-
-        if depth_tensor is None:
-            return acc, m
-
-        depth_tensor_bchw = depth_tensor.unsqueeze(0).unsqueeze(1).to(self.device)
-
-        depth_loss_items = [
-            ("affine_invariant_depth_loss", dcfg.enable_affine_invariant_depth_loss, dcfg.affine_invariant_depth_loss_weight,
-             self.affine_invariant_depth_loss),
-            ("pearson_correlation_loss", dcfg.enable_pearson_correlation_loss, dcfg.pearson_correlation_loss_weight,
-             self.pearson_correlation_loss),
-            ("silog_loss", dcfg.enable_silog_loss, dcfg.silog_loss_weight, self.silog_depth_loss),
-            ("ordinal_depth_loss", dcfg.enable_ordinal_depth_loss, dcfg.ordinal_depth_loss_weight,
-             self.ordinal_depth_loss),
-            ("affine_aligned_gradient_matching_loss", dcfg.enable_affine_aligned_gradient_matching_loss,
-             dcfg.affine_aligned_gradient_matching_loss_weight,
-             self.affine_aligned_gradient_matching_loss),
-            ("metric_depth_normal_loss", dcfg.enable_metric_depth_normal_loss, dcfg.metric_depth_normal_loss_weight,
-             self.metric_depth_normal_loss),
-            ("dn_splatter_normal_loss", dcfg.enable_dn_splatter_normal_loss, 1.0,
-             self.dn_splatter_normal_loss),
-        ]
-
-        for name, enabled, weight, module in depth_loss_items:
-            if enabled and weight > 0.0:
-                try:
-                    val = module(depth_map_bchw, depth_tensor_bchw, depth_mask_bchw)
-                    acc = acc + weight * val
-                    m[name] = val.item()
-                except TypeError:
-                    val = module(depth_map_bchw, depth_tensor_bchw, depth_mask_bchw, cam_data)
-                    acc = acc + weight * val
-                    m[name] = val.item()
-
-        return acc, m
-
-    def _compute_regularization(
-        self, model: BaseTrainableModel, step: int,
-    ) -> Tuple[torch.Tensor, dict]:
-        """Compute floater-prevention regularization losses."""
-        fcfg = self.floater_cfg
-        # Use zeros with dtype from model parameters (important for mixed precision)
-        acc = torch.zeros(1, device=self.device, dtype=model.opacities.dtype).squeeze()
-        m: dict = {}
-
-        if fcfg.enable_scale_reg:
-            v = losses.scale_regularization(
-                model.scales, weight=fcfg.scale_reg_weight,
-                scene_extent=float(self.scene_extent),
-            )
-            acc = acc + v
-            m["scale_reg_loss"] = v.item()
-        else:
-            m["scale_reg_loss"] = 0.0
-
-        if fcfg.enable_opacity_reg:
-            v = losses.opacity_regularization(model.opacities, weight=fcfg.opacity_reg_weight)
-            acc = acc + v
-            m["opacity_reg_loss"] = v.item()
-        else:
-            m["opacity_reg_loss"] = 0.0
-
-        if (fcfg.enable_opacity_entropy_reg
-                and step >= fcfg.opacity_entropy_reg_start_iter
-                and step <= fcfg.opacity_entropy_reg_end_iter):
-            v = losses.opacity_entropy_regularization(
-                model.opacities, weight=fcfg.opacity_entropy_reg_weight,
-            )
-            acc = acc + v
-            m["opacity_entropy_reg_loss"] = v.item()
-        else:
-            m["opacity_entropy_reg_loss"] = 0.0
-
-        return acc, m
-
-    # -- main entry-point ---------------------------------------------------
-
-    def compute(
-        self,
-        render_out: RenderOutput,
-        gt_image: torch.Tensor,
-        depth_tensor: Optional[torch.Tensor],
-        model: BaseTrainableModel,
-        cam_data: CameraData,
-        step: int,
-    ) -> LossResult:
-        """Compute all active losses for a single training step.
-
-        Returns:
-            LossResult with total loss tensor and per-component metrics dict.
-        """
-        dcfg = self.depth_cfg
-        render_perm = render_out.render_perm
-        gt_perm = render_out.gt_perm
-
-        # Core photometric losses
-        l1_loss = (render_out.render - gt_image).abs().mean()
-        ssim_loss = 1.0 - fused_ssim(render_perm, gt_perm)
-        lpips_loss = self._compute_lpips(render_perm, gt_perm)
-        psnr_value = self.psnr(render_perm, gt_perm)
-
-        loss = 0.8 * l1_loss + 0.2 * ssim_loss
-        if self.lpips is not None:
-            loss = loss + self.training_cfg.lpips_loss_weight * lpips_loss
-
-        metrics = {
-            "total_loss": 0.0,  # filled at end
-            "l1_loss": l1_loss.item(),
-            "ssim_loss": ssim_loss.item(),
-            "lpips_loss": lpips_loss.item(),
-            "psnr": psnr_value.item(),
-        }
-
-        # Depth losses
-        depth_acc, depth_m = self._compute_depth_losses(
-            render_out.depth_map_bchw, depth_tensor, render_out.depth_mask_bchw, cam_data
-        )
-        loss = loss + depth_acc
-        metrics.update(depth_m)
-
-        # Legacy depth loss (pearson + silog combined)
-        inv_rendered_depth = None
-        inv_prior_depth = None
-        depth_corr = torch.tensor(0.0, device=self.device)
-        d_loss = torch.tensor(0.0, device=self.device)
-
-        if dcfg.enable_depth_loss and depth_tensor is not None and step >= dcfg.depth_loss_start_iter:
-            if not depth_tensor.is_cuda:
-                depth_tensor = depth_tensor.to(self.device, non_blocking=True)
-            render_depth = torch.where(
-                torch.isfinite(render_out.depth_map),
-                render_out.depth_map,
-                torch.zeros_like(render_out.depth_map),
-            )
-            dt = depth_tensor
-            if dt.dim() == 2:
-                dt = dt.unsqueeze(0)
-            elif dt.dim() == 4 and dt.shape[-1] == 1:
-                dt = dt[..., 0]
-            try:
-                current_depth_corr = depth_corr.mean().item() if torch.isfinite(depth_corr).all() else 0.0
-                inv_rendered_depth = render_depth.detach()
-                inv_prior_depth = dt.detach()
-            except RuntimeError:
-                current_depth_corr = 0.0
-        else:
-            current_depth_corr = 0.0
-
-        metrics["depth_loss"] = d_loss.item()
-        metrics["depth_corr"] = current_depth_corr
-
-        # SAM loss (gradient-domain detail preservation)
-        if dcfg.sam_loss_weight > 0.0:
-            sam_loss = losses.gradient_loss(render_out.render, gt_image)
-            loss = loss + dcfg.sam_loss_weight * sam_loss
-            metrics["sam_loss"] = sam_loss.item()
-        else:
-            metrics["sam_loss"] = 0.0
-
-        # Regularization losses
-        reg_acc, reg_m = self._compute_regularization(model, step)
-        loss = loss + reg_acc
-        metrics.update(reg_m)
-
-        metrics["total_loss"] = loss.item()
-
-        return LossResult(
-            total_loss=loss,
-            metrics=metrics,
-            inv_rendered_depth=inv_rendered_depth,
-            inv_prior_depth=inv_prior_depth,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -969,8 +514,95 @@ class GaussianSplatTrainer:
         if self.training_cfg.preload:
             self.logger.info("[yellow]Preloading enabled:[/yellow] loading all images into RAM...")
             self.dataset.preload_all_data()
+        
+        # Image/depth cache (alternative to preload)
+        if self.training_cfg.enable_image_cache:
+            cache_dir = (
+                Path(self.training_cfg.image_cache_path)
+                if self.training_cfg.image_cache_path
+                else Path(self.output_cfg.output_dir) / "_image_cache"
+            )
+            cache_valid = self.dataset.check_cache_valid(cache_dir)
+            
+            if not cache_valid or self.training_cfg.rebuild_image_cache:
+                self.logger.info(
+                    "[cyan]Building image/depth cache[/cyan] (one-time setup)... "
+                    "[dim]this may take a few minutes[/dim]"
+                )
+                self.dataset.build_cache(cache_dir)
+            else:
+                self.logger.info("[cyan]Reusing existing image/depth cache[/cyan]")
+            
+            self.logger.info("[cyan]Loading cache into memory-mapped arrays...[/cyan]")
+            self.dataset.load_cache(cache_dir)
             
         self.scene_extent = self.dataset.scene_extent
+
+    def _reconcile_checkpoint_config(self) -> None:
+        """Load config from the checkpoint and apply it before any setup runs.
+
+        Checkpoint wins for all training-related groups so resuming Just Works
+        without re-specifying every flag.  CLI values that differ are logged as
+        warnings so the user can see what was overridden.
+
+        Groups inherited from checkpoint: model, training, densification,
+        floater_prevention, lod, sh, depth, learning_rates.
+        Groups always taken from CLI: required (dataset paths), output, runtime,
+        checkpoint, viewer, tensorboard, export.
+        """
+        if self.logger is None:
+            raise RuntimeError("Logger must be initialized before config reconciliation")
+        if self.checkpoint_cfg.resume_from is None:
+            return
+
+        checkpoint_path = Path(self.checkpoint_cfg.resume_from)
+        if not checkpoint_path.exists():
+            return  # Will be caught properly in _setup_model
+
+        self.logger.info("[cyan]📋 Loading config from checkpoint...[/cyan]")
+        peek = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
+        saved_config = peek.get("config")
+        del peek
+
+        if saved_config is None or not isinstance(saved_config, dict):
+            self.logger.warning(
+                "[yellow]⚠ Checkpoint has no saved config — using CLI values for all settings.[/yellow]"
+            )
+            return
+
+        # Groups where checkpoint is authoritative (all training-related).
+        enforce_groups = {
+            "model": self.config.model,
+            "training": self.config.training,
+            "densification": self.config.densification,
+            "floater_prevention": self.config.floater_prevention,
+            "lod": self.config.lod,
+            "sh": self.config.sh,
+            "depth": self.config.depth,
+            "learning_rates": self.config.learning_rates,
+        }
+
+        def _apply(group_name: str, saved: dict, obj) -> None:
+            for key, saved_val in saved.items():
+                if not hasattr(obj, key):
+                    continue
+                current_val = getattr(obj, key)
+                if isinstance(saved_val, dict):
+                    nested = getattr(obj, key, None)
+                    if nested is not None and hasattr(nested, "__dataclass_fields__"):
+                        _apply(f"{group_name}.{key}", saved_val, nested)
+                    continue
+                if current_val == saved_val:
+                    continue
+                self.logger.warning(
+                    f"[yellow]⚠ Checkpoint overrides CLI:[/yellow] "
+                    f"{group_name}.{key}: CLI={current_val!r} → {saved_val!r}"
+                )
+                setattr(obj, key, saved_val)
+
+        for group_name, obj in enforce_groups.items():
+            if group_name in saved_config and isinstance(saved_config[group_name], dict):
+                _apply(group_name, saved_config[group_name], obj)
 
     def _setup_model(self) -> None:
         if self.logger is None:
@@ -1173,7 +805,7 @@ class GaussianSplatTrainer:
         self.optimizers = self.model.create_optimizers(
             lr_means=lr.lr_means, lr_scales=lr.lr_scales,
             lr_quats=lr.lr_quats, lr_opacities=lr.lr_opacities,
-            lr_sh=lr.lr_sh, lr_semantics=lr.lr_semantics,
+            lr_sh=lr.lr_sh,
             means_lr_multiplier=5.0,
         )
         self.schedulers = self.model.create_schedulers(
@@ -1217,11 +849,10 @@ class GaussianSplatTrainer:
             packed=False,
             absgrad=self.config.densification.absgrad,
         )
-        self.loss_computer = LossComputer(
+        self.loss_computer = losses.LossComputer(
             self.training_cfg, self.depth_cfg, self.floater_cfg,
-            self.device, self.VERBOSITY, self.logger,
+            self.device, self.VERBOSITY, self.scene_extent, self.logger,
         )
-        self.loss_computer.scene_extent = self.scene_extent
 
         self.training_logger = TrainingLogger(
             tb_logger=self.tb_logger,
@@ -1481,12 +1112,12 @@ class GaussianSplatTrainer:
             raise RuntimeError("Logger is not initialized")
 
         cam, gt_image, depth_tensor = self._next_batch()
-        torch.cuda.synchronize()
+        # OPTIMIZATION: Removed torch.cuda.synchronize() - blocks CPU unnecessarily
 
         target_h = int(cam["height"])
         target_w = int(cam["width"])
         gt_image = _prepare_gt_image(
-            gt_image.detach(),
+            gt_image,  # OPTIMIZATION: Removed .detach() - already detached from dataloader
             self.device,
             target_h=target_h,
             target_w=target_w,
@@ -1517,7 +1148,7 @@ class GaussianSplatTrainer:
                     f"mean={dc_rgb.mean().item():.4f}"
                 )
 
-            params = self.model.get_params_dict()
+            params = self.model.get_params_dict_cached()
             optimizers_dict = self.model.get_optimizers_dict(self.optimizers)
             self.strategy.step_pre_backward(
                 params, optimizers_dict, self.strategy_state, step, render_out.meta,
@@ -1673,9 +1304,6 @@ class GaussianSplatTrainer:
         optimizers_state = {name: opt.state_dict() for name, opt in self.optimizers.all_optimizers()}
         extra_optimizers_state = self.model.get_extra_optimizer_states()
 
-        # Convert TrainConfig to dict for serialization
-        train_config_dict = asdict(self.training_cfg)
-
         torch.save({
             "iteration": step,
             "model_state_dict": self.model.state_dict(),
@@ -1683,7 +1311,7 @@ class GaussianSplatTrainer:
             "extra_optimizers_state_dict": extra_optimizers_state,
             "loss": loss,
             "tensorboard_run_name": tb_run_name,
-            "train_config": train_config_dict,
+            "config": asdict(self.config),
         }, checkpoint_path)
         if self.VERBOSITY >= 1:
             self.logger.info(f"[green]💾 Checkpoint saved:[/green] [dim]{checkpoint_path.name}[/dim]")
@@ -1698,6 +1326,7 @@ class GaussianSplatTrainer:
         """
         # Setup
         self._setup_logger()
+        self._reconcile_checkpoint_config()
         self._setup_dataset()
         self._setup_model()
         self._setup_strategy()
@@ -1763,8 +1392,6 @@ class GaussianSplatTrainer:
             )
 
         final_path = output_path / "model_final.pt"
-        # Convert TrainConfig to dict for serialization
-        train_config_dict = asdict(self.training_cfg)
 
         torch.save({
             "iteration": self.training_cfg.iterations,
@@ -1775,7 +1402,7 @@ class GaussianSplatTrainer:
             "tensorboard_run_name": (
                 self.tb_logger.run_name if (self.tensorboard_cfg.tensorboard and self.tb_logger is not None) else None
             ),
-            "train_config": train_config_dict,
+            "config": asdict(self.config),
         }, final_path)
 
         # Display summary

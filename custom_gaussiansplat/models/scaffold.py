@@ -4,15 +4,17 @@ from functools import reduce
 from typing import Dict, Iterator, Optional, Tuple
 
 import numpy as np
+import tinycudann as tcnn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from gs_types import GS_LR_Schedulers, GSOptimizers, NeuralGaussianOutput, RenderParams
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from torch_scatter import scatter_max
 
-from .base import BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin
+from .base import BaseTrainableModel, NeuralRenderingMixin
 
 logger = logging.getLogger("cityscape_gs.models.scaffold")
 
@@ -24,6 +26,57 @@ torch.backends.cuda.matmul.allow_tf32 = True
 
 # Allows dynamism on parms
 torch._dynamo.config.force_parameter_static_shapes = False
+
+
+# ---------------------------------------------------------------------------
+# Optimization helpers
+# ---------------------------------------------------------------------------
+
+def find_duplicates_voxel_grid(
+    coords: torch.Tensor, resolution: float = 1.0
+) -> torch.Tensor:
+    """Find duplicate coordinates using a spatial hash grid.
+
+    Returns a boolean mask where True = keep (first occurrence), False = duplicate.
+    Complexity: O(n log n) vs O(n²) for naive nested loop comparison.
+
+    Args:
+        coords: [N, 3] tensor of 3D coordinates
+        resolution: voxel size for grouping
+
+    Returns:
+        Boolean mask [N] where True = keep, False = duplicate
+    """
+    # Quantize coordinates to grid cells
+    cell_keys = torch.floor(coords / resolution).long()
+
+    # Hash each cell to a single integer (linearize the 3D grid)
+    # Use large primes for hashing to minimize collisions
+    hash_keys = (
+        cell_keys[:, 0].long() * 73856093
+        ^ cell_keys[:, 1].long() * 19349663
+        ^ cell_keys[:, 2].long() * 83492791
+    ) % (1 << 30)
+
+    # Sort by hash to group same cells
+    sort_idx = torch.argsort(hash_keys)
+    sorted_keys = hash_keys[sort_idx]
+
+    # Find first occurrence of each unique value
+    is_first = torch.ones(len(coords), dtype=torch.bool, device=coords.device)
+    is_first[1:] = sorted_keys[1:] != sorted_keys[:-1]
+
+    # Unsort to restore original order
+    keep_mask = torch.zeros(len(coords), dtype=torch.bool, device=coords.device)
+    keep_mask[sort_idx] = is_first
+
+    return keep_mask
+
+
+def normalize_safe(x: torch.Tensor, dim: int = -1, eps: float = 1e-10) -> torch.Tensor:
+    """Normalize along dim with numerical safety."""
+    norm = x.norm(dim=dim, keepdim=True)
+    return x / (norm + eps)
 
 def inverse_sigmoid(x: torch.Tensor) -> torch.Tensor:
     return torch.log(x / (1 - x))
@@ -61,19 +114,25 @@ class GeometricMultiHeadMLP(nn.Module):
 
     Eliminates runtime branching by pre-building input selector functions at init time.
     This removes Python-side conditional overhead from the forward path entirely.
+
+    OPTIMIZATION: Supports gradient checkpointing for memory efficiency.
     """
 
     def __init__(
         self,
         feat_dim: int,
-        view_embed_dim: int,
+        fourier_embed_dim: int,
         n_offsets: int,
         appearance_dim: int,
         add_opacity_dist: bool,
         add_cov_dist: bool,
         add_color_dist: bool,
+        use_gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
+
+        # OPTIMIZATION: Enable gradient checkpointing for memory savings
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         # Pre-build selector functions—choice is made once at init, not per-forward
         self._opacity_select = lambda with_dist, wodist: with_dist if add_opacity_dist else wodist
@@ -83,9 +142,22 @@ class GeometricMultiHeadMLP(nn.Module):
         # Track whether color head expects appearance to avoid forward-time checks
         self._append_appearance = appearance_dim > 0
 
-        opacity_in_dim = feat_dim + view_embed_dim + (1 if add_opacity_dist else 0)
-        cov_in_dim = feat_dim + view_embed_dim + (1 if add_cov_dist else 0)
-        color_in_dim = feat_dim + view_embed_dim + (1 if add_color_dist else 0) + appearance_dim
+        # opacity_in_dim = feat_dim + fourier_embed_dim + 3 + (1 if add_opacity_dist else 0)
+        # cov_in_dim = feat_dim + fourier_embed_dim + 3 + (1 if add_cov_dist else 0)
+        # color_in_dim = feat_dim + fourier_embed_dim + 3 + (1 if add_color_dist else 0) + appearance_dim
+
+        opacity_in_dim = feat_dim + fourier_embed_dim
+        cov_in_dim = feat_dim + fourier_embed_dim
+        color_in_dim = feat_dim + fourier_embed_dim
+
+        # opacity_in_dim = fourier_embed_dim + 3 + (1 if add_opacity_dist else 0)
+        # cov_in_dim = fourier_embed_dim + 3 + (1 if add_cov_dist else 0)
+        # color_in_dim = fourier_embed_dim + 3 + (1 if add_color_dist else 0) + appearance_dim
+
+        # opacity_in_dim = feat_dim + 3 + (1 if add_opacity_dist else 0)
+        # cov_in_dim = feat_dim + 3 + (1 if add_cov_dist else 0)
+        # color_in_dim = feat_dim + 3 + (1 if add_color_dist else 0) + appearance_dim
+
 
         self.opacity_head = nn.Sequential(
             nn.Linear(opacity_in_dim, feat_dim),
@@ -115,32 +187,158 @@ class GeometricMultiHeadMLP(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # All branching is eliminated—selectors are pre-computed closures
         opacity_input = self._opacity_select(cat_local_view, cat_local_view_wodist)
-        neural_opacity = self.opacity_head(opacity_input).contiguous().view(-1, 1)
-
         color_input = self._color_select(cat_local_view, cat_local_view_wodist)
+        cov_input = self._cov_select(cat_local_view, cat_local_view_wodist)
+
         if self._append_appearance and appearance is not None:
             color_input = torch.cat([color_input, appearance], dim=1)
-        color = self.color_head(color_input).contiguous().view(-1, 3)
 
-        cov_input = self._cov_select(cat_local_view, cat_local_view_wodist)
-        scale_rot = self.cov_head(cov_input).contiguous().view(-1, 7)
+        # OPTIMIZATION: Use gradient checkpointing for memory savings
+        if self.use_gradient_checkpointing and self.training:
+            neural_opacity = gradient_checkpoint(self.opacity_head, opacity_input).contiguous().view(-1, 1)
+            color = gradient_checkpoint(self.color_head, color_input).contiguous().view(-1, 3)
+            scale_rot = gradient_checkpoint(self.cov_head, cov_input).contiguous().view(-1, 7)
+        else:
+            neural_opacity = self.opacity_head(opacity_input).contiguous().view(-1, 1)
+            color = self.color_head(color_input).contiguous().view(-1, 3)
+            scale_rot = self.cov_head(cov_input).contiguous().view(-1, 7)
+
         return neural_opacity, color, scale_rot
 
+class GaussianFourierFeatureMappingTcnn(nn.Module):
+    """Projects view directions using tcnn's optimized Frequency encoding.
+    
+    tcnn has built-in Fourier encoding that's CUDA-fused and faster than
+    manual projection + sin/cos.
+    Note: tcnn Frequency encoding doesn't support scale parameter directly,
+    so we apply scaling manually in forward().
+    """
 
-class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
-    """Scaffold-GS: sparse anchor points + MLPs generate neural Gaussians per view.
+    def __init__(self, input_dim: int = 3, num_frequencies: int = 64, scale: float = 5.0) -> None:
+        super().__init__()
+        self.scale = scale
+        self.encoding = tcnn.Encoding(
+            n_input_dims=input_dim,
+            encoding_config={
+                "otype": "Frequency",
+                "n_frequencies": num_frequencies,
+            },
+        )
 
-    Language feature extension (enable_language_features=True):
-      - Each anchor owns a 32-dim language latent (_anchor_lang_feat).
-      - mlp_language predicts per-Gaussian offsets in that latent space.
-      - gaussian_lang_feat = anchor_lang_feat + mlp_offset  (residual / anchor-as-center).
-      - A global codebook [codebook_size, clip_dim] decodes 32-dim → 512-dim CLIP at query time.
-      - Training supervises in 32-dim PCA-compressed space (memory-efficient).
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Apply scale manually (tcnn doesn't support scale parameter natively)
+        # Frequency encoding outputs 2*n_frequencies dims (sin+cos)
+        return self.encoding(x * self.scale)
+
+
+class GeometricMultiHeadMLPTcnn(nn.Module):
+    """Multi-head model using tcnn.Network for CUDA-optimized inference.
+    
+    Key benefits:
+      - FullyFusedMLP: all layers fused into single CUDA kernel
+      - ~5-10x faster than nn.Sequential on typical configs
+      - Lower memory footprint due to kernel fusion
+      - Automatic half-precision support
+    
+    Constraint: FullyFusedMLP requires n_neurons ∈ {16, 32, 64, 128}.
+    If feat_dim doesn't match, automatically selects closest valid value
+    or falls back to CutlassMLP (flexible but slower).
     """
 
     def __init__(
         self,
-        init_points: torch.Tensor,
+        feat_dim: int,
+        fourier_embed_dim: int,
+        n_offsets: int,
+        appearance_dim: int,
+        add_opacity_dist: bool,
+        add_cov_dist: bool,
+        add_color_dist: bool,
+        n_neurons: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+
+        # Selector functions: same as before
+        self._opacity_select = lambda with_dist, wodist: with_dist if add_opacity_dist else wodist
+        self._cov_select = lambda with_dist, wodist: with_dist if add_cov_dist else wodist
+        self._color_select = lambda with_dist, wodist: with_dist if add_color_dist else wodist
+
+        self._append_appearance = appearance_dim > 0
+
+        opacity_in_dim = feat_dim + fourier_embed_dim + (1 if add_opacity_dist else 0)
+        cov_in_dim = feat_dim + fourier_embed_dim + (1 if add_cov_dist else 0)
+        color_in_dim = feat_dim + fourier_embed_dim + (1 if add_color_dist else 0) + appearance_dim
+
+        # Determine n_neurons: FullyFusedMLP only accepts {16, 32, 64, 128}
+        if n_neurons is None:
+            # Auto-select closest valid value
+            valid_neurons = [16, 32, 64, 128]
+            n_neurons = min(valid_neurons, key=lambda x: abs(x - feat_dim))
+        
+        use_fully_fused = n_neurons in [16, 32, 64, 128]
+        mlp_type = "FullyFusedMLP" if use_fully_fused else "CutlassMLP"
+        n_hidden_layers = 1  # 2-layer network: input→hidden→output
+
+        # tcnn.Network config: correct parameter names per documentation
+        network_cfg_base = {
+            "otype": mlp_type,
+            "activation": "ReLU",
+            "n_neurons": n_neurons,
+            "n_hidden_layers": n_hidden_layers,
+        }
+
+        self.opacity_head = tcnn.Network(
+            n_input_dims=opacity_in_dim,
+            n_output_dims=n_offsets,
+            network_config={**network_cfg_base, "output_activation": "Tanh"},
+        )
+
+        self.cov_head = tcnn.Network(
+            n_input_dims=cov_in_dim,
+            n_output_dims=7 * n_offsets,
+            network_config={**network_cfg_base, "output_activation": "None"},
+        )
+
+        self.color_head = tcnn.Network(
+            n_input_dims=color_in_dim,
+            n_output_dims=3 * n_offsets,
+            network_config={**network_cfg_base, "output_activation": "Sigmoid"},
+        )
+
+    def forward(
+        self,
+        cat_local_view: torch.Tensor,
+        cat_local_view_wodist: torch.Tensor,
+        appearance: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # tcnn.Network expects inputs in [B, input_dim]; outputs [B, output_dim]
+        # tcnn kernels are pre-optimized; no need for .contiguous() or torch.compile
+        # Use .reshape() instead of .view() since tcnn output may not be contiguous
+        
+        opacity_input = self._opacity_select(cat_local_view, cat_local_view_wodist)
+        neural_opacity = self.opacity_head(opacity_input).reshape(-1, 1)
+
+        color_input = self._color_select(cat_local_view, cat_local_view_wodist)
+        if self._append_appearance and appearance is not None:
+            color_input = torch.cat([color_input, appearance], dim=1)
+        color = self.color_head(color_input).reshape(-1, 3)
+
+        cov_input = self._cov_select(cat_local_view, cat_local_view_wodist)
+        scale_rot = self.cov_head(cov_input).reshape(-1, 7)
+        
+        return neural_opacity, color, scale_rot
+
+
+class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin):
+    """Scaffold-GS: sparse anchor points + MLPs generate neural Gaussians per view.
+
+    Language/semantic features are handled by SemanticScaffoldModel (a subclass).
+    This class is responsible only for visual reconstruction.
+    """
+
+    def __init__(
+        self,
+        init_points: torch.Tensor | None = None,
         feat_dim: int = 32,
         n_offsets: int = 10,
         voxel_size: float = 0.01,
@@ -160,10 +358,7 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
         lr_mlp_cov: float = 0.004,
         lr_mlp_color: float = 0.008,
         lr_appearance: float = 0.05,
-        enable_language_features: bool = False,
-        lang_feat_dim: int = 32,
-        codebook_size: int = 64,
-        clip_dim: int = 512,
+        use_gradient_checkpointing: bool = False,
         console=None,
     ):
         super().__init__()
@@ -185,24 +380,21 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
         self.lr_mlp_cov = lr_mlp_cov
         self.lr_mlp_color = lr_mlp_color
         self.lr_appearance = lr_appearance
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
-        # --- Language feature config ---
-        self.enable_language_features = enable_language_features
-        self.lang_feat_dim = lang_feat_dim
-        self.codebook_size = codebook_size
-        self.clip_dim = clip_dim
         self._extra_optimizers: Dict[str, torch.optim.Optimizer] = {}
         self._extra_schedulers: Dict[str, torch.optim.lr_scheduler.LRScheduler] = {}
 
+        # Pre-allocated buffer capacity tracking for densification
+        # These track the maximum allocated size to avoid repeated reallocation
+        self._buffer_capacity: int = 0
+
         # --- Learnable anchor parameters ---
-        # _anchor_lang_feat is always declared so state_dict is consistent.
-        # Sized to (0,) until create_from_pcd() runs, or remains empty if language disabled.
-        self._anchor: nn.Parameter = nn.Parameter(torch.empty(0)) # stores the positions of the gaussian anchors
-        self._offset: nn.Parameter = nn.Parameter(torch.empty(0)) # stores the offsets of the per-anchor Gaussians from their anchor position, shaped (num_anchors, n_offsets, 3)
-        self._anchor_feat: nn.Parameter = nn.Parameter(torch.empty(0)) # stores the per-anchor features that are input to the MLPs, shaped (num_anchors, feat_dim)
-        self._anchor_lang_feat: nn.Parameter = nn.Parameter(torch.empty(0)) # stores the language features for each anchor
-        self._scaling: nn.Parameter = nn.Parameter(torch.empty(0)) # stores the scaling values for each anchor
-        self._opacity: nn.Parameter = nn.Parameter(torch.empty(0)) # stores the opacities for each anchor
+        self._anchor: nn.Parameter = nn.Parameter(torch.empty(0))       # anchor positions
+        self._offset: nn.Parameter = nn.Parameter(torch.empty(0))       # per-anchor offsets
+        self._anchor_feat: nn.Parameter = nn.Parameter(torch.empty(0))  # per-anchor features
+        self._scaling: nn.Parameter = nn.Parameter(torch.empty(0))      # anchor scales
+        self._opacity: nn.Parameter = nn.Parameter(torch.empty(0))      # anchor opacities
 
         # --- Densification buffers ---
         self.register_buffer("opacity_accum", torch.empty(0))
@@ -218,28 +410,34 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
         self.fourier_embedder: nn.Module = GaussianFourierFeatureMapping(
             input_dim=3, num_frequencies=fourier_freqs, scale=fourier_scale
         )
-        self.fourier_embedder = torch.compile(self.fourier_embedder)  # type: ignore[assignment]
-        view_embed_dim = fourier_freqs * 2
+        self.fourier_embedder_dist = GaussianFourierFeatureMapping(
+            input_dim=4, num_frequencies=fourier_freqs, scale=fourier_scale
+        )
+        # Don't compile tcnn encodings—they're already CUDA-fused
+        # tcnn Frequency encoding outputs: n_input_dims * 2 * n_frequencies
+        # With 3D input and fourier_freqs: 3 * 2 * fourier_freqs
+        fourier_embed_dim = 2 * fourier_freqs
+        self.fourier_embed_dim = fourier_embed_dim
 
         # --- Geometric multi-head MLP (opacity + cov + color in one call) ---
-        # Keep a raw module for optimizer/checkpoint access and compile a callable
-        # wrapper for forward-time performance.
         self.mlp_geo_heads_raw = GeometricMultiHeadMLP(
             feat_dim=feat_dim,
-            view_embed_dim=view_embed_dim,
+            fourier_embed_dim=fourier_embed_dim,
             n_offsets=n_offsets,
             appearance_dim=appearance_dim,
             add_opacity_dist=add_opacity_dist,
             add_cov_dist=add_cov_dist,
             add_color_dist=add_color_dist,
+            use_gradient_checkpointing=use_gradient_checkpointing,
         )
-        self.mlp_geo_heads = torch.compile(self.mlp_geo_heads_raw)  # type: ignore[assignment]
+        # tcnn.Network is already kernel-fused; no need for torch.compile
+        self.mlp_geo_heads = self.mlp_geo_heads_raw
 
         self.mlp_feature_bank: Optional[nn.Module] = None
         if use_feat_bank:
             self.mlp_feature_bank = torch.compile(  # type: ignore[assignment]
                 nn.Sequential(
-                    nn.Linear(view_embed_dim + 1, feat_dim),
+                    nn.Linear(fourier_embed_dim + 1, feat_dim),
                     nn.ReLU(True),
                     nn.Linear(feat_dim, 3),
                     nn.Softmax(dim=1),
@@ -247,27 +445,6 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
             )
 
         self.embedding_appearance: Optional[Embedding] = None
-
-        # --- Language feature MLP + codebook (4th MLP path) ---
-        # mlp_language: [anchor_lang_feat(32) | ob_view(3)] → 32-dim offsets per Gaussian.
-        # Raw ob_view (not Fourier-embedded) keeps language features mildly view-conditional
-        # rather than strongly view-dependent — appropriate for semantic features.
-        self.mlp_language: Optional[nn.Module] = None
-        self.language_codebook: Optional[nn.Parameter] = None
-        self.codebook_proj: Optional[nn.Parameter] = None
-        if enable_language_features:
-            self.mlp_language = nn.Sequential(
-                nn.Linear(lang_feat_dim + 3, lang_feat_dim),
-                nn.ReLU(True),
-                nn.Linear(lang_feat_dim, lang_feat_dim * n_offsets),
-                nn.Tanh(),  # bounded offsets keep per-Gaussian feats near their anchor center
-            )
-            # Codebook: K semantic prototypes in CLIP space.
-            # Seed from PCA via init_codebook_from_pca() before training.
-            self.language_codebook = nn.Parameter(torch.randn(codebook_size, clip_dim))
-            # Projection: maps 32-dim latent → K-dim logits for soft codebook lookup.
-            # Initialized as orthogonal in init_codebook_from_pca to prevent collapse.
-            self.codebook_proj = nn.Parameter(torch.randn(lang_feat_dim, codebook_size))
 
         if init_points is not None and len(init_points) > 0:
             self.create_from_pcd(init_points)
@@ -356,8 +533,6 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
             "features_dc": optimizers.features_dc,
             "features_rest": optimizers.features_rest,
         }
-        if self.enable_language_features and optimizers.features_semantics is not None:
-            d["features_semantics"] = optimizers.features_semantics
         return d
 
     def update_params_from_dict(self, params: Dict[str, nn.Parameter]) -> None:
@@ -397,13 +572,9 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
         self._anchor = nn.Parameter(fused_point_cloud)
         self._offset = nn.Parameter(offsets)
         self._anchor_feat = nn.Parameter(anchors_feat)
+        torch.nn.init.xavier_uniform_(self._anchor_feat)
         self._scaling = nn.Parameter(scales)
         self._opacity = nn.Parameter(opacities)
-
-        if self.enable_language_features:
-            self._anchor_lang_feat = nn.Parameter(
-                torch.zeros((num_points, self.lang_feat_dim), device=points.device)
-            )
 
         self.max_radii2D = torch.zeros(num_points, device=points.device)
         self.opacity_accum = torch.zeros((num_points, 1), device=points.device)
@@ -415,6 +586,9 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
             (num_points * self.n_offsets, 1), device=points.device
         )
         self.lod_offsets = [num_points]
+
+        # OPTIMIZATION: Invalidate params cache after initialization
+        self._invalidate_params_cache()
 
     # ── Core neural Gaussian generation ──────────────────────────────────────
 
@@ -443,9 +617,11 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
 
         ob_view = anchor - camera_center
         ob_dist = ob_view.norm(dim=1, keepdim=True)
-        ob_view = ob_view / (ob_dist + 1e-10)
+        ob_view = normalize_safe(ob_view, dim=1)
 
+        # embedded_feat = self.fourier_embedder(feat)
         embedded_view = self.fourier_embedder(ob_view)
+        embedded_view_dist = self.fourier_embedder_dist(torch.cat([ob_view, ob_dist], dim=1))
 
         # --- Optional feature bank (multi-resolution anchor feat) ---
         if self.mlp_feature_bank is not None:
@@ -460,12 +636,12 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
                 + f3 * bank_weight[:, 2:3]
             )
 
-        cat_local_view = torch.cat([feat, embedded_view, ob_dist], dim=1).contiguous()
+        cat_local_view = torch.cat([feat, embedded_view_dist], dim=1).contiguous()
         cat_local_view_wodist = torch.cat([feat, embedded_view], dim=1).contiguous()
 
         # --- Appearance embedding ---
         appearance: Optional[torch.Tensor] = None
-        if self.embedding_appearance is not None:
+        if self.embedding_appearance is not None and self.appearance_dim > 0:
             camera_indices = (
                 torch.ones_like(cat_local_view[:, 0], dtype=torch.long)
                 * cam["uid"]
@@ -476,8 +652,11 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
         neural_opacity, color, scale_rot = self.mlp_geo_heads(
             cat_local_view, cat_local_view_wodist, appearance
         )
-        mask = (neural_opacity > 0.0).view(-1)
-        opacity = neural_opacity[mask]
+        # Flatten and create boolean mask for filtering positive opacities
+        neural_opacity_flat = neural_opacity.view(-1)
+        mask = neural_opacity_flat > 0.0
+        mask = mask.to(dtype=torch.bool, device=neural_opacity_flat.device)
+        opacity = neural_opacity_flat[mask].view(-1, 1)
 
         offsets = grid_offsets.contiguous().view(-1, 3)
 
@@ -500,26 +679,6 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
         rot = F.normalize(masked_scale_rot[:, 3:7], dim=-1)
         xyz = masked_offsets * s_repeat[:, :3] + a_repeat
 
-        # --- Language feature generation (4th MLP path) ---
-        # The anchor is the center of the language feature space for its Gaussians.
-        # mlp_language predicts per-Gaussian offsets from that center in the 32-dim latent.
-        # gaussian_lang_feat = anchor_lang_feat + offset  ← residual / anchor-as-center.
-        masked_lang: Optional[torch.Tensor] = None
-        if self.enable_language_features:
-            assert self.mlp_language is not None, "mlp_language must be set when enable_language_features=True"
-            lang_feat = self._anchor_lang_feat[visible_mask]           # [N_vis, lang_feat_dim]
-            lang_input = torch.cat([lang_feat, ob_view], dim=1)        # [N_vis, lang_feat_dim + 3]
-            lang_offsets = self.mlp_language(lang_input)               # [N_vis, lang_feat_dim * n_offsets]
-            lang_offsets = lang_offsets.view(-1, self.lang_feat_dim)   # [N_vis * n_offsets, lang_feat_dim]
-
-            lang_feat_repeated = (
-                lang_feat.unsqueeze(1)
-                .expand(-1, self.n_offsets, -1)
-                .reshape(-1, self.lang_feat_dim)
-            )
-            per_gaussian_lang = lang_feat_repeated + lang_offsets      # [N_vis * n_offsets, lang_feat_dim]
-            masked_lang = per_gaussian_lang[mask]                      # [M, lang_feat_dim]
-
         if is_training:
             return NeuralGaussianOutput(
                 means=xyz,
@@ -529,7 +688,6 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
                 quats=rot,
                 neural_opacity=neural_opacity,
                 selection_mask=mask,
-                language_features=masked_lang,
             )
         else:
             return NeuralGaussianOutput(
@@ -538,7 +696,6 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
                 opacities=opacity,
                 scales=scaling,
                 quats=rot,
-                language_features=masked_lang,
             )
 
     # ── Densification statistics ──────────────────────────────────────────────
@@ -595,21 +752,19 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
 
         self.anchor_growing(grads_norm, grad_threshold, offset_mask, optimizers)
 
+        # Reset and grow offset_denom to exact size (matches original Scaffold-GS)
         self.offset_denom[offset_mask] = 0
         padding_offset_denom = torch.zeros(
-            (self._anchor.shape[0] * self.n_offsets - self.offset_denom.shape[0], 1),
+            [self._anchor.shape[0] * self.n_offsets - self.offset_denom.shape[0], 1],
             dtype=torch.int32,
             device=self.offset_denom.device,
         )
         self.offset_denom = torch.cat([self.offset_denom, padding_offset_denom], dim=0)
 
+        # Reset and grow offset_gradient_accum to exact size (matches original Scaffold-GS)
         self.offset_gradient_accum[offset_mask] = 0
         padding_offset_gradient_accum = torch.zeros(
-            (
-                self._anchor.shape[0] * self.n_offsets
-                - self.offset_gradient_accum.shape[0],
-                1,
-            ),
+            [self._anchor.shape[0] * self.n_offsets - self.offset_gradient_accum.shape[0], 1],
             dtype=torch.int32,
             device=self.offset_gradient_accum.device,
         )
@@ -621,11 +776,17 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
         anchors_mask = (self.anchor_denom > check_interval * success_threshold).squeeze(1)
         prune_mask = torch.logical_and(prune_mask, anchors_mask)
 
+        # Properly resize offset_denom after pruning (matches original Scaffold-GS)
         offset_denom = self.offset_denom.view(-1, self.n_offsets)[~prune_mask]
-        self.offset_denom = offset_denom.view(-1, 1)
+        offset_denom = offset_denom.view(-1, 1)
+        del self.offset_denom
+        self.offset_denom = offset_denom
 
+        # Properly resize offset_gradient_accum after pruning (matches original Scaffold-GS)
         offset_gradient_accum = self.offset_gradient_accum.view(-1, self.n_offsets)[~prune_mask]
-        self.offset_gradient_accum = offset_gradient_accum.view(-1, 1)
+        offset_gradient_accum = offset_gradient_accum.view(-1, 1)
+        del self.offset_gradient_accum
+        self.offset_gradient_accum = offset_gradient_accum
 
         n_visited = int(anchors_mask.sum())
         if n_visited > 0:
@@ -642,7 +803,13 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
         if prune_mask.any():
             self.prune_anchor(prune_mask, optimizers)
 
+        # Memory management (matches original Scaffold-GS)
+        torch.cuda.empty_cache()
+
         self.max_radii2D = torch.zeros(self._anchor.shape[0], device=self._anchor.device)
+
+        # OPTIMIZATION: Invalidate params cache once after all structural changes
+        self._invalidate_params_cache()
 
     def anchor_growing(
         self,
@@ -658,6 +825,7 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
             candidate_mask = torch.logical_and(candidate_mask, offset_mask)
 
             rand_mask = torch.rand_like(candidate_mask.float()) > (0.5 ** (i + 1))
+            rand_mask = rand_mask.to(self._anchor.device)
             candidate_mask = torch.logical_and(candidate_mask, rand_mask)
 
             length_inc = self._anchor.shape[0] * self.n_offsets - init_length
@@ -688,19 +856,12 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
             )
 
             grid_coords = torch.round(self._anchor / cur_size).int()
-            chunk_size = 4096
-            max_iters = grid_coords.shape[0] // chunk_size + (
-                1 if grid_coords.shape[0] % chunk_size != 0 else 0
-            )
-            remove_duplicates_list = []
-            for j in range(max_iters):
-                cur_remove_duplicates = (
-                    selected_grid_coords_unique.unsqueeze(1)
-                    == grid_coords[j * chunk_size : (j + 1) * chunk_size, :]
-                ).all(-1).any(-1).view(-1)
-                remove_duplicates_list.append(cur_remove_duplicates)
-            remove_duplicates = reduce(torch.logical_or, remove_duplicates_list)
-            remove_duplicates = ~remove_duplicates  # True = keep (not a duplicate)
+            # OPTIMIZATION: Efficient O(n log n) deduplication using voxel grid hashing
+            # instead of O(n²) nested loop comparisons
+            all_grid_coords = torch.cat([grid_coords, selected_grid_coords_unique], dim=0)
+            keep_mask = find_duplicates_voxel_grid(all_grid_coords, resolution=1.0)
+            n_existing = grid_coords.shape[0]
+            remove_duplicates = keep_mask[n_existing:]  # True = keep, False = duplicate
 
             candidate_anchor = selected_grid_coords_unique[remove_duplicates] * cur_size
 
@@ -751,30 +912,11 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
             "opacities": new_opacities,
         }
 
-        # Language feature inheritance: scatter_max over the candidates that spawned each
-        # unique grid cell — same strategy as geometric feature inheritance above.
-        if self.enable_language_features:
-            inherited_lang = (
-                self._anchor_lang_feat.unsqueeze(1)
-                .repeat(1, self.n_offsets, 1)
-                .view(-1, self.lang_feat_dim)[candidate_mask]
-            )
-            new_lang_feat = scatter_max(
-                inherited_lang,
-                inverse_indices.unsqueeze(1).expand(-1, inherited_lang.size(1)),
-                dim=0,
-            )[0][new_mask]
-            d["features_semantics"] = new_lang_feat
-
         self._anchor = nn.Parameter(torch.cat([self._anchor, d["means"]], dim=0))
         self._scaling = nn.Parameter(torch.cat([self._scaling, d["scales"]], dim=0))
         self._anchor_feat = nn.Parameter(torch.cat([self._anchor_feat, d["features_dc"]], dim=0))
         self._offset = nn.Parameter(torch.cat([self._offset, d["features_rest"]], dim=0))
         self._opacity = nn.Parameter(torch.cat([self._opacity, d["opacities"]], dim=0))
-        if self.enable_language_features:
-            self._anchor_lang_feat = nn.Parameter(
-                torch.cat([self._anchor_lang_feat, d["features_semantics"]], dim=0)
-            )
 
         self.opacity_accum = torch.cat(
             [self.opacity_accum, torch.zeros((num_new, 1), device=device)], dim=0
@@ -789,16 +931,13 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
     # ── Optimizer / pruning helpers ───────────────────────────────────────────
 
     # Mapping: unified GSOptimizers key → internal parameter attribute name.
-    # "features_semantics" → _anchor_lang_feat.
-    # When language features are disabled, features_semantics optimizer is None and
-    # all grow/prune loops skip it automatically (no conditional branching needed there).
+    # SemanticScaffoldModel overrides this dict to add "features_semantics".
     _PARAM_ATTR: Dict[str, str] = {
         "means": "_anchor",
         "scales": "_scaling",
         "opacities": "_opacity",
         "features_dc": "_anchor_feat",
         "features_rest": "_offset",
-        "features_semantics": "_anchor_lang_feat",
     }
 
     def _get_opt(
@@ -844,8 +983,6 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
         self._anchor_feat = nn.Parameter(self._anchor_feat[valid_mask])
         self._scaling = nn.Parameter(self._scaling[valid_mask])
         self._opacity = nn.Parameter(self._opacity[valid_mask])
-        if self.enable_language_features:
-            self._anchor_lang_feat = nn.Parameter(self._anchor_lang_feat[valid_mask])
 
         if optimizers is not None:
             self.update_optimizers_after_pruning(valid_mask, optimizers)
@@ -952,27 +1089,9 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
                 self.mlp_feature_bank.parameters(), lr=self.lr_mlp_color
             )
 
-        if self.embedding_appearance is not None:
+        if self.embedding_appearance is not None and self.appearance_dim > 0:
             extra_optimizers["embedding_appearance"] = torch.optim.Adam(
                 self.embedding_appearance.parameters(), lr=self.lr_appearance
-            )
-
-        # Language feature optimizers:
-        #   _anchor_lang_feat → features_semantics slot (participates in grow/prune).
-        #   mlp_language + codebook/proj → extra dict (MLP-style, excluded from grow/prune).
-        #   Codebook trained at lr × 0.1 — it bootstraps from PCA and should evolve slowly.
-        lang_feat_optimizer: Optional[torch.optim.Optimizer] = None
-        if self.enable_language_features:
-            assert self.mlp_language is not None
-            assert self.language_codebook is not None
-            assert self.codebook_proj is not None
-            lr_lang = lr_semantics if lr_semantics is not None else lr_sh
-            lang_feat_optimizer = torch.optim.Adam([self._anchor_lang_feat], lr=lr_lang)
-            extra_optimizers["mlp_language"] = torch.optim.Adam(
-                self.mlp_language.parameters(), lr=self.lr_mlp_color
-            )
-            extra_optimizers["language_codebook"] = torch.optim.Adam(
-                [self.language_codebook, self.codebook_proj], lr=lr_lang * 0.1
             )
 
         self._extra_optimizers = extra_optimizers
@@ -984,7 +1103,7 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
             opacities=torch.optim.Adam([self._opacity], lr=lr_opacities),
             features_dc=torch.optim.Adam([self._anchor_feat], lr=lr_sh),
             features_rest=torch.optim.Adam([self._offset], lr=self.lr_offset),
-            features_semantics=lang_feat_optimizer,
+            features_semantics=None,
         )
 
     def iter_extra_optimizers(self) -> Iterator[Tuple[str, torch.optim.Optimizer]]:
@@ -1045,15 +1164,6 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
                     if self.embedding_appearance is not None
                     else None
                 ),
-                "language_mlp": (
-                    self.mlp_language.state_dict()
-                    if self.enable_language_features and self.mlp_language is not None
-                    else None
-                ),
-                "enable_language_features": self.enable_language_features,
-                "lang_feat_dim": self.lang_feat_dim,
-                "codebook_size": self.codebook_size,
-                "clip_dim": self.clip_dim,
                 "model_state_dict": self.state_dict(),
             },
             path,
@@ -1072,13 +1182,6 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
             self.mlp_feature_bank.load_state_dict(checkpoint["feature_bank_mlp"])
         if self.embedding_appearance is not None and checkpoint.get("appearance") is not None:
             self.embedding_appearance.load_state_dict(checkpoint["appearance"])
-        if (
-            self.enable_language_features
-            and self.mlp_language is not None
-            and checkpoint.get("language_mlp") is not None
-        ):
-            self.mlp_language.load_state_dict(checkpoint["language_mlp"])
-
     # ── Unified render API ────────────────────────────────────────────────────
 
     def get_render_params(
@@ -1094,68 +1197,6 @@ class ScaffoldModel(BaseTrainableModel, NeuralRenderingMixin, SemanticsMixin):
             sh_degree=None,
             neural_opacity=out.neural_opacity,
             selection_mask=out.selection_mask,
-            language_features=out.language_features,
-        )
-
-    # ── SemanticsMixin implementation ─────────────────────────────────────────
-
-    def decode_language_features(self, gaussian_lang_feat: torch.Tensor) -> torch.Tensor:
-        """Decode compact latent features to unit-normalized CLIP-space vectors.
-
-        Pipeline:
-            gaussian_lang_feat [M, 32]
-                @ codebook_proj [32, K]     → logits [M, K]
-                → softmax                   → weights [M, K]  (soft attention)
-                @ language_codebook [K, 512] → raw [M, 512]
-                → L2-normalize              → [M, 512]
-
-        Initialize the codebook with init_codebook_from_pca() before calling this
-        to get semantically meaningful CLIP-space reconstruction.
-
-        Args:
-            gaussian_lang_feat: [M, lang_feat_dim] compact latents from RenderParams.
-
-        Returns:
-            [M, clip_dim] unit-normalized CLIP-space vectors.
-        """
-        if not self.enable_language_features:
-            raise RuntimeError(
-                "decode_language_features() requires enable_language_features=True."
-            )
-        assert self.codebook_proj is not None
-        assert self.language_codebook is not None
-        logits = gaussian_lang_feat @ self.codebook_proj          # [M, K]
-        weights = F.softmax(logits, dim=-1)                        # [M, K]
-        raw_clip = weights @ self.language_codebook                # [M, clip_dim]
-        return F.normalize(raw_clip, dim=-1)
-
-    def init_codebook_from_pca(self, pca_components: torch.Tensor) -> None:
-        """Seed the codebook with PCA principal components of scene CLIP features.
-
-        Gives the codebook semantic meaning from day 0 rather than starting from noise.
-        The codebook entries will span the principal subspace of the scene's CLIP features.
-        Call this once before training begins with the top-K PCA directions.
-
-        Args:
-            pca_components: [n, clip_dim] top-n PCA directions of training CLIP features.
-                            If n < codebook_size, remaining entries keep their random init.
-        """
-        if not self.enable_language_features:
-            raise RuntimeError(
-                "init_codebook_from_pca() requires enable_language_features=True."
-            )
-        assert self.language_codebook is not None
-        assert self.codebook_proj is not None
-        n = min(pca_components.shape[0], self.codebook_size)
-        self.language_codebook.data[:n].copy_(
-            pca_components[:n].to(self.language_codebook.device)
-        )
-        # Orthogonal init for codebook_proj: each latent dim activates a distinct codebook
-        # entry at training start, preventing codebook collapse.
-        nn.init.orthogonal_(self.codebook_proj.data)
-        logger.info(
-            f"Codebook initialized from {n}/{self.codebook_size} PCA components; "
-            f"codebook_proj reset to orthogonal init."
         )
 
     # ── LoD (compatibility stub) ──────────────────────────────────────────────

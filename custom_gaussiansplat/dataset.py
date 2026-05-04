@@ -85,6 +85,12 @@ class BaseReconstructionDataset(Dataset):
         self.require_depth = require_depth
         self.cameras: list[CameraData] = []
 
+        # On-demand memmap cache handles
+        self._cache_mm_images: Optional[np.memmap] = None
+        self._cache_mm_depths: Optional[np.memmap] = None
+        self._cache_shape: Optional[tuple] = None
+        self._cache_meta: Optional[dict] = None
+
         # Set by subclasses.
         self.init_points = torch.empty((0, 3), dtype=torch.float32, device=self.device)
         self.init_colors = torch.empty((0, 3), dtype=torch.float32, device=self.device)
@@ -398,16 +404,29 @@ class BaseReconstructionDataset(Dataset):
         cam_data = self.cameras[idx]
 
         img_path = Path(cam_data.image_path)
-        if self._preloaded_images is not None:
+
+        # On-demand memmap read
+        if self._cache_mm_images is not None:
+            img_array = np.asarray(self._cache_mm_images[idx]).copy()
+            img_tensor = torch.from_numpy(img_array).float()
+        elif self._preloaded_images and len(self._preloaded_images) > 0:
             img_tensor = self._preloaded_images[idx]
         else:
             img = imageio.imread(img_path)
             img_tensor = self._image_to_rgb_tensor(img)
 
-        if self._preloaded_depths is not None:
+        # On-demand memmap depth read
+        if self._cache_mm_depths is not None:
+            depth_array = np.asarray(self._cache_mm_depths[idx]).copy()
+            if np.isnan(depth_array).all():
+                depth_tensor = None
+            else:
+                depth_tensor = torch.from_numpy(depth_array).float()
+        elif self._preloaded_depths and len(self._preloaded_depths) > 0:
             depth_tensor = self._preloaded_depths[idx]
         else:
             depth_tensor = self._load_depth(img_path, cam_data)
+
         depth_tensor = depth_tensor.to(self.device) if depth_tensor is not None else None
 
         return cam_data, img_tensor.to(self.device), depth_tensor
@@ -489,6 +508,260 @@ class BaseReconstructionDataset(Dataset):
         logger.info(
             f"[green]✓ Preloaded {len(self.cameras)} images and {depth_available}/{len(self.cameras)} depth maps to CPU RAM[/green]"
         )
+
+    def _cache_paths(self, cache_dir: Optional[Path] = None) -> tuple[Path, Path, Path]:
+        """Return paths to (images.npy, depths.npy, meta.json) in cache_dir."""
+        if cache_dir is None:
+            cache_dir = self.image_dir.parent / "_image_cache"
+        else:
+            cache_dir = Path(cache_dir).expanduser().resolve()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return (
+            cache_dir / "images.npy",
+            cache_dir / "depths.npy",
+            cache_dir / "meta.json",
+        )
+
+    def _cache_is_valid(self, cache_dir: Optional[Path] = None) -> bool:
+        """Check if cache exists and covers the same set of images with matching mtimes."""
+        images_path, depths_path, meta_path = self._cache_paths(cache_dir)
+        if not images_path.exists() or not meta_path.exists():
+            return False
+        
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+        except Exception:
+            return False
+        
+        # Verify all image files still exist and have same mtimes
+        cached_files = meta.get("files", [])
+        if len(cached_files) != len(self.cameras):
+            return False
+        
+        for i, cam_data in enumerate(self.cameras):
+            img_path = Path(cam_data.image_path)
+            if i >= len(cached_files):
+                return False
+            cached_entry = cached_files[i]
+            if img_path.name != cached_entry["name"]:
+                return False
+            if not img_path.exists():
+                return False
+            if abs(img_path.stat().st_mtime - cached_entry["mtime"]) > 1.0:
+                return False
+        
+        # Verify metadata matches expected shape
+        if (
+            meta.get("total_cameras") != len(self.cameras)
+            or meta.get("image_shape") is None
+            or meta.get("has_depth") is None
+        ):
+            return False
+        
+        return True
+
+    def build_cache(self, cache_dir: Optional[Path] = None) -> None:
+        """Build memmap cache for images and depths.
+        
+        Two-pass approach:
+        1. Scan all cameras to collect shapes
+        2. Allocate memmap and stream-write data
+        """
+        images_path, depths_path, meta_path = self._cache_paths(cache_dir)
+        total_cameras = len(self.cameras)
+        
+        logger.info(f"[cyan]Building image/depth cache:[/cyan] scanning {total_cameras} cameras...")
+        
+        # Pass 1: collect shapes and basic info
+        image_shape = None
+        has_depth = False
+        valid_depths = 0
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            expand=False,
+        ) as progress:
+            task = progress.add_task("[cyan]Scanning camera shapes...", total=total_cameras)
+            
+            for cam_data in self.cameras:
+                img_path = Path(cam_data.image_path)
+                try:
+                    img = imageio.imread(img_path)
+                    img_tensor = self._image_to_rgb_tensor(img)
+                    if image_shape is None:
+                        # Shape: (H, W, C)
+                        image_shape = tuple(img_tensor.shape)
+                    
+                    # Check if depth available
+                    if not has_depth:
+                        depth_tensor = self._load_depth(img_path, cam_data)
+                        if depth_tensor is not None:
+                            has_depth = True
+                            valid_depths += 1
+                        else:
+                            has_depth = False
+                except Exception as e:
+                    logger.debug(f"Failed to scan {img_path.name}: {e}")
+                
+                progress.update(task, advance=1)
+        
+        if image_shape is None:
+            raise RuntimeError("Failed to determine image shape from any camera")
+        
+        logger.info(f"  Image shape: {image_shape}, has_depth: {has_depth}")
+        size_gb_images = (total_cameras * np.prod(image_shape) * 4) / 1e9
+        logger.info(f"  Cache size (images): {size_gb_images:.2f} GB")
+        
+        # Pass 2: allocate memmap and stream-write
+        logger.info("[cyan]Allocating and writing memmap cache...[/cyan]")
+        
+        # Allocate image memmap
+        img_mm = np.memmap(
+            str(images_path),
+            dtype=np.float32,
+            mode="w+",
+            shape=(total_cameras,) + image_shape,
+        )
+        
+        # Allocate depth memmap (only H, W per camera)
+        depth_mm = None
+        if has_depth:
+            depth_shape = (total_cameras, image_shape[0], image_shape[1])
+            depth_mm = np.memmap(
+                str(depths_path),
+                dtype=np.float32,
+                mode="w+",
+                shape=depth_shape,
+            )
+        
+        # Stream-write data
+        file_meta = []
+        valid_depth_count = 0
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            expand=False,
+        ) as progress:
+            task = progress.add_task("[cyan]Writing cache files...", total=total_cameras)
+            
+            for i, cam_data in enumerate(self.cameras):
+                img_path = Path(cam_data.image_path)
+                
+                try:
+                    # Write image
+                    img = imageio.imread(img_path)
+                    img_tensor = self._image_to_rgb_tensor(img)
+                    img_mm[i] = img_tensor.numpy()
+                    
+                    # Write depth if available
+                    if depth_mm is not None:
+                        depth_tensor = self._load_depth(img_path, cam_data)
+                        if depth_tensor is not None:
+                            depth_mm[i] = depth_tensor.numpy()
+                            valid_depth_count += 1
+                        else:
+                            # Fill with NaNs to indicate missing depth
+                            depth_mm[i] = np.full(image_shape[:2], np.nan, dtype=np.float32)
+                    
+                    file_meta.append({
+                        "name": img_path.name,
+                        "mtime": img_path.stat().st_mtime,
+                    })
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to cache {img_path.name}: {e}")
+                    # Still record for consistency
+                    file_meta.append({
+                        "name": img_path.name,
+                        "mtime": img_path.stat().st_mtime if img_path.exists() else 0,
+                    })
+                
+                progress.update(task, advance=1)
+        
+        # Flush and close memmaps
+        img_mm.flush()
+        del img_mm
+        if depth_mm is not None:
+            depth_mm.flush()
+            del depth_mm
+        
+        # Save metadata
+        meta = {
+            "total_cameras": total_cameras,
+            "image_shape": image_shape,
+            "has_depth": has_depth,
+            "valid_depths": valid_depth_count if has_depth else 0,
+            "files": file_meta,
+        }
+        with open(meta_path, "w") as f:
+            json.dump(meta, f)
+        
+        logger.info(
+            f"[green]✓ Cache built successfully[/green]: "
+            f"{total_cameras} images, {valid_depth_count}/{total_cameras} depths"
+        )
+
+    def load_cache(self, cache_dir: Optional[Path] = None) -> None:
+        """Load cached images and depths from memmap, keeping handles open for on-demand reads."""
+        images_path, depths_path, meta_path = self._cache_paths(cache_dir)
+
+        if not images_path.exists() or not meta_path.exists():
+            raise FileNotFoundError(f"Cache not found at {images_path}")
+
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        total_cameras = meta["total_cameras"]
+        image_shape = tuple(meta["image_shape"])
+        has_depth = meta.get("has_depth", False)
+
+        # Open memmap in read-only mode and keep handles open
+        self._cache_mm_images = np.memmap(
+            str(images_path),
+            dtype=np.float32,
+            mode="r",
+            shape=(total_cameras,) + image_shape,
+        )
+
+        self._cache_mm_depths = None
+        if has_depth and depths_path.exists():
+            depth_shape = (total_cameras, image_shape[0], image_shape[1])
+            self._cache_mm_depths = np.memmap(
+                str(depths_path),
+                dtype=np.float32,
+                mode="r",
+                shape=depth_shape,
+            )
+
+        # Store metadata for on-demand reads
+        self._cache_shape = image_shape
+        self._cache_meta = meta
+
+        # Mark as loaded (but not in RAM)
+        self._preloaded_images = []  # Empty list signals memmap mode
+        self._preloaded_depths = []  # Empty list signals memmap mode
+
+        logger.info(
+            f"[green]✓ Cache loaded (on-demand):[/green] {total_cameras} images, "
+            f"depths={'available' if has_depth else 'not available'}"
+        )
+
+    def check_cache_valid(self, cache_dir: Optional[Path] = None) -> bool:
+        """Public method to check if cache is valid and up-to-date."""
+        return self._cache_is_valid(cache_dir)
 
     def collate_fn(self, batch):
         """Return single item directly for batch_size=1 training."""

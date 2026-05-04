@@ -44,9 +44,12 @@ class TrainingConfig:
     log_interval: int
     num_workers: int
     preload: bool
-    enable_lpips_loss: bool
-    lpips_loss_weight: float
-    use_low_vram: bool
+    enable_image_cache: bool = False
+    image_cache_path: Optional[str] = None
+    rebuild_image_cache: bool = False
+    enable_lpips_loss: bool = False
+    lpips_loss_weight: float = 0.2
+    use_low_vram: bool = False
     lpips_model: str = "vgg"  # Could be made configurable if desired, but VGG is a good default for perceptual similarity
 
 
@@ -72,6 +75,8 @@ class ScaffoldConfig:
     add_color_dist: bool = False
     fourier_freqs: int = 32
     fourier_scale: float = 6.05
+    # Optimization
+    use_gradient_checkpointing: bool = False
     # Scaffold-specific learning rates (not in shared LearningRateConfig)
     lr_offset: float = 0.01
     lr_mlp_opacity: float = 0.002
@@ -123,44 +128,50 @@ class SHConfig:
 
 
 @dataclass
-class SemanticsConfig:
-    train_semantics: bool
-    semantics_path: Optional[Path]
-    semantics_dim: int
-    semantic_image_resolution: Optional[Tuple[int, int]]
-    semantic_loss_weight: float
-    semantic_finetune_iters: int
-    semantic_provider: str
-    semantic_model_path: Optional[Path]
-    semantic_cache_enabled: bool
-
-
-@dataclass
 class DepthConfig:
     enable_depth_loss: bool
     depth_loss_weight: float
     depth_loss_start_iter: int
+    depth_loss_stop_iter: int  # -1 = no upper bound
     sam_loss_weight: float
+    sam_loss_start_iter: int
+    sam_loss_stop_iter: int
     enable_affine_invariant_depth_loss: bool
     affine_invariant_depth_loss_weight: float
+    affine_invariant_depth_loss_start_iter: int
+    affine_invariant_depth_loss_stop_iter: int
     enable_pearson_correlation_loss: bool
     pearson_correlation_loss_weight: float
+    pearson_correlation_loss_start_iter: int
+    pearson_correlation_loss_stop_iter: int
     enable_silog_loss: bool
     silog_loss_weight: float
+    silog_loss_start_iter: int
+    silog_loss_stop_iter: int
     enable_ordinal_depth_loss: bool
     ordinal_depth_loss_weight: float
+    ordinal_depth_loss_start_iter: int
+    ordinal_depth_loss_stop_iter: int
     enable_affine_aligned_gradient_matching_loss: bool
     affine_aligned_gradient_matching_loss_weight: float
+    affine_aligned_gradient_matching_loss_start_iter: int
+    affine_aligned_gradient_matching_loss_stop_iter: int
     enable_depth_smoothness_loss: bool
     depth_smoothness_start_alpha: float
     depth_smoothness_end_alpha: float
     depth_smoothness_max_steps: int # If not used, then it will default to total iterations
     depth_smoothness_loss_weight: float
+    depth_smoothness_loss_start_iter: int
+    depth_smoothness_loss_stop_iter: int
     enable_metric_depth_normal_loss: bool
     metric_depth_normal_loss_weight: float
+    metric_depth_normal_loss_start_iter: int
+    metric_depth_normal_loss_stop_iter: int
     enable_dn_splatter_normal_loss: bool
     dn_splatter_normal_loss_weight: float
     dn_splatter_normal_tv_weight: float
+    dn_splatter_normal_loss_start_iter: int
+    dn_splatter_normal_loss_stop_iter: int
 
 
 @dataclass
@@ -174,7 +185,6 @@ class LearningRateConfig:
     lr_quats: float
     lr_opacities: float
     lr_sh: float
-    lr_semantics: Optional[float]
 
 
 @dataclass
@@ -230,7 +240,6 @@ class TrainConfig:
     floater_prevention: FloaterPreventionConfig
     lod: LODConfig
     sh: SHConfig
-    semantics: SemanticsConfig
     depth: DepthConfig
     learning_rates: LearningRateConfig
     export: ExportConfig
@@ -324,43 +333,6 @@ def _build_model_config(values: Dict[str, Any], flat_args: argparse.Namespace) -
         if hasattr(flat_args, name)
     }
     values["scaffold"] = ScaffoldConfig(**scaffold_kwargs)
-    return values
-
-
-def _normalize_semantics_values(values: Dict[str, Any]) -> Dict[str, Any]:
-    path_value = values.get("semantics_path")
-    values["semantics_path"] = Path(path_value) if path_value is not None else None
-
-    model_path_value = values.get("semantic_model_path")
-    values["semantic_model_path"] = Path(model_path_value) if model_path_value is not None else None
-
-    raw_resolution = values.get("semantic_image_resolution")
-    if isinstance(raw_resolution, list):
-        if len(raw_resolution) != 2:
-            raise ValueError("--semantic-image-resolution must contain exactly two values: height width")
-        values["semantic_image_resolution"] = (int(raw_resolution[0]), int(raw_resolution[1]))
-    elif isinstance(raw_resolution, tuple):
-        if len(raw_resolution) != 2:
-            raise ValueError("--semantic-image-resolution must contain exactly two values: height width")
-        values["semantic_image_resolution"] = (int(raw_resolution[0]), int(raw_resolution[1]))
-
-    if values.get("semantics_dim", 0) <= 0:
-        raise ValueError("--semantics-dim must be a positive integer")
-
-    if values.get("semantic_finetune_iters", 0) <= 0:
-        raise ValueError("--semantic-finetune-iters must be a positive integer")
-
-    if values.get("train_semantics", False):
-        provider = values.get("semantic_provider")
-        if provider == "npy" and values.get("semantics_path") is None:
-            raise ValueError("--semantics-path is required when --semantic-provider=npy and --train-semantics is enabled")
-        if provider == "runtime":
-            model_path = values.get("semantic_model_path")
-            if model_path is None:
-                raise ValueError("--semantic-model-path is required when --semantic-provider=runtime and --train-semantics is enabled")
-            if not model_path.exists():
-                raise ValueError(f"semantic model path does not exist: {model_path}")
-
     return values
 
 
@@ -528,11 +500,13 @@ MODEL_GROUP = ArgGroupDef(
         ArgSpec(flags=("--add-color-dist",), dest="add_color_dist", action="store_true", help="Scaffold-GS: include distance in color MLP"),
         ArgSpec(flags=("--fourier-freqs",), dest="fourier_freqs", arg_type=int, default=32, help="Scaffold-GS: number of Fourier feature frequencies for view encoding"),
         ArgSpec(flags=("--fourier-scale",), dest="fourier_scale", arg_type=float, default=6.05, help="Scaffold-GS: scale for Fourier feature encoding"),
+        ArgSpec(flags=("--use-gradient-checkpointing",), dest="use_gradient_checkpointing", action="store_true", help="Scaffold-GS: enable gradient checkpointing for MLP heads to save memory (~30-40 percent reduction) at cost of ~10 percent slower training"),
         # ── Scaffold-GS learning rates (model-specific, not in LearningRateConfig) ─
         ArgSpec(flags=("--lr-offset",), dest="lr_offset", arg_type=float, default=0.01, help="Scaffold-GS: learning rate for anchor offsets (official: 0.01)"),
         ArgSpec(flags=("--lr-mlp-opacity",), dest="lr_mlp_opacity", arg_type=float, default=0.002, help="Scaffold-GS: learning rate for the opacity MLP head (official: 0.002)"),
         ArgSpec(flags=("--lr-mlp-cov",), dest="lr_mlp_cov", arg_type=float, default=0.004, help="Scaffold-GS: learning rate for the covariance MLP head (official: 0.004)"),
         ArgSpec(flags=("--lr-mlp-color",), dest="lr_mlp_color", arg_type=float, default=0.008, help="Scaffold-GS: learning rate for the color MLP head (official: 0.008)"),
+        ArgSpec(flags=("--lr-appearance",), dest="lr_appearance", arg_type=float, default=0.05, help="Scaffold-GS: learning rate for appearance embeddings (official: 0.05)"),
     ),
 )
 
@@ -546,7 +520,10 @@ TRAINING_GROUP = ArgGroupDef(
         ArgSpec(flags=("--log-interval",), dest="log_interval", arg_type=int, default=1, help="Log progress every N iterations"),
         ArgSpec(flags=("--num-workers",), dest="num_workers", arg_type=int, default=0, help="Number of worker threads for data loading"),
         ArgSpec(flags=("--preload",), dest="preload", action="store_true", help="Preload all images into RAM before training (can speed up training but requires more memory)"),
-        ArgSpec(flags=("--use-low-vram",), dest="use_low_vram", action="store_true", default=False, help="Enable low VRAM optimizations: mixed precision training (FP16/AMP), aggressive cache clearing, and gradient scaling. Reduces memory usage by ~30-40%% with minimal impact on quality. Consider disabling --enable-lpips-loss for additional savings."),
+        ArgSpec(flags=("--enable-image-cache",), dest="enable_image_cache", action="store_true", help="Build/use a memmap cache of images and depths on disk for faster training. Recommended for large datasets."),
+        ArgSpec(flags=("--image-cache-path",), dest="image_cache_path", arg_type=str, default=None, help="Explicit directory for the image/depth cache. Defaults to output_dir/_image_cache/"),
+        ArgSpec(flags=("--rebuild-image-cache",), dest="rebuild_image_cache", action="store_true", help="Force rebuild of the image/depth cache even if it already exists"),
+        ArgSpec(flags=("--use-low-vram",), dest="use_low_vram", action="store_true", default=False, help="Enable low VRAM optimizations: mixed precision training (FP16/AMP), aggressive cache clearing, and gradient scaling. Reduces memory usage by ~30-40 percent with minimal impact on quality. Consider disabling --enable-lpips-loss for additional savings."),
         ArgSpec(flags=("--enable-lpips-loss",), dest="enable_lpips_loss", action="store_true", help="Enable LPIPS loss for perceptual similarity (requires additional dependencies and GPU memory)"),
         ArgSpec(flags=("--lpips-loss-weight",), dest="lpips_loss_weight", arg_type=float, default=0.2, help="Weight for LPIPS loss (0.01-0.4 recommended if enabled), default: 0.2"),
         ArgSpec(flags=("--lpips-model",), dest="lpips_model", arg_type=str, default="vgg", choices=("vgg", "alex", "squeeze"), help="Model to use for LPIPS loss (default: vgg)"),
@@ -601,25 +578,6 @@ SH_GROUP = ArgGroupDef(
     ),
 )
 
-SEMANTICS_GROUP = ArgGroupDef(
-    key="semantics",
-    title="Training Semantics",
-    config_cls=SemanticsConfig,
-    transform=_normalize_semantics_values,
-    specs=(
-        ArgSpec(flags=("--train-semantics",), dest="train_semantics", action="store_true", default=False, help="Enable post-training semantic fine-tuning stage"),
-        ArgSpec(flags=("--semantics-path",), dest="semantics_path", arg_type=str, default=None, help="Path to semantic targets directory for npy provider"),
-        ArgSpec(flags=("--semantics-dim",), dest="semantics_dim", arg_type=int, default=3, help="Dimensionality of semantic Gaussian features"),
-        ArgSpec(flags=("--semantic-image-resolution",), dest="semantic_image_resolution", arg_type=int, nargs=2, default=(1080, 1620), help="Semantic supervision reference resolution: height width"),
-        ArgSpec(flags=("--semantic-loss-weight",), dest="semantic_loss_weight", arg_type=float, default=1.0, help="Weight for semantic supervision loss during semantic fine-tuning"),
-        ArgSpec(flags=("--semantic-finetune-iters",), dest="semantic_finetune_iters", arg_type=int, default=2000, help="Number of post-training semantic fine-tuning iterations"),
-        ArgSpec(flags=("--semantic-provider",), dest="semantic_provider", arg_type=str, default="npy", choices=("npy", "runtime"), help="Semantic supervision provider backend"),
-        ArgSpec(flags=("--semantic-model-path",), dest="semantic_model_path", arg_type=str, default=None, help="Path to TorchScript or PyTorch model for runtime semantic inference"),
-        ArgSpec(flags=("--semantic-cache-enabled",), dest="semantic_cache_enabled", action="store_true", default=False, help="Enable in-memory semantic target caching for runtime provider"),
-        ArgSpec(flags=("--no-semantic-cache",), dest="semantic_cache_enabled", action="store_false", help="Disable in-memory semantic target caching"),
-    ),
-)
-
 DEPTH_GROUP = ArgGroupDef(
     key="depth",
     title="Depth Supervision Options",
@@ -628,27 +586,46 @@ DEPTH_GROUP = ArgGroupDef(
         ArgSpec(flags=("--enable-depth-loss",), dest="enable_depth_loss", action="store_true", help="Enable depth supervision from Depth Anything V2 depth maps"),
         ArgSpec(flags=("--depth-loss-weight",), dest="depth_loss_weight", arg_type=float, default=0.0, help="Weight for depth loss (0.05-0.2 recommended)"),
         ArgSpec(flags=("--depth-loss-start-iter",), dest="depth_loss_start_iter", arg_type=int, default=1000, help="Start applying depth loss after this many iterations"),
+        ArgSpec(flags=("--depth-loss-stop-iter",), dest="depth_loss_stop_iter", arg_type=int, default=-1, help="Stop applying depth loss after this iteration (-1 = never stop)"),
         ArgSpec(flags=("--sam-loss-weight",), dest="sam_loss_weight", arg_type=float, default=0.0, help="Weight for sharpness-aware minimization loss in gradient space (0.0 disables)"),
+        ArgSpec(flags=("--sam-loss-start-iter",), dest="sam_loss_start_iter", arg_type=int, default=0, help="Start applying SAM loss after this many iterations"),
+        ArgSpec(flags=("--sam-loss-stop-iter",), dest="sam_loss_stop_iter", arg_type=int, default=-1, help="Stop applying SAM loss after this iteration (-1 = never stop)"),
         ArgSpec(flags=("--enable-affine-invariant-depth-loss",), dest="enable_affine_invariant_depth_loss", action="store_true", help="Enable affine-invariant depth loss"),
         ArgSpec(flags=("--affine-invariant-depth-loss-weight",), dest="affine_invariant_depth_loss_weight", arg_type=float, default=0.0, help="Weight for AffineInvariantDepthLoss (0.0 disables)"),
+        ArgSpec(flags=("--affine-invariant-depth-loss-start-iter",), dest="affine_invariant_depth_loss_start_iter", arg_type=int, default=0, help="Start applying affine-invariant depth loss after this many iterations"),
+        ArgSpec(flags=("--affine-invariant-depth-loss-stop-iter",), dest="affine_invariant_depth_loss_stop_iter", arg_type=int, default=-1, help="Stop applying affine-invariant depth loss after this iteration (-1 = never stop)"),
         ArgSpec(flags=("--enable-pearson-correlation-loss",), dest="enable_pearson_correlation_loss", action="store_true", help="Enable Pearson correlation depth loss"),
         ArgSpec(flags=("--pearson-correlation-loss-weight",), dest="pearson_correlation_loss_weight", arg_type=float, default=0.0, help="Weight for PearsonCorrelationLoss module (0.0 disables)"),
+        ArgSpec(flags=("--pearson-correlation-loss-start-iter",), dest="pearson_correlation_loss_start_iter", arg_type=int, default=0, help="Start applying Pearson correlation loss after this many iterations"),
+        ArgSpec(flags=("--pearson-correlation-loss-stop-iter",), dest="pearson_correlation_loss_stop_iter", arg_type=int, default=-1, help="Stop applying Pearson correlation loss after this iteration (-1 = never stop)"),
         ArgSpec(flags=("--enable-silog-loss",), dest="enable_silog_loss", action="store_true", help="Enable scale-invariant log depth loss"),
         ArgSpec(flags=("--silog-loss-weight",), dest="silog_loss_weight", arg_type=float, default=0.0, help="Weight for SILogLoss (0.0 disables)"),
+        ArgSpec(flags=("--silog-loss-start-iter",), dest="silog_loss_start_iter", arg_type=int, default=0, help="Start applying SILog loss after this many iterations"),
+        ArgSpec(flags=("--silog-loss-stop-iter",), dest="silog_loss_stop_iter", arg_type=int, default=-1, help="Stop applying SILog loss after this iteration (-1 = never stop)"),
         ArgSpec(flags=("--enable-ordinal-depth-loss",), dest="enable_ordinal_depth_loss", action="store_true", help="Enable ordinal depth ranking loss"),
         ArgSpec(flags=("--ordinal-depth-loss-weight",), dest="ordinal_depth_loss_weight", arg_type=float, default=0.0, help="Weight for OrdinalDepthLoss (0.0 disables)"),
+        ArgSpec(flags=("--ordinal-depth-loss-start-iter",), dest="ordinal_depth_loss_start_iter", arg_type=int, default=0, help="Start applying ordinal depth loss after this many iterations"),
+        ArgSpec(flags=("--ordinal-depth-loss-stop-iter",), dest="ordinal_depth_loss_stop_iter", arg_type=int, default=-1, help="Stop applying ordinal depth loss after this iteration (-1 = never stop)"),
         ArgSpec(flags=("--enable-affine-aligned-gradient-matching-loss",), dest="enable_affine_aligned_gradient_matching_loss", action="store_true", help="Enable affine-aligned gradient matching loss"),
         ArgSpec(flags=("--affine-aligned-gradient-matching-loss-weight",), dest="affine_aligned_gradient_matching_loss_weight", arg_type=float, default=0.0, help="Weight for AffineAlignedGradientMatchingLoss (0.0 disables)"),
+        ArgSpec(flags=("--affine-aligned-gradient-matching-loss-start-iter",), dest="affine_aligned_gradient_matching_loss_start_iter", arg_type=int, default=0, help="Start applying affine-aligned gradient matching loss after this many iterations"),
+        ArgSpec(flags=("--affine-aligned-gradient-matching-loss-stop-iter",), dest="affine_aligned_gradient_matching_loss_stop_iter", arg_type=int, default=-1, help="Stop applying affine-aligned gradient matching loss after this iteration (-1 = never stop)"),
         ArgSpec(flags=("--enable-depth-smoothness-loss",), dest="enable_depth_smoothness_loss", action="store_true", help="Enable edge-aware depth smoothness loss to regularize depth maps and reduce noise"),
         ArgSpec(flags=("--depth-smoothness-start-alpha",), dest="depth_smoothness_start_alpha", arg_type=float, default=0.5, help="Starting alpha value for edge-aware depth smoothness loss (lower = more edge-sensitive)"),
         ArgSpec(flags=("--depth-smoothness-end-alpha",), dest="depth_smoothness_end_alpha", arg_type=float, default=2.5, help="Ending alpha value for edge-aware depth smoothness loss (higher = less edge-sensitive)"),
         ArgSpec(flags=("--depth-smoothness-max-steps",), dest="depth_smoothness_max_steps", arg_type=int, default=None, help="Number of steps over which to schedule alpha for depth smoothness loss (defaults to total iterations if not set)"),
         ArgSpec(flags=("--depth-smoothness-loss-weight",), dest="depth_smoothness_loss_weight", arg_type=float, default=0.0, help="Weight for depth smoothness loss (0.01-0.1 recommended)"),
+        ArgSpec(flags=("--depth-smoothness-loss-start-iter",), dest="depth_smoothness_loss_start_iter", arg_type=int, default=0, help="Start applying depth smoothness loss after this many iterations"),
+        ArgSpec(flags=("--depth-smoothness-loss-stop-iter",), dest="depth_smoothness_loss_stop_iter", arg_type=int, default=-1, help="Stop applying depth smoothness loss after this iteration (-1 = never stop)"),
         ArgSpec(flags=("--enable-metric-depth-normal-loss",), dest="enable_metric_depth_normal_loss", action="store_true", help="Enable metric depth normal loss"),
         ArgSpec(flags=("--metric-depth-normal-loss-weight",), dest="metric_depth_normal_loss_weight", arg_type=float, default=0.1, help="Weight for metric depth normal loss (0.01-0.1 recommended)"),
+        ArgSpec(flags=("--metric-depth-normal-loss-start-iter",), dest="metric_depth_normal_loss_start_iter", arg_type=int, default=0, help="Start applying metric depth normal loss after this many iterations"),
+        ArgSpec(flags=("--metric-depth-normal-loss-stop-iter",), dest="metric_depth_normal_loss_stop_iter", arg_type=int, default=-1, help="Stop applying metric depth normal loss after this iteration (-1 = never stop)"),
         ArgSpec(flags=("--enable-dn-splatter-normal-loss",), dest="enable_dn_splatter_normal_loss", action="store_true", help="Enable DN-Splatter normal loss (L1 + TV smoothness on depth-derived surface normals)"),
         ArgSpec(flags=("--dn-splatter-normal-loss-weight",), dest="dn_splatter_normal_loss_weight", arg_type=float, default=0.1, help="L1 weight for DN-Splatter normal loss"),
         ArgSpec(flags=("--dn-splatter-normal-tv-weight",), dest="dn_splatter_normal_tv_weight", arg_type=float, default=0.01, help="TV smoothness weight for DN-Splatter normal loss"),
+        ArgSpec(flags=("--dn-splatter-normal-loss-start-iter",), dest="dn_splatter_normal_loss_start_iter", arg_type=int, default=0, help="Start applying DN-Splatter normal loss after this many iterations"),
+        ArgSpec(flags=("--dn-splatter-normal-loss-stop-iter",), dest="dn_splatter_normal_loss_stop_iter", arg_type=int, default=-1, help="Stop applying DN-Splatter normal loss after this iteration (-1 = never stop)"),
     ),
 )
 
@@ -662,7 +639,6 @@ LEARNING_RATE_GROUP = ArgGroupDef(
         ArgSpec(flags=("--lr-quats",), dest="lr_quats", arg_type=float, default=0.002, help="Learning rate for anchor/Gaussian rotations. Scaffold official: 0.002. Standard 3DGS: 0.001."),
         ArgSpec(flags=("--lr-opacities",), dest="lr_opacities", arg_type=float, default=0.02, help="Learning rate for opacities. Scaffold official: 0.02 (anchor opacity is MLP input, not final opacity). Standard 3DGS: 0.05."),
         ArgSpec(flags=("--lr-sh",), dest="lr_sh", arg_type=float, default=0.0075, help="Learning rate for SH features / Scaffold anchor features (_anchor_feat). Scaffold official: 0.0075. Standard 3DGS: 0.0025."),
-        ArgSpec(flags=("--lr-semantics",), dest="lr_semantics", arg_type=float, default=None, help="Learning rate for semantic Gaussian features (defaults to --lr-sh)"),
     ),
 )
 
@@ -743,7 +719,6 @@ ARG_GROUP_DEFS: Tuple[ArgGroupDef[Any], ...] = (
     FLOATER_PREVENTION_GROUP,
     LOD_GROUP,
     SH_GROUP,
-    SEMANTICS_GROUP,
     DEPTH_GROUP,
     LEARNING_RATE_GROUP,
     EXPORT_GROUP,
@@ -795,7 +770,6 @@ def parse_args() -> TrainConfig:
         floater_prevention=_build_group_config(flat_args, FLOATER_PREVENTION_GROUP),
         lod=_build_group_config(flat_args, LOD_GROUP),
         sh=_build_group_config(flat_args, SH_GROUP),
-        semantics=_build_group_config(flat_args, SEMANTICS_GROUP),
         depth=_build_group_config(flat_args, DEPTH_GROUP),
         learning_rates=_build_group_config(flat_args, LEARNING_RATE_GROUP),
         export=_build_group_config(flat_args, EXPORT_GROUP),
@@ -807,6 +781,20 @@ def parse_args() -> TrainConfig:
 
 
 __all__ = [
+    # Config dataclasses
+    "RequiredConfig",
+    "TrainingConfig",
+    "LearningRateConfig",
+    "TensorBoardConfig",
+    # ArgGroupDef instances reusable by other parsers (e.g. train_semantics_args)
+    "REQUIRED_GROUP",
+    "TRAINING_GROUP",
+    "LEARNING_RATE_GROUP",
+    "TENSORBOARD_GROUP",
+    # Builder helpers
+    "_add_group_to_parser",
+    "_build_group_config",
+    # Full train.py config + entry point
     "TrainConfig",
     "parse_args",
 ]

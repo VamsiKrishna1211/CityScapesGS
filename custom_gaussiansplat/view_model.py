@@ -4,6 +4,19 @@ Usage:
     python custom_gaussiansplat/view_model.py --checkpoint path/to/ckpt.pth
     python custom_gaussiansplat/view_model.py --checkpoint path/to/ckpt.pth --model-type scaffold
     python custom_gaussiansplat/view_model.py --checkpoint path/to/ckpt.pth --port 8081
+
+    # Visualize semantic features (for models trained with train_semantics.py)
+    python custom_gaussiansplat/view_model.py --checkpoint path/to/semantic_model_final.pt \
+        --model-type scaffold --show-semantic-heatmap
+
+Semantic Heatmap Visualization:
+    When viewing a semantic checkpoint, use the new controls:
+    - "Semantic Heatmap": Toggle visualization on/off
+    - "Sim Threshold": Threshold for hard-mask mode (0-1)
+    - "Blend Alpha": Blend strength of heatmap over RGB (0-1)
+    - "Reference": Choose between "mean" (all anchors) or "anchor" (specific anchor)
+    - "Ref Anchor Index": Select which anchor to use when Reference="anchor"
+    - "Hard Mask": Toggle between continuous heatmap and binary mask
 """
 
 from __future__ import annotations
@@ -13,8 +26,9 @@ import importlib
 import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
@@ -22,7 +36,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from model_factory import ModelFactory
-from models import NeuralRenderingMixin
+from models import NeuralRenderingMixin, SemanticsMixin
 from viewer_sync import ViewerParamSync
 
 nerfview: Any = None
@@ -142,6 +156,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--add-opacity-dist", action="store_true")
     parser.add_argument("--add-cov-dist", action="store_true")
     parser.add_argument("--add-color-dist", action="store_true")
+    parser.add_argument(
+        "--show-semantic-heatmap",
+        action="store_true",
+        help="Enable semantic feature similarity visualization (for semantic checkpoints).",
+    )
     return parser.parse_args()
 
 
@@ -327,6 +346,160 @@ def _parse_visible_labels(spec: str) -> set[int] | None:
     return labels if labels else None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Semantic Heatmap Visualization Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class _SemanticOverlayState:
+    """Runtime state for semantic feature visualization."""
+    enabled: bool = False
+    threshold: float = 0.5
+    alpha: float = 0.6
+    ref_mode: str = "mean"  # "mean" or "anchor"
+    anchor_index: int = 0
+    show_mask: bool = False
+
+
+def _load_model_for_viewer(
+    args: argparse.Namespace, device: torch.device
+) -> tuple[Any, dict]:
+    """Load model, auto-detecting semantic checkpoints.
+
+    For scaffold models, peeks at checkpoint for 'lang_feat_dim' key.
+    If found, loads via SemanticScaffoldModel.from_checkpoint().
+    Otherwise falls back to ModelFactory.resume().
+    """
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+
+    if args.model_type == "scaffold" and "lang_feat_dim" in checkpoint:
+        from models.semantic_scaffold import SemanticScaffoldModel
+        model = SemanticScaffoldModel.from_checkpoint(args.checkpoint, device)
+        return model, checkpoint
+
+    # Fallback to ModelFactory for standard models
+    scaffold_kw = _scaffold_kwargs(args) if args.model_type == "scaffold" else {}
+    return ModelFactory.resume(
+        model_type=args.model_type,
+        checkpoint_path=args.checkpoint,
+        device=device,
+        sh_degree=args.sh_degree,
+        **scaffold_kw,
+    )
+
+
+def _build_semantic_cam(
+    camera_state: Any, width: int, height: int, device: torch.device
+) -> dict:
+    """Convert viser camera_state to the cam dict expected by render_semantics()."""
+    c2w = torch.from_numpy(camera_state.c2w).float().to(device)
+    K = torch.from_numpy(camera_state.get_K((width, height))).float().to(device)
+    viewmat = torch.linalg.inv(c2w)
+
+    return {
+        "R": viewmat[:3, :3],
+        "T": viewmat[:3, 3],
+        "fx": float(K[0, 0].item()),
+        "fy": float(K[1, 1].item()),
+        "cx": float(K[0, 2].item()),
+        "cy": float(K[1, 2].item()),
+        "width": width,
+        "height": height,
+        "camera_center": c2w[:3, 3],
+        "uid": 0,
+    }
+
+
+def _apply_jet_colormap(values: np.ndarray) -> np.ndarray:
+    """Apply jet-like colormap to values in [0, 1].
+
+    Returns array of shape [H, W, 3] with uint8 RGB values.
+    """
+    values = np.clip(values, 0.0, 1.0)
+
+    # Simple jet approximation using the standard 5-color jet pattern
+    # r = 1.5 - |4v - 3|, g = 1.5 - |4v - 2|, b = 1.5 - |4v - 1|
+    r = np.clip(1.5 - np.abs(4.0 * values - 3.0), 0.0, 1.0)
+    g = np.clip(1.5 - np.abs(4.0 * values - 2.0), 0.0, 1.0)
+    b = np.clip(1.5 - np.abs(4.0 * values - 1.0), 0.0, 1.0)
+
+    rgb = np.stack([r, g, b], axis=-1)
+    return (rgb * 255.0).astype(np.uint8)
+
+
+def _make_semantic_render_fn(
+    base_fn: Any,
+    model: Any,
+    device: torch.device,
+    sem_state: _SemanticOverlayState,
+) -> Any:
+    """Create a render function that wraps the base viewer render with semantic overlay.
+
+    Returns a callable with signature: render_fn(camera_state, render_tab_state) -> np.ndarray [H,W,3]
+    """
+    def semantic_render_fn(camera_state: Any, render_tab_state: Any) -> np.ndarray:
+        # Get base RGB render
+        rgb = base_fn(camera_state, render_tab_state)
+
+        # If semantic visualization disabled, return RGB unchanged
+        if not sem_state.enabled:
+            return rgb
+
+        height, width = rgb.shape[:2]
+
+        try:
+            # Build cam dict for render_semantics
+            cam = _build_semantic_cam(camera_state, width, height, device)
+
+            with torch.no_grad():
+                _, feat_map = model.render_semantics(cam, device)
+
+            # Select reference feature
+            if sem_state.ref_mode == "anchor":
+                anchor_idx = min(sem_state.anchor_index, model._anchor_lang_feat.shape[0] - 1)
+                ref_feat = model._anchor_lang_feat[anchor_idx].detach()
+            else:
+                ref_feat = model._anchor_lang_feat.detach().mean(dim=0)
+
+            # Compute cosine similarity per pixel
+            feat_flat = feat_map.reshape(-1, feat_map.shape[-1])
+            feat_norm = F.normalize(feat_flat, dim=-1)
+            ref_norm = F.normalize(ref_feat.unsqueeze(0), dim=-1)
+            sim = (feat_norm * ref_norm).sum(dim=-1)
+            sim_map = sim.reshape(height, width).cpu().numpy()
+
+            # Normalize similarity to [0, 1]
+            sim_map_norm = (sim_map + 1.0) * 0.5  # cosine sim is in [-1, 1]
+
+            # Apply colormap
+            heatmap = _apply_jet_colormap(sim_map_norm)
+
+            # Option 1: Hard mask (binary) above threshold
+            if sem_state.show_mask:
+                mask = (sim_map_norm > sem_state.threshold).astype(np.uint8)
+                mask_rgb = np.stack([mask, mask, mask], axis=-1) * 255
+                # Blend with RGB
+                blended = (
+                    rgb.astype(np.float32) * (1.0 - sem_state.alpha) +
+                    mask_rgb.astype(np.float32) * sem_state.alpha
+                ).astype(np.uint8)
+            else:
+                # Option 2: Continuous heatmap overlay
+                blended = (
+                    rgb.astype(np.float32) * (1.0 - sem_state.alpha) +
+                    heatmap.astype(np.float32) * sem_state.alpha
+                ).astype(np.uint8)
+
+            return blended
+
+        except Exception as e:
+            print(f"[Warning] Semantic render failed: {e}")
+            return rgb
+
+    return semantic_render_fn
+
+
 def main() -> None:
     args = parse_args()
 
@@ -343,14 +516,7 @@ def main() -> None:
     device = torch.device(args.device)
     print(f"Loading {args.model_type} model from {checkpoint_path} on {device} ...")
 
-    scaffold_kw = _scaffold_kwargs(args) if args.model_type == "scaffold" else {}
-    model, _ = ModelFactory.resume(
-        model_type=args.model_type,
-        checkpoint_path=checkpoint_path,
-        device=device,
-        sh_degree=args.sh_degree,
-        **scaffold_kw,
-    )
+    model, _ = _load_model_for_viewer(args, device)
     model.eval()
 
     n_gaussians = len(model.means)
@@ -370,10 +536,20 @@ def main() -> None:
 
     server = viser.ViserServer(port=args.port, verbose=False)
 
+    # Setup semantic heatmap visualization if applicable
+    sem_state = _SemanticOverlayState()
+    render_fn = viewer_sync.render_fn
+    if isinstance(model, SemanticsMixin):
+        if args.show_semantic_heatmap:
+            sem_state.enabled = True
+        render_fn = _make_semantic_render_fn(viewer_sync.render_fn, model, device, sem_state)
+    elif args.show_semantic_heatmap:
+        print("[Warning] --show-semantic-heatmap requires a semantic model; flag ignored.")
+
     # "rendering" mode — no training-specific UI (pause/step/rays-per-sec)
     _viewer = nerfview.Viewer(
         server=server,
-        render_fn=viewer_sync.render_fn,
+        render_fn=render_fn,
         mode="rendering",
     )
 
@@ -524,6 +700,73 @@ def main() -> None:
         # anchor point cloud immediately instead of waiting for GUI interaction.
         if show_anchors_checkbox.value:
             _refresh_anchor_cloud()
+
+    # Semantic feature heatmap visualization (if model supports it)
+    if isinstance(model, SemanticsMixin):
+        sem_heatmap_cb = server.gui.add_checkbox(
+            "Semantic Heatmap",
+            initial_value=sem_state.enabled,
+        )
+
+        sim_threshold_sl = server.gui.add_slider(
+            "Sim Threshold",
+            min=0.0,
+            max=1.0,
+            step=0.01,
+            initial_value=0.5,
+        )
+
+        blend_alpha_sl = server.gui.add_slider(
+            "Blend Alpha",
+            min=0.0,
+            max=1.0,
+            step=0.05,
+            initial_value=0.6,
+        )
+
+        ref_mode_dd = server.gui.add_dropdown(
+            "Reference",
+            ["mean", "anchor"],
+            initial_value="mean",
+        )
+
+        max_anchor_idx = model._anchor_lang_feat.shape[0] - 1 if model._anchor_lang_feat.numel() > 0 else 0
+        anchor_idx_sl = server.gui.add_slider(
+            "Ref Anchor Index",
+            min=0,
+            max=max(0, max_anchor_idx),
+            step=1,
+            initial_value=0,
+        )
+
+        show_mask_cb = server.gui.add_checkbox(
+            "Hard Mask",
+            initial_value=False,
+        )
+
+        @sem_heatmap_cb.on_update
+        def _on_sem_heatmap_update(event: Any) -> None:
+            sem_state.enabled = sem_heatmap_cb.value
+
+        @sim_threshold_sl.on_update
+        def _on_threshold_update(event: Any) -> None:
+            sem_state.threshold = float(sim_threshold_sl.value)
+
+        @blend_alpha_sl.on_update
+        def _on_alpha_update(event: Any) -> None:
+            sem_state.alpha = float(blend_alpha_sl.value)
+
+        @ref_mode_dd.on_update
+        def _on_ref_mode_update(event: Any) -> None:
+            sem_state.ref_mode = str(ref_mode_dd.value)
+
+        @anchor_idx_sl.on_update
+        def _on_anchor_idx_update(event: Any) -> None:
+            sem_state.anchor_index = int(anchor_idx_sl.value)
+
+        @show_mask_cb.on_update
+        def _on_show_mask_update(event: Any) -> None:
+            sem_state.show_mask = show_mask_cb.value
 
     hide_checkbox = server.gui.add_checkbox("Hide Gaussians", initial_value=False)
     if args.only_show_anchors:

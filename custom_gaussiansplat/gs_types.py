@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional, Tuple
 
 import torch
@@ -43,6 +43,40 @@ class RenderParams:
     selection_mask: Optional[torch.Tensor] = None    # Scaffold-GS training only
     language_features: Optional[torch.Tensor] = None # [N, lang_feat_dim] compact language features
 
+# ---------------------------------------------------------------------------
+# Data containers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RenderSemanticsOutput:
+    """Typed return from BaseTrainableModel.render().
+
+    Replaces the untyped dict currently returned by both GaussianModel and ScaffoldModel.
+    """
+    rgb: torch.Tensor          # [H, W, 3] rendered RGB image
+    depth: torch.Tensor        # [H, W] rendered depth map
+    semantics: Optional[torch.Tensor] = None  # [H, W] rendered semantic labels (optional)@dataclass
+
+@dataclass
+class RenderOutput:
+    """Bundles all outputs from a single rasterization call."""
+    render: torch.Tensor           # [B, H, W, 3]
+    alpha: torch.Tensor            # [B, H, W, 1]
+    depth_map: torch.Tensor        # [B, H, W]
+    depth_mask: torch.Tensor       # [B, H, W]
+    depth_mask_bchw: torch.Tensor  # [B, 1, H, W]
+    depth_map_bchw: torch.Tensor   # [B, 1, H, W]
+    render_perm: torch.Tensor      # [B, C, H, W]
+    gt_perm: torch.Tensor          # [B, C, H, W]
+    meta: dict = field(default_factory=dict)
+
+@dataclass
+class LossResult:
+    """Bundles loss tensor and per-component metrics for logging."""
+    total_loss: torch.Tensor
+    metrics: dict  # str -> float, all individual loss/metric values
+    inv_rendered_depth: Optional[torch.Tensor] = None
+    inv_prior_depth: Optional[torch.Tensor] = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Parameter and Optimizer Dataclasses

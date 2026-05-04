@@ -52,32 +52,134 @@ class NeuralRenderingMixin(ABC):
 
 
 class SemanticsMixin(ABC):
-    """Mixin for models that support language / semantic feature learning.
+    """Mixin for models that support semantic / language feature learning.
 
-    Implemented by ScaffoldModel when enable_language_features=True.
     Callers use isinstance(model, SemanticsMixin) for type-safe detection.
+
+    The mixin is deliberately model-agnostic: it declares *what* a semantic
+    model must expose (render output, trainable params, feature dim) without
+    encoding any assumption about the supervision signal (CLIP, DINO, etc.).
+    Model-specific setup (e.g. PCA codebook init for CLIP) goes in
+    setup_semantic_training(), which each subclass overrides as needed.
     """
 
+    # ── Required properties ───────────────────────────────────────────────────
+
+    @property
     @abstractmethod
-    def decode_language_features(self, gaussian_lang_feat: torch.Tensor) -> torch.Tensor:
-        """Decode compact language features → CLIP space via codebook.
+    def semantics_dim(self) -> int:
+        """Dimension of the rendered per-Gaussian/anchor semantic feature vector."""
+        ...
+
+    @property
+    def provider_semantics_dim(self) -> int:
+        """Channel count expected from SemanticTargetProvider.get_target().
+
+        Defaults to semantics_dim. Override when the raw provider output
+        dimension differs from the rendered one — e.g. SemanticScaffoldModel
+        renders 32-dim features but the provider returns 512-dim raw CLIP
+        features that are later PCA-compressed in prepare_target().
+        """
+        return self.semantics_dim
+
+    # ── Required rendering interface ──────────────────────────────────────────
+
+    @abstractmethod
+    def render_semantics(
+        self,
+        cam: dict,
+        device: torch.device,
+        detach_geometry: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Render the semantic feature map for the given camera.
 
         Args:
-            gaussian_lang_feat: [M, lang_feat_dim] compact latent vectors.
+            cam: Camera dict.
+            device: Target device.
+            detach_geometry: When True (default), geometry tensors are detached
+                so only semantic parameters receive gradients.  Set to False
+                when joint geometry + semantic training is desired.
 
         Returns:
-            [M, clip_dim] unit-normalized CLIP-space feature vectors.
+            rgb_pred:      [H, W, 3]              RGB rendering.
+            semantic_pred: [H, W, semantics_dim]  Rendered semantic feature map.
         """
         ...
+
+    # ── Required optimization interface ──────────────────────────────────────
 
     @abstractmethod
-    def init_codebook_from_pca(self, pca_components: torch.Tensor) -> None:
-        """Seed the codebook with PCA principal components for a meaningful start.
+    def get_semantic_trainable_params(self) -> "list[nn.Parameter]":
+        """Return ONLY the parameters that receive gradients during semantic training."""
+        ...
+
+    # ── Optional hooks (concrete defaults) ───────────────────────────────────
+
+    def setup_semantic_training(self, semantics_cfg: object, device: torch.device) -> None:
+        """Pre-training setup hook called once before the semantic training loop.
+
+        Default: no-op. SemanticScaffoldModel overrides to compute PCA and
+        seed the language codebook from CLIP feature principal components.
+        """
+
+    def prepare_target(self, raw_target: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """Per-step target transformation applied before loss computation.
+
+        Default: identity (raw provider output used as-is). SemanticScaffoldModel
+        overrides to project [H, W, clip_dim] → [H, W, lang_feat_dim] via PCA.
 
         Args:
-            pca_components: [n, clip_dim] — top-n PCA directions over training CLIP features.
+            raw_target: [H', W', D] raw semantic target from the provider.
+            device:     Target device.
+
+        Returns:
+            Transformed target tensor, potentially smaller in the channel dim.
         """
-        ...
+        return raw_target
+
+    @property
+    def geometry_param_group_names(self) -> frozenset:
+        """Names of param groups (from get_finetune_param_groups) that modify geometry.
+
+        The SemanticTrainer uses this to decide whether to activate the full
+        Rasterizer + LossComputer render path.  Override in subclasses to declare
+        which named groups affect geometry — the base default is the empty set
+        (semantics-only fine-tuning).
+        """
+        return frozenset()
+
+    def get_finetune_param_groups(self) -> "Dict[str, list]":
+        """Return named param groups for selective fine-tuning.
+
+        Override in subclasses to expose geometry, MLP heads, appearance, etc.
+        SemanticTrainer calls this to resolve ``--finetune-params`` group names to
+        actual parameter lists.
+        """
+        return {}
+
+    def freeze_params_except(self, trainable: "list") -> "Dict[str, bool]":
+        """Freeze all parameters except the given list. Returns old requires_grad state."""
+        trainable_ids = {id(p) for p in trainable}
+        state: "Dict[str, bool]" = {}
+        for name, param in self.named_parameters():
+            state[name] = bool(param.requires_grad)
+            param.requires_grad_(id(param) in trainable_ids)
+        return state
+
+    def freeze_non_semantic_params(self) -> "Dict[str, bool]":
+        """Freeze all parameters except semantic ones. Returns grad state for later restoration."""
+        trainable_ids = {id(p) for p in self.get_semantic_trainable_params()}
+        state: "Dict[str, bool]" = {}
+        for name, param in self.named_parameters():
+            state[name] = bool(param.requires_grad)
+            param.requires_grad_(id(param) in trainable_ids)
+        return state
+
+    def restore_grad_state(self, state: "Dict[str, bool]") -> None:
+        """Restore requires_grad flags previously saved by freeze_params_except."""
+        for name, param in self.named_parameters():
+            if name in state:
+                param.requires_grad_(state[name])
 
 
 # Future mixin stubs for other capabilities (add as needed):
@@ -100,6 +202,17 @@ class BaseTrainableModel(nn.Module, ABC):
     Capability mixins (e.g. NeuralRenderingMixin) are inherited by subclasses
     to declare support for model-specific features.
     """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # OPTIMIZATION: Cache for params_dict to avoid repeated dict construction
+        self._params_dict_cache: Optional[Dict[str, nn.Parameter]] = None
+        self._params_dict_version: int = 0
+
+    def _invalidate_params_cache(self) -> None:
+        """Invalidate the params_dict cache when model structure changes."""
+        self._params_dict_version += 1
+        self._params_dict_cache = None
 
     # ───────────────────────────────────────────────────────────────────────────
     # Abstract Properties (Required Geometric State)
@@ -188,6 +301,17 @@ class BaseTrainableModel(nn.Module, ABC):
         Keys must match GSOptimizers field names (means, scales, quats, etc.).
         """
         ...
+
+    def get_params_dict_cached(self) -> Dict[str, nn.Parameter]:
+        """Return cached params_dict if available, otherwise compute and cache.
+
+        Subclasses should call this instead of get_params_dict() in training loops
+        to avoid repeated dict construction. The cache is automatically invalidated
+        when the model structure changes (via _invalidate_params_cache()).
+        """
+        if self._params_dict_cache is None:
+            self._params_dict_cache = self.get_params_dict()
+        return self._params_dict_cache
 
     @abstractmethod
     def get_optimizers_dict(self, optimizers: "GSOptimizers") -> Dict[str, torch.optim.Optimizer]:

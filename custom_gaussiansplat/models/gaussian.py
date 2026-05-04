@@ -28,11 +28,9 @@ def inverse_sigmoid(x):
 class GaussianModel(BaseTrainableModel):
     SH_C0 = 0.28209479177387814
 
-    def __init__(self, init_points: torch.Tensor, 
-                 init_colors: torch.Tensor, 
+    def __init__(self, init_points: torch.Tensor,
+                 init_colors: torch.Tensor,
                  sh_degree=3,
-                 train_semantics=False,
-                 semantics_dim=3,
                  console=None):
         super().__init__()
         num_points = init_points.shape[0]
@@ -76,15 +74,6 @@ class GaussianModel(BaseTrainableModel):
         # We fuse RGB into the DC component for easier initialization
         self._features_dc = nn.Parameter(init_colors.unsqueeze(1)) # [N, 1, 3]
         self._features_rest = nn.Parameter(torch.zeros(num_points, (sh_degree + 1)**2 - 1, 3, device=init_points.device)) # [N, D, 3]
-
-        # 6. Always initialize semantics field (fixes hasattr violations)
-        if train_semantics:
-            if semantics_dim is None or semantics_dim <= 0:
-                raise ValueError("semantics_dim must be a positive integer when train_semantics is True.")
-            self._features_semantics = nn.Parameter(torch.zeros(num_points, semantics_dim, device=init_points.device)) # [N, semantics_dim]
-        else:
-            self._features_semantics: Optional[nn.Parameter] = None
-        self.train_semantics = train_semantics
 
         # Visibility tracking buffer for multi-view consistency (floater prevention)
         self.register_buffer('view_count', torch.zeros(num_points, device=init_points.device))
@@ -136,13 +125,6 @@ class GaussianModel(BaseTrainableModel):
     def sh_degree(self) -> int:
         return self._sh_degree
 
-    @property
-    def semantics(self):
-        if self._features_semantics is not None:
-            return self._features_semantics
-        else:
-            raise ValueError("Semantic features are not enabled. Please enable them by setting train_semantics=True in the config.")
-    
     def add_view_count(self, alpha_contributions, threshold=0.5):
         """
         Track which Gaussians contribute significantly to rendered pixels.
@@ -203,9 +185,6 @@ class GaussianModel(BaseTrainableModel):
         self._opacities.data = self._opacities.data[indices]
         self._features_dc.data = self._features_dc.data[indices]
         self._features_rest.data = self._features_rest.data[indices]
-
-        if self._features_semantics is not None:
-            self._features_semantics.data = self._features_semantics.data[indices]
 
         self.view_count.data = self.view_count.data[indices]
         
@@ -301,7 +280,7 @@ class GaussianModel(BaseTrainableModel):
         Returns:
             Dictionary mapping parameter names to Parameter tensors
         """
-        params = {
+        return {
             "means": self._means,
             "scales": self._scales,
             "quats": self._quats,
@@ -309,9 +288,6 @@ class GaussianModel(BaseTrainableModel):
             "features_dc": self._features_dc,
             "features_rest": self._features_rest,
         }
-        if self._features_semantics is not None:
-            params["features_semantics"] = self._features_semantics
-        return params
     
     def get_optimizers_dict(self, optimizers: GSOptimizers) -> Dict[str, torch.optim.Optimizer]:
         """Convert GSOptimizers to dictionary for strategy interface.
@@ -322,7 +298,7 @@ class GaussianModel(BaseTrainableModel):
         Returns:
             Dictionary mapping parameter names to optimizers
         """
-        optimizers_dict = {
+        return {
             "means": optimizers.means,
             "scales": optimizers.scales,
             "quats": optimizers.quats,
@@ -330,9 +306,6 @@ class GaussianModel(BaseTrainableModel):
             "features_dc": optimizers.features_dc,
             "features_rest": optimizers.features_rest,
         }
-        if optimizers.features_semantics is not None:
-            optimizers_dict["features_semantics"] = optimizers.features_semantics
-        return optimizers_dict
     
     def update_params_from_dict(self, params: Dict[str, nn.Parameter]):
         """Update model parameters from dictionary after strategy operations.
@@ -350,8 +323,6 @@ class GaussianModel(BaseTrainableModel):
         self._opacities = params["opacities"]
         self._features_dc = params["features_dc"]
         self._features_rest = params["features_rest"]
-        if "features_semantics" in params:
-            self._features_semantics = params["features_semantics"]
     
     def create_optimizers(
         self,
@@ -377,13 +348,6 @@ class GaussianModel(BaseTrainableModel):
         Returns:
             GSOptimizers: Named tuple containing optimizers for each parameter group
         """
-        if lr_semantics is None:
-            lr_semantics = lr_sh
-
-        semantics_optimizer = None
-        if self._features_semantics is not None:
-            semantics_optimizer = torch.optim.Adam([self._features_semantics], lr=lr_semantics)
-
         return GSOptimizers(
             means=torch.optim.Adam([self._means], lr=lr_means * means_lr_multiplier),
             scales=torch.optim.Adam([self._scales], lr=lr_scales),
@@ -391,7 +355,7 @@ class GaussianModel(BaseTrainableModel):
             opacities=torch.optim.Adam([self._opacities], lr=lr_opacities),
             features_dc=torch.optim.Adam([self._features_dc], lr=lr_sh),
             features_rest=torch.optim.Adam([self._features_rest], lr=lr_sh*0.1),
-            features_semantics=semantics_optimizer,
+            features_semantics=None,
         )
     
     def construct_list_of_attributes(self):
@@ -745,8 +709,6 @@ class GaussianModel(BaseTrainableModel):
         checkpoint_path,
         device='cuda',
         sh_degree=None,
-        train_semantics=False,
-        semantics_dim=3,
         console=None,
         strict=False,
         return_checkpoint=False,
@@ -757,8 +719,6 @@ class GaussianModel(BaseTrainableModel):
             checkpoint_path: Path to checkpoint file.
             device: Target device.
             sh_degree: Optional SH degree override. If None, inferred from checkpoint.
-            train_semantics: Whether to initialize semantic features if not inferable.
-            semantics_dim: Semantic feature dimension fallback.
             console: Optional rich console.
             strict: Whether to enforce strict state-dict loading.
             return_checkpoint: If True, returns (model, checkpoint_dict).
@@ -785,8 +745,10 @@ class GaussianModel(BaseTrainableModel):
                 sh_degree = 3
 
         if '_features_semantics' in state_dict:
-            train_semantics = True
-            semantics_dim = state_dict['_features_semantics'].shape[1]
+            raise RuntimeError(
+                "This checkpoint contains semantic features (_features_semantics). "
+                "Load it with SemanticGaussianModel.from_checkpoint() instead of GaussianModel."
+            )
 
         dummy_points = torch.zeros((num_gaussians, 3), device=device)
         dummy_colors = torch.zeros((num_gaussians, 3), device=device)
@@ -794,8 +756,6 @@ class GaussianModel(BaseTrainableModel):
             dummy_points,
             dummy_colors,
             sh_degree=sh_degree,
-            train_semantics=train_semantics,
-            semantics_dim=semantics_dim,
             console=console,
         ).to(device)
 
@@ -832,8 +792,6 @@ class GaussianModel(BaseTrainableModel):
         checkpoint_path,
         device='cuda',
         sh_degree=None,
-        train_semantics=False,
-        semantics_dim=3,
         console=None,
         strict=False,
     ) -> Tuple["GaussianModel", Dict]:
@@ -842,8 +800,6 @@ class GaussianModel(BaseTrainableModel):
             checkpoint_path=checkpoint_path,
             device=device,
             sh_degree=sh_degree,
-            train_semantics=train_semantics,
-            semantics_dim=semantics_dim,
             console=console,
             strict=strict,
             return_checkpoint=True,

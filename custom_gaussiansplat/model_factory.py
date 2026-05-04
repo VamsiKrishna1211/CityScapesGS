@@ -4,7 +4,13 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from models import BaseTrainableModel, GaussianModel, ScaffoldModel
+from models import (
+    BaseTrainableModel,
+    GaussianModel,
+    ScaffoldModel,
+    SemanticGaussianModel,
+    SemanticScaffoldModel,
+)
 
 
 class ModelFactory:
@@ -18,16 +24,17 @@ class ModelFactory:
         sh_degree: int = 3,
         console=None,
         **scaffold_kwargs,
-    ) -> BaseTrainableModel | ScaffoldModel | GaussianModel:
+    ) -> BaseTrainableModel:
         """Create a model instance based on model_type string.
 
         Args:
-            model_type: "gaussian" or "scaffold"
-            init_points: Initial point cloud
-            init_colors: Initial colors (GaussianModel only)
-            sh_degree: Spherical harmonic degree
-            console: Logger console
-            **scaffold_kwargs: Additional args for ScaffoldModel (feat_dim, n_offsets, etc.)
+            model_type: ``"gaussian"`` or ``"scaffold"`` for visual training.
+                        Semantic models are instantiated directly by train_semantics.py.
+            init_points: Initial point cloud.
+            init_colors: Initial colours (GaussianModel only).
+            sh_degree: Spherical harmonic degree.
+            console: Logger console.
+            **scaffold_kwargs: Additional args forwarded to ScaffoldModel.
 
         Returns:
             Instantiated BaseTrainableModel subclass.
@@ -47,7 +54,11 @@ class ModelFactory:
                 console=console,
             )
         else:
-            raise ValueError(f"Unknown model type: {model_type}. Supported: 'gaussian', 'scaffold'")
+            raise ValueError(
+                f"Unknown model type: {model_type!r}. "
+                "Visual models: 'gaussian', 'scaffold'. "
+                "Semantic models are created directly by train_semantics.py."
+            )
 
     @staticmethod
     def resume(
@@ -56,7 +67,7 @@ class ModelFactory:
         device: torch.device,
         sh_degree: int = 3,
         **scaffold_kwargs,
-    ) -> tuple[BaseTrainableModel | ScaffoldModel | GaussianModel, dict]:
+    ) -> tuple[BaseTrainableModel, dict]:
         """Resume a model from checkpoint.
 
         Args:

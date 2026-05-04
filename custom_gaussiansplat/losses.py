@@ -1,12 +1,24 @@
 """
 Loss functions for Gaussian Splatting training.
 """
+import logging
+from typing import TYPE_CHECKING, Optional, cast
+
+if TYPE_CHECKING:
+    from semantic_providers import SemanticTarget
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import logging
-from typing import cast
 from dataset import CameraData
+from fused_ssim import fused_ssim  # type: ignore[import-untyped]
+from gs_types import LossResult, RenderOutput
+from models import BaseTrainableModel
+from torchmetrics.image import (
+    LearnedPerceptualImagePatchSimilarity,
+    PeakSignalNoiseRatio,
+)
+from train_args import DepthConfig, FloaterPreventionConfig
 
 logger = logging.getLogger("cityscape_gs.losses")
 
@@ -1703,3 +1715,446 @@ class DNSplatterNormalLoss(nn.Module):
         tv = self._tv_loss(N_ren)
 
         return self.lambda_weight * l1 + self.tv_weight * tv
+
+
+
+# ---------------------------------------------------------------------------
+# LossComputer — consolidates all loss modules and per-step computation
+# ---------------------------------------------------------------------------
+
+
+class LossComputer:
+    """Consolidates all loss modules and their per-step computation.
+
+    Loss modules are created once at init rather than scattered as free
+    variables, and the conditional loss-accumulation logic is unified in
+    a single ``compute()`` method.
+    """
+
+    def __init__(self, training_cfg, depth_cfg: DepthConfig, floater_cfg: FloaterPreventionConfig, device: torch.device,
+                 verbosity: int = 1, scene_extent: float = 1.0, logger: Optional[logging.Logger] = None) -> None:
+        self.training_cfg = training_cfg
+        self.depth_cfg = depth_cfg
+        self.floater_cfg = floater_cfg
+        self.device = device
+        self.logger = logger
+        self.scene_extent: float = 1.0
+
+        # Quality metric
+        self.psnr = PeakSignalNoiseRatio(data_range=(0, 1.0)).to(device)
+
+        # LPIPS loss (optional)
+        self.lpips = None
+        if training_cfg.enable_lpips_loss:
+            try:
+                self.lpips = LearnedPerceptualImagePatchSimilarity(
+                    net_type="vgg", normalize=True,
+                ).to(device)
+                if verbosity >= 1 and logger:
+                    logger.info("[green]✓ LPIPS loss enabled[/green]")
+            except Exception as e:
+                if logger:
+                    logger.error(f"[bold red]❌ Failed to initialize LPIPS:[/bold red] {e}")
+
+        # Depth loss modules (created unconditionally, only used when weights > 0)
+        self.depth_smoothness_loss = FastPriorGradientMatchingLoss().to(device)
+        self.affine_invariant_depth_loss = FastAffineInvariantDepthLoss().to(device)
+        self.pearson_correlation_loss = PearsonCorrelationLoss().to(device)
+        self.silog_depth_loss = SILogLoss().to(device)
+        self.ordinal_depth_loss = OrdinalDepthLoss().to(device)
+        self.affine_aligned_gradient_matching_loss = AffineAlignedGradientMatchingLoss().to(device)
+        self.metric_depth_normal_loss = MetricNormalLoss().to(device)
+        self.dn_splatter_normal_loss = DNSplatterNormalLoss(
+            lambda_weight=depth_cfg.dn_splatter_normal_loss_weight,
+            tv_weight=depth_cfg.dn_splatter_normal_tv_weight,
+        ).to(device)
+
+    # -- internal helpers ---------------------------------------------------
+
+    def _compute_lpips(self, render_perm: torch.Tensor,
+                       gt_perm: torch.Tensor) -> torch.Tensor:
+        """LPIPS with random-patch cropping for large images."""
+        if self.lpips is None:
+            return torch.tensor(0.0, device=self.device)
+
+        h, w = render_perm.shape[2:]
+        if h >= 1024 and w >= 1024:
+            ps = 1024
+            top = torch.randint(0, h - ps, (1,))
+            left = torch.randint(0, w - ps, (1,))
+            rp = render_perm[:, :, top:top + ps, left:left + ps].clamp(0.0, 1.0)
+            gp = gt_perm[:, :, top:top + ps, left:left + ps].clamp(0.0, 1.0)
+        else:
+            rp, gp = render_perm, gt_perm
+        return self.lpips(rp, gp)
+
+    @staticmethod
+    def _loss_active(step: int, start: int, stop: int) -> bool:
+        return step >= start and (stop == -1 or step <= stop)
+
+    def _compute_depth_losses(
+        self, depth_map_bchw: torch.Tensor,
+        depth_tensor: Optional[torch.Tensor],
+        depth_mask_bchw: torch.Tensor,
+        step: int,
+        cam_data: Optional[CameraData] = None,
+    ) -> tuple[torch.Tensor, dict]:
+        """Compute all active depth-related losses.
+
+        Returns:
+            (accumulated_loss, metrics_dict)
+        """
+        dcfg = self.depth_cfg
+        # Use zeros_like to inherit dtype from render output (important for mixed precision)
+        acc = torch.zeros(1, device=self.device, dtype=depth_map_bchw.dtype).squeeze()
+        m: dict = {}
+
+        if depth_tensor is None:
+            return acc, m
+
+        depth_tensor_bchw = depth_tensor.unsqueeze(0).unsqueeze(1).to(self.device)
+
+        # (name, enabled, weight, module, start_iter, stop_iter)
+        depth_loss_items = [
+            ("affine_invariant_depth_loss", dcfg.enable_affine_invariant_depth_loss, dcfg.affine_invariant_depth_loss_weight,
+             self.affine_invariant_depth_loss, dcfg.affine_invariant_depth_loss_start_iter, dcfg.affine_invariant_depth_loss_stop_iter),
+            ("pearson_correlation_loss", dcfg.enable_pearson_correlation_loss, dcfg.pearson_correlation_loss_weight,
+             self.pearson_correlation_loss, dcfg.pearson_correlation_loss_start_iter, dcfg.pearson_correlation_loss_stop_iter),
+            ("silog_loss", dcfg.enable_silog_loss, dcfg.silog_loss_weight, self.silog_depth_loss,
+             dcfg.silog_loss_start_iter, dcfg.silog_loss_stop_iter),
+            ("ordinal_depth_loss", dcfg.enable_ordinal_depth_loss, dcfg.ordinal_depth_loss_weight,
+             self.ordinal_depth_loss, dcfg.ordinal_depth_loss_start_iter, dcfg.ordinal_depth_loss_stop_iter),
+            ("affine_aligned_gradient_matching_loss", dcfg.enable_affine_aligned_gradient_matching_loss,
+             dcfg.affine_aligned_gradient_matching_loss_weight, self.affine_aligned_gradient_matching_loss,
+             dcfg.affine_aligned_gradient_matching_loss_start_iter, dcfg.affine_aligned_gradient_matching_loss_stop_iter),
+            ("depth_smoothness_loss", dcfg.enable_depth_smoothness_loss, dcfg.depth_smoothness_loss_weight,
+             self.depth_smoothness_loss, dcfg.depth_smoothness_loss_start_iter, dcfg.depth_smoothness_loss_stop_iter),
+            ("metric_depth_normal_loss", dcfg.enable_metric_depth_normal_loss, dcfg.metric_depth_normal_loss_weight,
+             self.metric_depth_normal_loss, dcfg.metric_depth_normal_loss_start_iter, dcfg.metric_depth_normal_loss_stop_iter),
+            ("dn_splatter_normal_loss", dcfg.enable_dn_splatter_normal_loss, 1.0,
+             self.dn_splatter_normal_loss, dcfg.dn_splatter_normal_loss_start_iter, dcfg.dn_splatter_normal_loss_stop_iter),
+        ]
+
+        for name, enabled, weight, module, start, stop in depth_loss_items:
+            if enabled and weight > 0.0 and self._loss_active(step, start, stop):
+                try:
+                    val = module(depth_map_bchw, depth_tensor_bchw, depth_mask_bchw)
+                    acc = acc + weight * val
+                    m[name] = val.item()
+                except TypeError:
+                    val = module(depth_map_bchw, depth_tensor_bchw, depth_mask_bchw, cam_data)
+                    acc = acc + weight * val
+                    m[name] = val.item()
+
+        return acc, m
+
+    def _compute_regularization(
+        self, model: BaseTrainableModel, step: int,
+    ) -> tuple[torch.Tensor, dict]:
+        """Compute floater-prevention regularization losses."""
+        fcfg = self.floater_cfg
+        # Use zeros with dtype from model parameters (important for mixed precision)
+        acc = torch.zeros(1, device=self.device, dtype=model.opacities.dtype).squeeze()
+        m: dict = {}
+
+        if fcfg.enable_scale_reg:
+            v = scale_regularization(
+                model.scales, weight=fcfg.scale_reg_weight,
+                scene_extent=float(self.scene_extent),
+            )
+            acc = acc + v
+            m["scale_reg_loss"] = v.item()
+        else:
+            m["scale_reg_loss"] = 0.0
+
+        if fcfg.enable_opacity_reg:
+            v = opacity_regularization(model.opacities, weight=fcfg.opacity_reg_weight)
+            acc = acc + v
+            m["opacity_reg_loss"] = v.item()
+        else:
+            m["opacity_reg_loss"] = 0.0
+
+        if (fcfg.enable_opacity_entropy_reg
+                and step >= fcfg.opacity_entropy_reg_start_iter
+                and step <= fcfg.opacity_entropy_reg_end_iter):
+            v = opacity_entropy_regularization(
+                model.opacities, weight=fcfg.opacity_entropy_reg_weight,
+            )
+            acc = acc + v
+            m["opacity_entropy_reg_loss"] = v.item()
+        else:
+            m["opacity_entropy_reg_loss"] = 0.0
+
+        return acc, m
+
+    # -- main entry-point ---------------------------------------------------
+
+    def compute(
+        self,
+        render_out: RenderOutput,
+        gt_image: torch.Tensor,
+        depth_tensor: Optional[torch.Tensor],
+        model: BaseTrainableModel,
+        cam_data: CameraData,
+        step: int,
+    ) -> LossResult:
+        """Compute all active losses for a single training step.
+
+        Returns:
+            LossResult with total loss tensor and per-component metrics dict.
+        """
+        dcfg = self.depth_cfg
+        render_perm = render_out.render_perm
+        gt_perm = render_out.gt_perm
+
+        # Core photometric losses
+        l1_loss = (render_out.render - gt_image).abs().mean()
+        ssim_loss = 1.0 - fused_ssim(render_perm, gt_perm)
+        lpips_loss = self._compute_lpips(render_perm, gt_perm)
+        psnr_value = self.psnr(render_perm, gt_perm)
+
+        loss = 0.8 * l1_loss + 0.2 * ssim_loss
+        if self.lpips is not None:
+            loss = loss + self.training_cfg.lpips_loss_weight * lpips_loss
+
+        metrics = {
+            "total_loss": 0.0,  # filled at end
+            "l1_loss": l1_loss.item(),
+            "ssim_loss": ssim_loss.item(),
+            "lpips_loss": lpips_loss.item(),
+            "psnr": psnr_value.item(),
+        }
+
+        # Depth losses
+        depth_acc, depth_m = self._compute_depth_losses(
+            render_out.depth_map_bchw, depth_tensor, render_out.depth_mask_bchw, step, cam_data
+        )
+        loss = loss + depth_acc
+        metrics.update(depth_m)
+
+        # Legacy depth loss (pearson + silog combined)
+        inv_rendered_depth = None
+        inv_prior_depth = None
+        depth_corr = torch.tensor(0.0, device=self.device)
+        d_loss = torch.tensor(0.0, device=self.device)
+
+        if dcfg.enable_depth_loss and depth_tensor is not None and self._loss_active(step, dcfg.depth_loss_start_iter, dcfg.depth_loss_stop_iter):
+            if not depth_tensor.is_cuda:
+                depth_tensor = depth_tensor.to(self.device, non_blocking=True)
+            render_depth = torch.where(
+                torch.isfinite(render_out.depth_map),
+                render_out.depth_map,
+                torch.zeros_like(render_out.depth_map),
+            )
+            dt = depth_tensor
+            if dt.dim() == 2:
+                dt = dt.unsqueeze(0)
+            elif dt.dim() == 4 and dt.shape[-1] == 1:
+                dt = dt[..., 0]
+            try:
+                current_depth_corr = depth_corr.mean().item() if torch.isfinite(depth_corr).all() else 0.0
+                inv_rendered_depth = render_depth.detach()
+                inv_prior_depth = dt.detach()
+            except RuntimeError:
+                current_depth_corr = 0.0
+        else:
+            current_depth_corr = 0.0
+
+        metrics["depth_loss"] = d_loss.item()
+        metrics["depth_corr"] = current_depth_corr
+
+        # SAM loss (gradient-domain detail preservation)
+        if dcfg.sam_loss_weight > 0.0 and self._loss_active(step, dcfg.sam_loss_start_iter, dcfg.sam_loss_stop_iter):
+            sam_loss = gradient_loss(render_out.render, gt_image)
+            loss = loss + dcfg.sam_loss_weight * sam_loss
+            metrics["sam_loss"] = sam_loss.item()
+        else:
+            metrics["sam_loss"] = 0.0
+
+        # Regularization losses
+        reg_acc, reg_m = self._compute_regularization(model, step)
+        loss = loss + reg_acc
+        metrics.update(reg_m)
+
+        metrics["total_loss"] = loss.item()
+
+        return LossResult(
+            total_loss=loss,
+            metrics=metrics,
+            inv_rendered_depth=inv_rendered_depth,
+            inv_prior_depth=inv_prior_depth,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Semantic supervision loss
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class SemanticLossComputer:
+    """Normalized Cosine + Smooth L1 semantic supervision loss based on EUPE.
+
+    Spatial alignment helpers live here as private methods — they are only
+    meaningful in the context of semantic loss computation.  Stateless by
+    default; add GPU-resident nn.Modules as ``__init__`` fields when new loss
+    variants (contrastive, cosine, etc.) require them.  A new loss variant is
+    one additional method + a config flag in train_semantics_args.py.
+    """
+
+    @staticmethod
+    def _norm(x: torch.Tensor) -> torch.Tensor:
+        # EUPE normalizes by subtracting the mean and dividing by the standard deviation
+        return (x - x.mean()) / (x.std() + 1e-6)
+
+    @staticmethod
+    def _upsample_patches_to_pixels(
+        patch_features: torch.Tensor, patch_size: int, target_h: int, target_w: int
+    ) -> torch.Tensor:
+        """Upsample patch features to pixel resolution using bicubic interpolation."""
+        # Convert [H, W, D] to [B, C, H, W] for interpolation
+        x = patch_features.permute(2, 0, 1).unsqueeze(0)
+        
+        # PyTorch's builtin interpolation with bicubic mode to resize patch tokens
+        out = F.interpolate(x, size=(target_h, target_w), mode="bicubic", align_corners=False)
+        
+        # Convert back to [H, W, D]
+        return out.squeeze(0).permute(1, 2, 0)
+
+    def _align(
+        self,
+        pred: torch.Tensor,
+        target: "SemanticTarget",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Align rendered features [H, W, D] to a SemanticTarget for loss computation.
+
+        patch  — target patches bicubically upsampled to target resolution.
+        dense  — pred bicubically downsampled to target resolution if sizes differ.
+        global — pred mean-pooled to [1, 1, D].
+        """
+        if target.mode == "global":
+            return pred.mean(dim=(0, 1), keepdim=True), target.features
+
+        if target.mode == "patch":
+            patch_size = round(1.0 / target.scale_factor)
+            return pred, self._upsample_patches_to_pixels(
+                target.features, patch_size, pred.shape[0], pred.shape[1]
+            )
+
+        th, tw = target.features.shape[:2]
+        if pred.shape[:2] == (th, tw):
+            return pred, target.features
+            
+        # Use bicubic interpolation for alignment
+        pred_aligned = F.interpolate(
+            pred.permute(2, 0, 1).unsqueeze(0), size=(th, tw), mode="bicubic", align_corners=False,
+        ).squeeze(0).permute(1, 2, 0)
+        return pred_aligned, target.features
+
+    def compute(
+        self,
+        pred: torch.Tensor,
+        target: "SemanticTarget",
+        weight: float = 1.0,
+    ) -> tuple[torch.Tensor, dict]:
+        """Compute EUPE combined Cosine and Smooth L1 loss between rendered and target features.
+
+        Args:
+            pred:   [H, W, D] rendered semantic feature map.
+            target: SemanticTarget (mode, features, scale_factor).
+            weight: Loss scale applied to the raw loss before returning.
+
+        Returns:
+            (weighted_loss, {"semantic_loss": float})
+        """
+        aligned_pred, aligned_tgt = self._align(pred, target)
+        
+        norm_pred = self._norm(aligned_pred)
+        norm_tgt = self._norm(aligned_tgt)
+        
+        # Compute Cosine Similarity Loss: 1 - cosine_similarity
+        # Using dim=-1 since features are in the last dimension [H, W, D]
+        cos_loss = 1.0 - F.cosine_similarity(norm_pred, norm_tgt, dim=-1).mean()
+        
+        # Compute Smooth L1 Loss
+        smooth_l1_loss = F.smooth_l1_loss(norm_pred, norm_tgt)
+        
+        # Combine using alpha=0.9 and beta=0.1
+        loss = (0.9 * cos_loss) + (0.1 * smooth_l1_loss)
+        
+        return weight * loss, {"semantic_loss": float(loss.item())}
+
+# class SemanticLossComputer:
+#     """Normalized MSE semantic supervision loss.
+
+#     Spatial alignment helpers live here as private methods — they are only
+#     meaningful in the context of semantic loss computation.  Stateless by
+#     default; add GPU-resident nn.Modules as ``__init__`` fields when new loss
+#     variants (contrastive, cosine, etc.) require them.  A new loss variant is
+#     one additional method + a config flag in train_semantics_args.py.
+#     """
+
+#     @staticmethod
+#     def _norm(x: torch.Tensor) -> torch.Tensor:
+#         return (x - x.min()) / (x.max() - x.min() + 1e-6)
+
+#     @staticmethod
+#     def _upsample_patches_to_pixels(
+#         patch_features: torch.Tensor, patch_size: int, target_h: int, target_w: int
+#     ) -> torch.Tensor:
+#         """Replicate each patch value to its patch_size×patch_size pixel region (no interpolation)."""
+#         nh, nw, d = patch_features.shape
+#         x = patch_features.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, patch_size, patch_size)
+#         x = x.permute(0, 3, 1, 4, 2).contiguous().reshape(nh * patch_size, nw * patch_size, d)
+#         if x.shape[0] < target_h or x.shape[1] < target_w:
+#             out = torch.zeros(target_h, target_w, d, device=patch_features.device, dtype=patch_features.dtype)
+#             out[:x.shape[0], :x.shape[1]] = x
+#             return out
+#         return x[:target_h, :target_w]
+
+#     def _align(
+#         self,
+#         pred: torch.Tensor,
+#         target: "SemanticTarget",
+#     ) -> tuple[torch.Tensor, torch.Tensor]:
+#         """Align rendered features [H, W, D] to a SemanticTarget for loss computation.
+
+#         patch  — target patches replicated to pixel grid (discrete, no interpolation).
+#         dense  — pred bilinearly downsampled to target resolution if sizes differ.
+#         global — pred mean-pooled to [1, 1, D].
+#         """
+#         if target.mode == "global":
+#             return pred.mean(dim=(0, 1), keepdim=True), target.features
+
+#         if target.mode == "patch":
+#             patch_size = round(1.0 / target.scale_factor)
+#             return pred, self._upsample_patches_to_pixels(
+#                 target.features, patch_size, pred.shape[0], pred.shape[1]
+#             )
+
+#         th, tw = target.features.shape[:2]
+#         if pred.shape[:2] == (th, tw):
+#             return pred, target.features
+#         pred_aligned = F.interpolate(
+#             pred.permute(2, 0, 1).unsqueeze(0), size=(th, tw), mode="bilinear", align_corners=False,
+#         ).squeeze(0).permute(1, 2, 0)
+#         return pred_aligned, target.features
+
+#     def compute(
+#         self,
+#         pred: torch.Tensor,
+#         target: "SemanticTarget",
+#         weight: float = 1.0,
+#     ) -> tuple[torch.Tensor, dict]:
+#         """Compute normalized MSE between rendered and target semantic features.
+
+#         Args:
+#             pred:   [H, W, D] rendered semantic feature map.
+#             target: SemanticTarget (mode, features, scale_factor).
+#             weight: Loss scale applied to the raw MSE before returning.
+
+#         Returns:
+#             (weighted_loss, {"semantic_loss": float})
+#         """
+#         aligned_pred, aligned_tgt = self._align(pred, target)
+#         loss = F.mse_loss(self._norm(aligned_pred), self._norm(aligned_tgt))
+#         return weight * loss, {"semantic_loss": float(loss.item())}
