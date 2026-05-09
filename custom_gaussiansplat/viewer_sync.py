@@ -191,6 +191,7 @@ class TrainingViewerBundle:
     server: Optional[Any] = None
     viewer_param_sync: Optional[ViewerParamSync] = None
     rerun_viewer: Optional[Any] = None
+    semantic_click_interactor: Optional[Any] = None
 
 
 def setup_training_viewer(
@@ -249,9 +250,16 @@ def setup_training_viewer(
         refresh_interval=viewer_cfg.viewer_refresh_interval,
     )
     bundle.server = viser_mod.ViserServer(port=viewer_cfg.viewer_port, verbose=False)
+
+    from semantic_click import setup_semantic_click
+    bundle.semantic_click_interactor = setup_semantic_click(model, device, bundle.server)
+    render_fn = bundle.viewer_param_sync.render_fn
+    if bundle.semantic_click_interactor is not None:
+        render_fn = bundle.semantic_click_interactor.make_render_fn(render_fn)
+
     bundle.viewer = nerfview_mod.Viewer(
         server=bundle.server,
-        render_fn=bundle.viewer_param_sync.render_fn,
+        render_fn=render_fn,
         mode="training",
     )
 

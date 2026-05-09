@@ -37,6 +37,7 @@ import torch
 import torch.nn.functional as F
 from model_factory import ModelFactory
 from models import NeuralRenderingMixin, SemanticsMixin
+from semantic_click import apply_jet_colormap, build_semantic_cam, setup_semantic_click
 from viewer_sync import ViewerParamSync
 
 nerfview: Any = None
@@ -389,43 +390,6 @@ def _load_model_for_viewer(
     )
 
 
-def _build_semantic_cam(
-    camera_state: Any, width: int, height: int, device: torch.device
-) -> dict:
-    """Convert viser camera_state to the cam dict expected by render_semantics()."""
-    c2w = torch.from_numpy(camera_state.c2w).float().to(device)
-    K = torch.from_numpy(camera_state.get_K((width, height))).float().to(device)
-    viewmat = torch.linalg.inv(c2w)
-
-    return {
-        "R": viewmat[:3, :3],
-        "T": viewmat[:3, 3],
-        "fx": float(K[0, 0].item()),
-        "fy": float(K[1, 1].item()),
-        "cx": float(K[0, 2].item()),
-        "cy": float(K[1, 2].item()),
-        "width": width,
-        "height": height,
-        "camera_center": c2w[:3, 3],
-        "uid": 0,
-    }
-
-
-def _apply_jet_colormap(values: np.ndarray) -> np.ndarray:
-    """Apply jet-like colormap to values in [0, 1].
-
-    Returns array of shape [H, W, 3] with uint8 RGB values.
-    """
-    values = np.clip(values, 0.0, 1.0)
-
-    # Simple jet approximation using the standard 5-color jet pattern
-    # r = 1.5 - |4v - 3|, g = 1.5 - |4v - 2|, b = 1.5 - |4v - 1|
-    r = np.clip(1.5 - np.abs(4.0 * values - 3.0), 0.0, 1.0)
-    g = np.clip(1.5 - np.abs(4.0 * values - 2.0), 0.0, 1.0)
-    b = np.clip(1.5 - np.abs(4.0 * values - 1.0), 0.0, 1.0)
-
-    rgb = np.stack([r, g, b], axis=-1)
-    return (rgb * 255.0).astype(np.uint8)
 
 
 def _make_semantic_render_fn(
@@ -450,7 +414,7 @@ def _make_semantic_render_fn(
 
         try:
             # Build cam dict for render_semantics
-            cam = _build_semantic_cam(camera_state, width, height, device)
+            cam = build_semantic_cam(camera_state, width, height, device)
 
             with torch.no_grad():
                 _, feat_map = model.render_semantics(cam, device)
@@ -473,7 +437,7 @@ def _make_semantic_render_fn(
             sim_map_norm = (sim_map + 1.0) * 0.5  # cosine sim is in [-1, 1]
 
             # Apply colormap
-            heatmap = _apply_jet_colormap(sim_map_norm)
+            heatmap = apply_jet_colormap(sim_map_norm)
 
             # Option 1: Hard mask (binary) above threshold
             if sem_state.show_mask:
@@ -536,7 +500,7 @@ def main() -> None:
 
     server = viser.ViserServer(port=args.port, verbose=False)
 
-    # Setup semantic heatmap visualization if applicable
+    # Build render_fn chain: base → static anchor heatmap → click similarity
     sem_state = _SemanticOverlayState()
     render_fn = viewer_sync.render_fn
     if isinstance(model, SemanticsMixin):
@@ -545,6 +509,10 @@ def main() -> None:
         render_fn = _make_semantic_render_fn(viewer_sync.render_fn, model, device, sem_state)
     elif args.show_semantic_heatmap:
         print("[Warning] --show-semantic-heatmap requires a semantic model; flag ignored.")
+
+    click_interactor = setup_semantic_click(model, device, server)
+    if click_interactor is not None:
+        render_fn = click_interactor.make_render_fn(render_fn)
 
     # "rendering" mode — no training-specific UI (pause/step/rays-per-sec)
     _viewer = nerfview.Viewer(

@@ -181,6 +181,11 @@ class SemanticsMixin(ABC):
             if name in state:
                 param.requires_grad_(state[name])
 
+    @property
+    def anchor_lang_feat(self) -> "Optional[torch.Tensor]":
+        """Per-anchor language feature matrix [N, D]. None if not implemented."""
+        return None
+
 
 # Future mixin stubs for other capabilities (add as needed):
 # class LoDAwareMixin(ABC):

@@ -2015,7 +2015,7 @@ class SemanticLossComputer:
         x = patch_features.permute(2, 0, 1).unsqueeze(0)
         
         # PyTorch's builtin interpolation with bicubic mode to resize patch tokens
-        out = F.interpolate(x, size=(target_h, target_w), mode="bicubic", align_corners=False)
+        out = F.interpolate(x, size=(target_h, target_w), mode="bilinear", align_corners=False)
         
         # Convert back to [H, W, D]
         return out.squeeze(0).permute(1, 2, 0)

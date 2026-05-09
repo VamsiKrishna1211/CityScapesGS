@@ -610,8 +610,11 @@ def _save_checkpoint(
         {
             "iteration": int(base_checkpoint.get("iteration", 0)) + metrics["semantic_iters"],
             "model_state_dict": model.state_dict(),
-            "language_mlp": model.mlp_language.state_dict(),
-            "lang_feat_dim": model.lang_feat_dim,
+            "language_mlp":     model.mlp_language.state_dict(),
+            "language_proj":    model.mlp_lang_proj.state_dict(),
+            "cross_modal_attn": model.cross_modal_attn.state_dict(),
+            "lang_feat_dim":    model.lang_feat_dim,
+            "semantics_dim":    model.semantics_dim,
             "base_checkpoint": str(cfg.checkpoint_path),
             "semantic_metrics": metrics,
             "tensorboard_run_name": (

@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from gs_types import GSOptimizers, NeuralGaussianOutput, RenderOutput, RenderParams
+from gsplat import rasterization
 from torch_scatter import scatter_max
 
 from .base import SemanticsMixin
@@ -40,6 +41,48 @@ def _build_K(cam: dict, device: torch.device) -> torch.Tensor:
         dtype=torch.float32, device=device,
     )
 
+class CrossModalGaussianAttention(nn.Module):
+    def __init__(self, color_dim: int = 3, lang_dim: int = 32):
+        super().__init__()
+        # Project color up to lang_dim so both tokens live in same space
+        self.color_proj = nn.Linear(color_dim, lang_dim)
+
+        # Standard Q, K, V projections — operate on the 2-token sequence
+        self.q_proj = nn.Linear(lang_dim, lang_dim)
+        self.k_proj = nn.Linear(lang_dim, lang_dim)
+        self.v_proj = nn.Linear(lang_dim, lang_dim)
+        self.out_proj = nn.Linear(lang_dim, lang_dim)
+
+        self.scale = lang_dim ** -0.5
+
+    def forward(self, colors: torch.Tensor, lang: torch.Tensor) -> torch.Tensor:
+        # colors: [M, 3],  lang: [M, D]
+        M, D = lang.shape
+
+        # Both modalities projected to same space
+        c_embed = self.color_proj(colors)         # [M, D]
+
+        # Stack into 2-token sequence: token-0 = color, token-1 = language
+        tokens = torch.stack([c_embed, lang], dim=1)   # [M, 2, D]
+
+        Q = self.q_proj(tokens)   # [M, 2, D]
+        K = self.k_proj(tokens)   # [M, 2, D]
+        V = self.v_proj(tokens)   # [M, 2, D]
+
+        # Attention weights: [M, 2, 2] — each token attends to both tokens
+        attn_weights = F.softmax(
+            (Q @ K.transpose(-1, -2)) * self.scale, dim=-1
+        )                         # [M, 2, 2]
+
+        attended = attn_weights @ V               # [M, 2, D]
+
+        # Extract only the language token's attended output
+        lang_attended = attended[:, 1, :]         # [M, D]  — the semantic token's output
+
+        # Residual: preserve original language feature, only add the refined delta
+        lang_refined = lang + self.out_proj(lang_attended)  # [M, D]
+
+        return lang_refined
 
 class SemanticScaffoldModel(ScaffoldModel, SemanticsMixin):
     """ScaffoldModel extended with per-anchor language feature learning.
@@ -139,6 +182,11 @@ class SemanticScaffoldModel(ScaffoldModel, SemanticsMixin):
             nn.Linear(lang_feat_dim, lang_feat_dim),
             nn.ReLU(True),
             nn.Linear(lang_feat_dim, semantics_dim),
+        )
+
+        self.cross_modal_attn = CrossModalGaussianAttention(
+            color_dim=3,
+            lang_dim=semantics_dim
         )
 
     # ── Language feature initialisation ──────────────────────────────────────
@@ -293,12 +341,21 @@ class SemanticScaffoldModel(ScaffoldModel, SemanticsMixin):
         return self._semantics_dim
 
     @property
+    def anchor_lang_feat(self) -> torch.Tensor:
+        return self._anchor_lang_feat
+
+    @property
     def geometry_param_group_names(self) -> frozenset:
         return frozenset({"geometry", "mlp_geo", "anchor_features", "appearance"})
 
     def get_finetune_param_groups(self) -> Dict[str, List[nn.Parameter]]:
         groups: Dict[str, List[nn.Parameter]] = {
-            "semantics":       [self._anchor_lang_feat] + list(self.mlp_language.parameters()),
+            "semantics": (
+                [self._anchor_lang_feat]
+                + list(self.mlp_language.parameters())
+                + list(self.mlp_lang_proj.parameters())
+                + list(self.cross_modal_attn.parameters())
+            ),
             "anchor_features": [self._anchor_feat],
             "mlp_geo":         list(self.mlp_geo_heads_raw.parameters()),
             "geometry":        [self._anchor, self._scaling, self._opacity, self._offset],
@@ -324,7 +381,6 @@ class SemanticScaffoldModel(ScaffoldModel, SemanticsMixin):
             rgb_pred:  [H, W, 3]
             feat_pred: [H, W, semantics_dim] — projected to match DINO bottleneck
         """
-        from gsplat import rasterization
 
         viewmat = _build_viewmat(cam, device)
         K = _build_K(cam, device)
@@ -335,7 +391,11 @@ class SemanticScaffoldModel(ScaffoldModel, SemanticsMixin):
 
         colors = out.colors.detach() if detach_geometry else out.colors
         # Project language features from lang_feat_dim to semantics_dim for supervision
-        lang_feat_proj = self.mlp_lang_proj(out.language_features)  # [M, semantics_dim]
+        # lang_feat_proj = self.mlp_lang_proj(out.language_features)  # [M, semantics_dim]
+        # colors_with_lang = torch.cat([colors, lang_feat_proj], dim=-1)
+
+        lang_feat_proj = self.mlp_lang_proj(out.language_features)  # [M, D]
+        lang_feat_proj = self.cross_modal_attn(colors, lang_feat_proj)  # [M, D]  ← insert here
         colors_with_lang = torch.cat([colors, lang_feat_proj], dim=-1)
 
         means   = out.means.detach()   if detach_geometry else out.means
@@ -363,6 +423,8 @@ class SemanticScaffoldModel(ScaffoldModel, SemanticsMixin):
     def get_semantic_trainable_params(self) -> List[nn.Parameter]:
         params: List[nn.Parameter] = [self._anchor_lang_feat]
         params.extend(self.mlp_language.parameters())
+        params.extend(self.mlp_lang_proj.parameters())   # ← also missing
+        params.extend(self.cross_modal_attn.parameters()) # ← missing
         return params
 
     def setup_semantic_training(self, semantics_cfg: object, device: torch.device) -> None:
@@ -453,7 +515,10 @@ class SemanticScaffoldModel(ScaffoldModel, SemanticsMixin):
         lr_lang = lr_semantics if lr_semantics is not None else lr_sh
         lang_feat_opt = torch.optim.Adam([self._anchor_lang_feat], lr=lr_lang)
         self._extra_optimizers["mlp_language"] = torch.optim.Adam(
-            self.mlp_language.parameters(), lr=self.lr_mlp_color
+            list(self.mlp_language.parameters())
+            + list(self.mlp_lang_proj.parameters())
+            + list(self.cross_modal_attn.parameters()),
+            lr=self.lr_mlp_color,
         )
         return GSOptimizers(
             means=base_opts.means,
@@ -481,8 +546,9 @@ class SemanticScaffoldModel(ScaffoldModel, SemanticsMixin):
                     self.embedding_appearance.state_dict()
                     if self.embedding_appearance is not None else None
                 ),
-                "language_mlp": self.mlp_language.state_dict(),
-                "language_proj": self.mlp_lang_proj.state_dict(),
+                "language_mlp":    self.mlp_language.state_dict(),
+                "language_proj":   self.mlp_lang_proj.state_dict(),
+                "cross_modal_attn": self.cross_modal_attn.state_dict(),
                 "lang_feat_dim": self.lang_feat_dim,
                 "semantics_dim": self._semantics_dim,
                 "model_state_dict": self.state_dict(),
@@ -507,6 +573,8 @@ class SemanticScaffoldModel(ScaffoldModel, SemanticsMixin):
             self.mlp_language.load_state_dict(checkpoint["language_mlp"])
         if checkpoint.get("language_proj"):
             self.mlp_lang_proj.load_state_dict(checkpoint["language_proj"])
+        if checkpoint.get("cross_modal_attn"):
+            self.cross_modal_attn.load_state_dict(checkpoint["cross_modal_attn"])
 
     # ── Checkpoint loaders ────────────────────────────────────────────────────
 
@@ -643,6 +711,26 @@ class SemanticScaffoldModel(ScaffoldModel, SemanticsMixin):
                     "Skipping mlp_language weights: fourier_embed_dim mismatch. "
                     "Expected input %d, checkpoint had %d. Reinitializing.",
                     expected_input_size, actual_input_size,
+                )
+
+        if checkpoint.get("language_proj"):
+            actual = checkpoint["language_proj"].get("2.weight", torch.zeros(1, 1)).shape[0]
+            if actual == semantics_dim:
+                model.mlp_lang_proj.load_state_dict(checkpoint["language_proj"])
+            else:
+                logger.warning(
+                    "Skipping mlp_lang_proj: semantics_dim mismatch (%d vs %d).",
+                    actual, semantics_dim,
+                )
+
+        if checkpoint.get("cross_modal_attn"):
+            actual = checkpoint["cross_modal_attn"].get("color_proj.weight", torch.zeros(1, 1)).shape[0]
+            if actual == semantics_dim:
+                model.cross_modal_attn.load_state_dict(checkpoint["cross_modal_attn"])
+            else:
+                logger.warning(
+                    "Skipping cross_modal_attn: semantics_dim mismatch (%d vs %d).",
+                    actual, semantics_dim,
                 )
 
         logger.info(

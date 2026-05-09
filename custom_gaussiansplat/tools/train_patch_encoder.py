@@ -34,6 +34,8 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
+torch.set_float32_matmul_precision('high')
+
 # ─────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────
@@ -54,6 +56,14 @@ def parse_args():
                    help="If set, encode all .pt files and save compressed features here")
     p.add_argument("--encode_only", action="store_true",
                    help="Skip training; load encoder from --save_path and run encode_directory")
+    p.add_argument("--contrastive_weight", type=float, default=0.0,
+                   help="Weight for InfoNCE contrastive loss (0.0 to disable)")
+    p.add_argument("--similarity_threshold", type=float, default=0.4,
+                   help="Threshold for defining positive pairs from DINO feature similarity")
+    p.add_argument("--temperature", type=float, default=0.07,
+        help="Temperature parameter for InfoNCE loss")
+    p.add_argument("--enable-mixed-precision", action="store_true",
+        help="Use bfloat16 autocast for forward passes (requires Ampere+ GPU)")
     return p.parse_args()
 
 
@@ -79,9 +89,9 @@ class PatchAutoencoder(nn.Module):
             nn.Linear(hidden, bottleneck),
         )
         self.decoder = nn.Sequential(
-            nn.Linear(bottleneck, hidden),
+            nn.Linear(bottleneck, hidden // 2),
             nn.ReLU(),
-            nn.Linear(hidden, D),
+            nn.Linear(hidden // 2, D),
         )
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -94,6 +104,69 @@ class PatchAutoencoder(nn.Module):
         z = self.encode(x)
         recon = self.decode(z)
         return recon, z
+
+
+# ─────────────────────────────────────────────
+# CONTRASTIVE LOSS (InfoNCE)
+# ─────────────────────────────────────────────
+
+@torch.no_grad()
+def get_positive_mask(features: torch.Tensor, threshold: float = 0.85) -> torch.Tensor:
+    """
+    Create a mask of positive pairs based on DINO feature similarity.
+    Patches with cosine similarity > threshold are considered positive pairs.
+
+    Args:
+        features: L2-normalized DINO features (B, D)
+        threshold: similarity threshold for positive pairs
+
+    Returns:
+        positive_mask: boolean tensor (B, B) where positive_mask[i,j] = True if i,j are positive
+    """
+    # Pairwise cosine similarity (features already L2-normalized)
+    sim_matrix = torch.mm(features, features.t())  # (B, B)
+
+    # Positive pairs: high similarity, excluding self-similarity
+    positive_mask = sim_matrix > threshold
+    positive_mask.fill_diagonal_(False)  # Don't pair with self
+
+    return positive_mask
+
+
+def infonce_loss(bottleneck_codes: torch.Tensor, positive_mask: torch.Tensor,
+                 temperature: float = 0.07) -> torch.Tensor:
+    """
+    InfoNCE / Contrastive loss on bottleneck codes.
+    For each sample, pull positive pairs close and push negative pairs apart
+    by turning similarity computation into a softmax classification problem.
+
+    Args:
+        bottleneck_codes: encoded codes (B, bottleneck_dim), not necessarily normalized
+        positive_mask: boolean tensor (B, B) indicating positive pairs
+        temperature: temperature for scaling similarities (smaller = sharper softmax)
+
+    Returns:
+        loss: scalar tensor, or zero tensor if no positive pairs exist
+    """
+    if positive_mask.sum() == 0:
+        return torch.tensor(0.0, device=bottleneck_codes.device, dtype=bottleneck_codes.dtype)
+
+    # Normalize codes for fair similarity computation
+    normalized_codes = F.normalize(bottleneck_codes, dim=-1)
+    codes_similarity = torch.mm(normalized_codes, normalized_codes.t())  # (B, B) pairwise similarities
+
+    # Apply temperature scaling
+    logits = codes_similarity / temperature
+
+    # Log-softmax: convert similarities to log probabilities
+    # For each row i, this is: log(exp(sim[i,j]) / sum_k exp(sim[i,k]))
+    log_probs = F.log_softmax(logits, dim=1)  # (B, B)
+
+    # Extract log probs of positive pairs and average (negative log-likelihood)
+    mask_float = positive_mask.float()
+    contrastive_loss = -(log_probs * mask_float).sum() / (mask_float.sum() + 1e-8)
+
+    return contrastive_loss
 
 
 # ─────────────────────────────────────────────
@@ -112,7 +185,10 @@ def train(model: PatchAutoencoder, dataloader, args, device):
     console.print(f"  Epochs={args.epochs}  Batch={args.batch_size}  LR={args.lr}")
     console.print(f"  Bottleneck={args.bottleneck}  Hidden={args.hidden}")
     n_params = sum(p.numel() for p in model.parameters())
-    console.print(f"  Params: [yellow]{n_params:,}[/yellow]  Device: {device}\n")
+    console.print(f"  Params: [yellow]{n_params:,}[/yellow]  Device: {device}")
+    if args.contrastive_weight > 0.0:
+        console.print(f"  Contrastive: weight={args.contrastive_weight}  threshold={args.similarity_threshold}  temp={args.temperature}")
+    console.print()
 
     best_loss = float("inf")
     best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -122,14 +198,19 @@ def train(model: PatchAutoencoder, dataloader, args, device):
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         MofNCompleteColumn(),
-        TextColumn("loss=[cyan]{task.fields[loss]:.4f}[/cyan]  cos=[green]{task.fields[cos]:.4f}[/green]  best=[yellow]{task.fields[best]:.4f}[/yellow]  lr=[magenta]{task.fields[lr]:.2e}[/magenta]"),
+        TextColumn("{task.fields[info]}"),
         TimeRemainingColumn(),
         console=console,
-    ) as epoch_progress:
-        epoch_task = epoch_progress.add_task(
+    ) as progress:
+        epoch_task = progress.add_task(
             "[cyan]Epochs[/cyan]",
             total=args.epochs,
-            loss=0.0, cos=0.0, best=best_loss, lr=args.lr,
+            info=f"loss=0.0000  cos=0.0000  best={best_loss:.4f}  lr={args.lr:.2e}",
+        )
+        batch_task = progress.add_task(
+            "[blue]  Batches[/blue]",
+            total=len(dataloader),
+            info="loss=inf  cos=0.0000",
         )
 
         for _ in range(args.epochs):
@@ -137,45 +218,38 @@ def train(model: PatchAutoencoder, dataloader, args, device):
             sum_loss = 0.0
             sum_cos  = 0.0
             n_batches = 0
+            progress.reset(batch_task, total=len(dataloader))
 
-            with Progress(
-                TextColumn("  {task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TextColumn("loss=[cyan]{task.fields[loss]:.4f}[/cyan]  cos=[green]{task.fields[cos]:.4f}[/green]  lr=[magenta]{task.fields[lr]:.2e}[/magenta]"),
-                console=console,
-                transient=True,
-            ) as batch_progress:
-                batch_task = batch_progress.add_task(
-                    "[blue]Batches[/blue]",
-                    total=len(dataloader),
-                    loss=float("inf"), cos=0.0,
-                    lr=optimizer.param_groups[0]["lr"],
+            for batch in dataloader:
+                batch = batch.to(device)  # already L2-normalized by dataset
+
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=args.enable_mixed_precision):
+                    recon, bottleneck_codes = model(batch)
+
+                    cos_loss = (1.0 - F.cosine_similarity(recon, batch, dim=-1)).mean()
+                    mse_loss = F.mse_loss(recon, batch)
+                    loss = cos_loss + 0.3 * mse_loss
+
+                    if args.contrastive_weight > 0.0:
+                        positive_pairs_mask = get_positive_mask(batch, threshold=args.similarity_threshold)
+                        contrastive_loss = infonce_loss(bottleneck_codes, positive_pairs_mask, temperature=args.temperature)
+                        loss = loss + args.contrastive_weight * contrastive_loss
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                with torch.no_grad():
+                    cos = 1 - cos_loss.item()
+
+                sum_loss  += loss.item()
+                sum_cos   += cos
+                n_batches += 1
+
+                progress.update(
+                    batch_task, advance=1,
+                    info=f"loss=[cyan]{loss.item():.4f}[/cyan]  cos=[green]{cos:.4f}[/green]  lr=[magenta]{optimizer.param_groups[0]['lr']:.2e}[/magenta]",
                 )
-
-                for batch in dataloader:
-                    batch = batch.to(device)  # already L2-normalized by dataset
-                    recon, _ = model(batch)
-
-                    # Cosine reconstruction loss (scale-invariant, matches DINO's feature space)
-                    loss = (1.0 - F.cosine_similarity(recon, batch, dim=-1)).mean()
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-
-                    with torch.no_grad():
-                        cos = F.cosine_similarity(recon, batch, dim=-1).mean().item()
-
-                    sum_loss  += loss.item()
-                    sum_cos   += cos
-                    n_batches += 1
-
-                    batch_progress.update(
-                        batch_task, advance=1,
-                        loss=loss.item(), cos=cos,
-                        lr=optimizer.param_groups[0]["lr"],
-                    )
 
             scheduler.step()
             avg_loss = sum_loss / max(1, n_batches)
@@ -185,7 +259,10 @@ def train(model: PatchAutoencoder, dataloader, args, device):
                 best_loss = avg_loss
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
-            epoch_progress.update(epoch_task, advance=1, loss=avg_loss, cos=avg_cos, best=best_loss, lr=optimizer.param_groups[0]["lr"])
+            progress.update(
+                epoch_task, advance=1,
+                info=f"loss=[cyan]{avg_loss:.4f}[/cyan]  cos=[green]{avg_cos:.4f}[/green]  best=[yellow]{best_loss:.4f}[/yellow]  lr=[magenta]{optimizer.param_groups[0]['lr']:.2e}[/magenta]",
+            )
 
     model.load_state_dict(best_state)
     console.print(f"\n  [green]✓[/green] Restored best checkpoint (loss={best_loss:.4f})")
@@ -225,6 +302,7 @@ def evaluate(model: PatchAutoencoder, dataloader, device):
 # ─────────────────────────────────────────────
 
 import glob as _glob
+
 
 @torch.no_grad()
 def encode_directory(model: PatchAutoencoder, feat_dir: str, encoded_dir: str,
@@ -325,6 +403,7 @@ def main():
     console.print(f"  Feature Dim: [yellow]{D_feat}[/yellow]   Total patches: [yellow]{total_patches:,}[/yellow]")
 
     model = PatchAutoencoder(D=D_feat, hidden=args.hidden, bottleneck=args.bottleneck).to(device)
+    model = torch.compile(model)
 
     loader = create_dataloader(npy_path, total_patches, D_feat, args.batch_size, args.num_workers)
     train(model, loader, args, device)
